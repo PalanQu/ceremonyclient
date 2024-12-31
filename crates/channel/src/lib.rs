@@ -1,9 +1,9 @@
 use base64::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::{collections::HashMap, io::Read};
 
-use ed448_goldilocks_plus::{elliptic_curve::group::GroupEncoding, EdwardsPoint, Scalar};
-use protocols::{doubleratchet::{DoubleRatchetParticipant, P2PChannelEnvelope}, tripleratchet::{PeerInfo, TripleRatchetParticipant}};
+use ed448_goldilocks_plus::{elliptic_curve::group::GroupEncoding, CompressedEdwardsY, EdwardsPoint, Scalar};
+use protocols::{doubleratchet::{DoubleRatchetParticipant, P2PChannelEnvelope}, tripleratchet::{PeerInfo, TripleRatchetParticipant}, x3dh};
 
 pub(crate) mod protocols;
 
@@ -39,6 +39,86 @@ pub struct TripleRatchetStateAndMessage {
     pub message: Vec<u8>,
 }
 
+pub fn sender_x3dh(sending_identity_private_key: &Vec<u8>, sending_ephemeral_private_key: &Vec<u8>, receiving_identity_key: &Vec<u8>, receiving_signed_pre_key: &Vec<u8>, session_key_length: usize) -> String {
+  if sending_identity_private_key.len() != 56 {
+    return "invalid sending identity private key length".to_string();
+  }
+
+  if sending_ephemeral_private_key.len() != 56 {
+    return "invalid sending ephemeral private key length".to_string();
+  }
+
+  if receiving_identity_key.len() != 57 {
+    return "invalid receiving identity public key length".to_string();
+  }
+
+  if receiving_signed_pre_key.len() != 57 {
+    return "invalid receiving signed public key length".to_string();
+  }
+
+  let sidk = Scalar::from_bytes(sending_identity_private_key.as_slice().try_into().unwrap());
+  let sepk = Scalar::from_bytes(sending_ephemeral_private_key.as_slice().try_into().unwrap());
+  let ridk = CompressedEdwardsY(receiving_identity_key.as_slice().try_into().unwrap()).decompress();
+  let rspk = CompressedEdwardsY(receiving_signed_pre_key.as_slice().try_into().unwrap()).decompress();
+
+  if ridk.is_none().into() {
+    return "invalid receiving identity public key".to_string();
+  }
+
+  if rspk.is_none().into() {
+    return "invalid receiving signed public key".to_string();
+  }
+
+  match x3dh::sender_x3dh(&sidk, &sepk, &ridk.unwrap(), &rspk.unwrap(), session_key_length) {
+    Some(result) => {
+      return format!("\"{}\"", BASE64_STANDARD.encode(result));
+    }
+    None => {
+      return "could not perform key agreement".to_string();
+    }
+  }
+}
+
+pub fn receiver_x3dh(sending_identity_private_key: &Vec<u8>, sending_signed_private_key: &Vec<u8>, receiving_identity_key: &Vec<u8>, receiving_ephemeral_key: &Vec<u8>, session_key_length: usize) -> String {
+  if sending_identity_private_key.len() != 56 {
+    return "invalid sending identity private key length".to_string();
+  }
+
+  if sending_signed_private_key.len() != 56 {
+    return "invalid sending signed private key length".to_string();
+  }
+
+  if receiving_identity_key.len() != 57 {
+    return "invalid receiving identity public key length".to_string();
+  }
+
+  if receiving_ephemeral_key.len() != 57 {
+    return "invalid receiving ephemeral public key length".to_string();
+  }
+
+  let sidk = Scalar::from_bytes(sending_identity_private_key.as_slice().try_into().unwrap());
+  let sspk = Scalar::from_bytes(sending_signed_private_key.as_slice().try_into().unwrap());
+  let ridk = CompressedEdwardsY(receiving_identity_key.as_slice().try_into().unwrap()).decompress();
+  let repk = CompressedEdwardsY(receiving_ephemeral_key.as_slice().try_into().unwrap()).decompress();
+
+  if ridk.is_none().into() {
+    return "invalid receiving identity public key".to_string();
+  }
+
+  if repk.is_none().into() {
+    return "invalid receiving signed public key".to_string();
+  }
+
+  match x3dh::receiver_x3dh(&sidk, &sspk, &ridk.unwrap(), &repk.unwrap(), session_key_length) {
+    Some(result) => {
+      return format!("\"{}\"", BASE64_STANDARD.encode(result));
+    }
+    None => {
+      return "could not perform key agreement".to_string();
+    }
+  }
+}
+
 pub fn new_double_ratchet(session_key: &Vec<u8>, sending_header_key: &Vec<u8>, next_receiving_header_key: &Vec<u8>, is_sender: bool, sending_ephemeral_private_key: &Vec<u8>, receiving_ephemeral_key: &Vec<u8>) -> String {
     if sending_ephemeral_private_key.len() != 56 {
         return "invalid private key length".to_string();
@@ -64,7 +144,7 @@ pub fn new_double_ratchet(session_key: &Vec<u8>, sending_header_key: &Vec<u8>, n
         &session_key,
         &sending_header_key,
         &next_receiving_header_key,
-        true,
+        is_sender,
         sending_key,
         receiving_key.unwrap(),
     );
