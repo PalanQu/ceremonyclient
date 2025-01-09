@@ -1,6 +1,6 @@
 use base64::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, io::Read};
+use std::{collections::HashMap, error::Error, io::Read};
 
 use ed448_goldilocks_plus::{elliptic_curve::group::GroupEncoding, CompressedEdwardsY, EdwardsPoint, Scalar};
 use protocols::{doubleratchet::{DoubleRatchetParticipant, P2PChannelEnvelope}, tripleratchet::{PeerInfo, TripleRatchetParticipant}, x3dh};
@@ -660,6 +660,44 @@ pub fn triple_ratchet_decrypt(ratchet_state_and_envelope: TripleRatchetStateAndE
         ratchet_state: json.unwrap(),
         message: message,
     };
+}
+
+pub fn triple_ratchet_resize(ratchet_state: String, other: String, id: usize, total: usize) -> Vec<Vec<u8>> {
+    let tr = TripleRatchetParticipant::from_json(&ratchet_state);
+    if tr.is_err() {
+        return vec![vec![1]];
+    }
+
+    let other_bytes = hex::decode(other);
+    if other_bytes.is_err() {
+        return vec![other_bytes.unwrap_err().to_string().as_bytes().to_vec()];
+    }
+
+    let result = tr.unwrap().ratchet_resize(other_bytes.unwrap(), id, total);
+    if result.is_err() {
+        return vec![result.unwrap_err().to_string().as_bytes().to_vec()];
+    }
+
+    return result.unwrap();
+}
+
+pub fn triple_ratchet_verify_point(ratchet_state: String, point: String, id: usize) -> Result<bool, Box<dyn Error>> {
+    let tr = TripleRatchetParticipant::from_json(&ratchet_state);
+    if tr.is_err() {
+        return Err(tr.unwrap_err());
+    }
+
+    let point_bytes = hex::decode(point);
+    if point_bytes.is_err() {
+        return Err(Box::new(point_bytes.unwrap_err()));
+    }
+
+    let result = tr.unwrap().point_verify(point_bytes.unwrap(), id);
+    if result.is_err() {
+        return Err(result.unwrap_err());
+    }
+
+    return Ok(result.unwrap());
 }
 
 #[cfg(test)]

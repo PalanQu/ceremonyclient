@@ -81,6 +81,22 @@ pub struct SealedInboxMessageEncryptRequest {
   pub plaintext: Vec<u8>,
 }
 
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResizeRequest {
+  pub ratchet_state: String,
+  pub other: String,
+  pub id: usize,
+  pub total: usize,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct TripleRatchetStateAndPoint {
+    pub ratchet_state: String,
+    pub point: String,
+    pub index: usize,
+}
+
+
 fn encrypt(plaintext: &[u8], key: &[u8]) 
   -> Result<MessageCiphertext, Box<dyn std::error::Error>> {
     use aes_gcm::KeyInit;
@@ -413,7 +429,6 @@ pub fn js_verify_ed448(public_key: &str, message: &str, signature: &str) -> Stri
   }
   
   let pub_bytes: [u8; 57] = key.try_into().unwrap();
-
   let pub_key = ed448_rust::PublicKey::from(pub_bytes);
   let signature = pub_key.verify(&maybe_message.unwrap(), &maybe_signature.unwrap(), None);
   
@@ -572,3 +587,48 @@ pub fn js_triple_ratchet_decrypt(params: &str) -> String {
   }
 }
 
+#[wasm_bindgen]
+pub fn js_triple_ratchet_resize(params: &str) -> String {
+  let json: Result<ResizeRequest, serde_json::Error> = serde_json::from_str(params);
+  match json {
+    Ok(request) => {
+      return serde_json::to_string(&triple_ratchet_resize(request.ratchet_state, request.other, request.id, request.total)).unwrap_or_else(|e| e.to_string());
+    }
+    Err(e) => {
+      return e.to_string();
+    }
+  }
+}
+
+#[wasm_bindgen]
+pub fn js_verify_point(params: &str) -> String {
+  let json: Result<TripleRatchetStateAndPoint, serde_json::Error> = serde_json::from_str(params);
+  match json {
+    Ok(request) => {
+      let verify = triple_ratchet_verify_point(request.ratchet_state, request.point, request.index);
+      return match verify {
+        Ok(result) => serde_json::to_string(&result).unwrap_or_else(|e| e.to_string()),
+        Err(e) => serde_json::to_string(&e.to_string()).unwrap_or_else(|e| e.to_string())
+      }
+    }
+    Err(e) => {
+      return e.to_string();
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use ed448_goldilocks_plus::{Scalar, elliptic_curve::Group, EdwardsPoint};
+
+    #[test]
+    fn test_verify() {    
+      let priv_key = ed448_rust::PrivateKey::new(&mut rand::thread_rng());
+      let pub_key = ed448_rust::PublicKey::from(&priv_key);
+      let sig = js_sign_ed448(&BASE64_STANDARD.encode(priv_key.as_bytes()).to_string(), "AQAB");
+      assert_eq!(js_verify_ed448(&BASE64_STANDARD.encode(pub_key.as_byte()).to_string(), "AQAB", &serde_json::from_str::<String>(&sig.to_string()).unwrap()), "true")
+    }
+}
