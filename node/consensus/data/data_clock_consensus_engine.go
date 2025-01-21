@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/libp2p/go-libp2p/p2p/discovery/backoff"
 	"github.com/multiformats/go-multiaddr"
 	mn "github.com/multiformats/go-multiaddr/net"
@@ -29,6 +30,7 @@ import (
 	qtime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	qcrypto "source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/internal/cas"
 	"source.quilibrium.com/quilibrium/monorepo/node/internal/frametime"
 	qgrpc "source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
@@ -124,6 +126,7 @@ type DataClockConsensusEngine struct {
 	previousHead                    *protobufs.ClockFrame
 	engineMx                        sync.Mutex
 	dependencyMapMx                 sync.Mutex
+	recentlyProcessedFrames         *lru.Cache[string, struct{}]
 	stagedTransactions              *protobufs.TokenRequests
 	stagedTransactionsSet           map[string]struct{}
 	stagedTransactionsMx            sync.Mutex
@@ -140,6 +143,7 @@ type DataClockConsensusEngine struct {
 	infoMessageProcessorCh          chan *pb.Message
 	report                          *protobufs.SelfTestReport
 	clients                         []protobufs.DataIPCServiceClient
+	clientsMx                       sync.Mutex
 	grpcRateLimiter                 *RateLimiter
 	previousFrameProven             *protobufs.ClockFrame
 	previousTree                    *mt.MerkleTree
@@ -233,6 +237,11 @@ func NewDataClockConsensusEngine(
 		panic(err)
 	}
 
+	cache, err := lru.New[string, struct{}](25)
+	if err != nil {
+		panic(err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &DataClockConsensusEngine{
 		ctx:              ctx,
@@ -281,6 +290,7 @@ func NewDataClockConsensusEngine(
 		requestSyncCh:            make(chan struct{}, 1),
 		validationFilter:         map[string]struct{}{},
 		clockFrameFragmentBuffer: clockFrameFragmentBuffer,
+		recentlyProcessedFrames:  cache,
 	}
 
 	logger.Info("constructing consensus engine")
@@ -561,19 +571,7 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
-		if len(e.config.Engine.DataWorkerMultiaddrs) != 0 {
-			e.clients, err = e.createParallelDataClientsFromList()
-			if err != nil {
-				panic(err)
-			}
-		} else {
-			e.clients, err = e.createParallelDataClientsFromBaseMultiaddr(
-				e.config.Engine.DataWorkerCount,
-			)
-			if err != nil {
-				panic(err)
-			}
-		}
+		e.createParallelDataWorkerClients()
 	}()
 
 	return errChan
@@ -581,6 +579,7 @@ func (e *DataClockConsensusEngine) Start() <-chan error {
 
 func (e *DataClockConsensusEngine) PerformTimeProof(
 	frame *protobufs.ClockFrame,
+	previousTreeRoot []byte,
 	difficulty uint32,
 	ring int,
 ) []mt.DataBlock {
@@ -613,6 +612,12 @@ func (e *DataClockConsensusEngine) PerformTimeProof(
 
 	wg := sync.WaitGroup{}
 	wg.Add(len(actives))
+	challengeOutput := []byte{}
+	if frame.FrameNumber >= application.PROOF_FRAME_COMBINE_CUTOFF {
+		challengeOutput = append(append([]byte{}, frame.Output...), previousTreeRoot...)
+	} else {
+		challengeOutput = frame.Output
+	}
 
 	for i, client := range actives {
 		i := i
@@ -625,7 +630,7 @@ func (e *DataClockConsensusEngine) PerformTimeProof(
 					&protobufs.ChallengeProofRequest{
 						PeerId:      e.pubSub.GetPeerID(),
 						Core:        uint32(i),
-						Output:      frame.Output,
+						Output:      challengeOutput,
 						FrameNumber: frame.FrameNumber,
 						Difficulty:  frame.Difficulty,
 					},
@@ -823,211 +828,155 @@ func (e *DataClockConsensusEngine) createCommunicationKeys() error {
 	return nil
 }
 
-func (e *DataClockConsensusEngine) createParallelDataClientsFromListAndIndex(
-	index uint32,
+func (e *DataClockConsensusEngine) connectToClient(
+	index int,
+	useList bool,
 ) (
 	protobufs.DataIPCServiceClient,
 	error,
 ) {
-	ma, err := multiaddr.NewMultiaddr(e.config.Engine.DataWorkerMultiaddrs[index])
-	if err != nil {
-		return nil, errors.Wrap(err, "create parallel data client")
-	}
-
-	_, addr, err := mn.DialArgs(ma)
-	if err != nil {
-		return nil, errors.Wrap(err, "create parallel data client")
-	}
-
-	ctx, cancel := context.WithTimeout(e.ctx, 1*time.Second)
-	defer cancel()
-	conn, err := qgrpc.DialContext(
-		ctx,
-		addr,
-		grpc.WithTransportCredentials(
-			insecure.NewCredentials(),
-		),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallSendMsgSize(10*1024*1024),
-			grpc.MaxCallRecvMsgSize(10*1024*1024),
-		),
-		grpc.WithBlock(),
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "create parallel data client")
-	}
-
-	client := protobufs.NewDataIPCServiceClient(conn)
-
-	e.logger.Info(
-		"connected to data worker process",
-		zap.Uint32("client", index),
-	)
-	return client, nil
-}
-
-func (
-	e *DataClockConsensusEngine,
-) createParallelDataClientsFromBaseMultiaddrAndIndex(
-	index uint32,
-) (
-	protobufs.DataIPCServiceClient,
-	error,
-) {
-	e.logger.Info(
-		"re-connecting to data worker process",
-		zap.Uint32("client", index),
-	)
-
-	ma, err := multiaddr.NewMultiaddr(
-		fmt.Sprintf(
-			e.config.Engine.DataWorkerBaseListenMultiaddr,
-			int(e.config.Engine.DataWorkerBaseListenPort)+int(index),
-		),
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "create parallel data client")
-	}
-
-	_, addr, err := mn.DialArgs(ma)
-	if err != nil {
-		return nil, errors.Wrap(err, "create parallel data client")
-	}
-
-	ctx, cancel := context.WithTimeout(e.ctx, 1*time.Second)
-	defer cancel()
-	conn, err := qgrpc.DialContext(
-		ctx,
-		addr,
-		grpc.WithTransportCredentials(
-			insecure.NewCredentials(),
-		),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallSendMsgSize(10*1024*1024),
-			grpc.MaxCallRecvMsgSize(10*1024*1024),
-		),
-		grpc.WithBlock(),
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "create parallel data client")
-	}
-
-	client := protobufs.NewDataIPCServiceClient(conn)
-
-	e.logger.Info(
-		"connected to data worker process",
-		zap.Uint32("client", index),
-	)
-	return client, nil
-}
-
-func (e *DataClockConsensusEngine) createParallelDataClientsFromList() (
-	[]protobufs.DataIPCServiceClient,
-	error,
-) {
-	parallelism := len(e.config.Engine.DataWorkerMultiaddrs)
-
-	e.logger.Info(
-		"connecting to data worker processes",
-		zap.Int("parallelism", parallelism),
-	)
-
-	clients := make([]protobufs.DataIPCServiceClient, parallelism)
-
-	for i := 0; i < parallelism; i++ {
-		ma, err := multiaddr.NewMultiaddr(e.config.Engine.DataWorkerMultiaddrs[i])
-		if err != nil {
-			panic(err)
-		}
-
-		_, addr, err := mn.DialArgs(ma)
-		if err != nil {
-			e.logger.Error("could not get dial args", zap.Error(err))
-			continue
-		}
-
-		ctx, cancel := context.WithTimeout(e.ctx, 1*time.Second)
-		defer cancel()
-		conn, err := qgrpc.DialContext(
-			ctx,
-			addr,
-			grpc.WithTransportCredentials(
-				insecure.NewCredentials(),
-			),
-			grpc.WithDefaultCallOptions(
-				grpc.MaxCallSendMsgSize(10*1024*1024),
-				grpc.MaxCallRecvMsgSize(10*1024*1024),
-			),
-			grpc.WithBlock(),
-		)
-		if err != nil {
-			e.logger.Error("could not dial", zap.Error(err))
-			continue
-		}
-
-		clients[i] = protobufs.NewDataIPCServiceClient(conn)
-	}
-
-	e.logger.Info(
-		"connected to data worker processes",
-		zap.Int("parallelism", parallelism),
-	)
-	return clients, nil
-}
-
-func (e *DataClockConsensusEngine) createParallelDataClientsFromBaseMultiaddr(
-	parallelism int,
-) ([]protobufs.DataIPCServiceClient, error) {
-	e.logger.Info(
-		"connecting to data worker processes",
-		zap.Int("parallelism", parallelism),
-	)
-
-	clients := make([]protobufs.DataIPCServiceClient, parallelism)
-
-	for i := 0; i < parallelism; i++ {
-		ma, err := multiaddr.NewMultiaddr(
+	var ma multiaddr.Multiaddr
+	var err error
+	if useList {
+		ma, err = multiaddr.NewMultiaddr(e.config.Engine.DataWorkerMultiaddrs[index])
+	} else {
+		ma, err = multiaddr.NewMultiaddr(
 			fmt.Sprintf(
 				e.config.Engine.DataWorkerBaseListenMultiaddr,
-				int(e.config.Engine.DataWorkerBaseListenPort)+i,
+				int(e.config.Engine.DataWorkerBaseListenPort)+int(index),
 			),
 		)
-		if err != nil {
-			panic(err)
-		}
+	}
+	if err != nil {
+		e.logger.Error("failed to create multiaddr", zap.Error(err))
+		return nil, err
+	}
 
-		_, addr, err := mn.DialArgs(ma)
-		if err != nil {
-			e.logger.Error("could not get dial args", zap.Error(err))
-			continue
-		}
-		ctx, cancel := context.WithTimeout(e.ctx, 1*time.Second)
-		defer cancel()
-		conn, err := qgrpc.DialContext(
-			ctx,
-			addr,
-			grpc.WithTransportCredentials(
-				insecure.NewCredentials(),
-			),
-			grpc.WithDefaultCallOptions(
-				grpc.MaxCallSendMsgSize(10*1024*1024),
-				grpc.MaxCallRecvMsgSize(10*1024*1024),
-			),
-			grpc.WithBlock(),
+	_, addr, err := mn.DialArgs(ma)
+
+	if err != nil {
+		e.logger.Error("could not get dial args",
+			zap.Error(err),
+			zap.String("multiaddr", ma.String()),
+			zap.Int("index", index),
 		)
-		if err != nil {
-			e.logger.Error("could not dial", zap.Error(err))
-			continue
-		}
+		return nil, err
+	}
 
-		clients[i] = protobufs.NewDataIPCServiceClient(conn)
+	ctx, cancel := context.WithTimeout(e.ctx, 1*time.Second)
+	defer cancel()
+	conn, err := qgrpc.DialContext(
+		ctx,
+		addr,
+		grpc.WithTransportCredentials(
+			insecure.NewCredentials(),
+		),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallSendMsgSize(10*1024*1024),
+			grpc.MaxCallRecvMsgSize(10*1024*1024),
+		),
+		grpc.WithBlock(),
+	)
+	if err != nil {
+		e.logger.Error("could not dial",
+			zap.Error(err),
+			zap.String("multiaddr", ma.String()),
+			zap.Int("index", index),
+		)
+		return nil, err
 	}
 
 	e.logger.Info(
-		"connected to data worker processes",
+		"connected to data worker process",
+		zap.String("multiaddr", ma.String()),
+	)
+
+	return protobufs.NewDataIPCServiceClient(conn), nil
+
+}
+
+func (e *DataClockConsensusEngine) createParallelDataWorkerClients() {
+	parallelism := len(e.config.Engine.DataWorkerMultiaddrs)
+	useList := true
+	if parallelism == 0 {
+		parallelism = e.config.Engine.DataWorkerCount
+		useList = false
+	}
+
+	e.clientsMx.Lock()
+	e.clients = make([]protobufs.DataIPCServiceClient, parallelism)
+	e.clientsMx.Unlock()
+
+	e.logger.Info(
+		"connecting to data worker processes",
 		zap.Int("parallelism", parallelism),
 	)
-	return clients, nil
+
+	wg := sync.WaitGroup{}
+	wg.Add(parallelism)
+	for i := 0; i < parallelism; i++ {
+		index := i
+		go func() {
+			defer wg.Done()
+			client, err := e.connectToClient(index, useList)
+			if err != nil {
+				e.clientsMx.Lock()
+				e.clients[index] = nil
+				e.clientsMx.Unlock()
+				e.logger.Error("failed to connect to data worker", zap.Error(err))
+				return
+			}
+			e.clientsMx.Lock()
+			e.clients[index] = client
+			e.clientsMx.Unlock()
+		}()
+	}
+	wg.Wait()
+}
+
+func (e *DataClockConsensusEngine) tryReconnectDataWorkerClients() {
+	// could reload worker list config here
+	parallelism := len(e.config.Engine.DataWorkerMultiaddrs)
+	useList := true
+	if parallelism == 0 {
+		parallelism = e.config.Engine.DataWorkerCount
+		useList = false
+	}
+
+	wg := sync.WaitGroup{}
+	wg.Add(parallelism)
+	for i := 0; i < parallelism; i++ {
+		index := i
+
+		go func() {
+			defer wg.Done()
+			if e.clients[index] != nil {
+				return
+			}
+			for j := 3; j >= 0; j-- {
+				client, err := e.connectToClient(index, useList)
+				if err != nil {
+					e.clientsMx.Lock()
+					e.clients[index] = nil
+					e.clientsMx.Unlock()
+					e.logger.Error("failed to connect to data worker",
+						zap.Error(err),
+						zap.Int("index", index),
+					)
+					time.Sleep(50 * time.Millisecond)
+					continue
+				}
+				e.clientsMx.Lock()
+				e.logger.Info("reconnected to data worker",
+					zap.Int("index", index),
+				)
+				e.clients[index] = client
+				e.clientsMx.Unlock()
+				break
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func (e *DataClockConsensusEngine) GetWorkerCount() uint32 {

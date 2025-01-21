@@ -2,10 +2,8 @@ package data
 
 import (
 	"bytes"
-	"sync"
 	"time"
 
-	"github.com/iden3/go-iden3-crypto/poseidon"
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
@@ -233,6 +231,7 @@ func (e *DataClockConsensusEngine) processFrame(
 	latestFrame *protobufs.ClockFrame,
 	dataFrame *protobufs.ClockFrame,
 ) *protobufs.ClockFrame {
+
 	e.logger.Info(
 		"current frame head",
 		zap.Uint64("frame_number", dataFrame.FrameNumber),
@@ -275,175 +274,12 @@ func (e *DataClockConsensusEngine) processFrame(
 			return dataFrame
 		}
 
-		e.dataTimeReel.Insert(e.ctx, nextFrame, true)
+		if _, err := e.dataTimeReel.Insert(e.ctx, nextFrame); err != nil {
+			e.logger.Debug("could not insert frame", zap.Error(err))
+		}
 
 		return nextFrame
 	} else {
-		if latestFrame.Timestamp > time.Now().UnixMilli()-120000 {
-			if !e.IsInProverTrie(e.pubSub.GetPeerID()) {
-				e.logger.Info("announcing prover join")
-				for _, eng := range e.executionEngines {
-					eng.AnnounceProverJoin()
-					break
-				}
-			} else {
-				if e.previousFrameProven != nil &&
-					e.previousFrameProven.FrameNumber == latestFrame.FrameNumber {
-					return latestFrame
-				}
-
-				h, err := poseidon.HashBytes(e.pubSub.GetPeerID())
-				if err != nil {
-					panic(err)
-				}
-				peerProvingKeyAddress := h.FillBytes(make([]byte, 32))
-
-				ring := -1
-				if tries := e.GetFrameProverTries(); len(tries) > 1 {
-					for i, tries := range tries[1:] {
-						i := i
-						if tries.Contains(peerProvingKeyAddress) {
-							ring = i
-						}
-					}
-				}
-
-				e.clientReconnectTest++
-				if e.clientReconnectTest >= 10 {
-					wg := sync.WaitGroup{}
-					wg.Add(len(e.clients))
-					for i, client := range e.clients {
-						i := i
-						client := client
-						go func() {
-							for j := 3; j >= 0; j-- {
-								var err error
-								if client == nil {
-									if len(e.config.Engine.DataWorkerMultiaddrs) != 0 {
-										e.logger.Error(
-											"client failed, reconnecting after 50ms",
-											zap.Uint32("client", uint32(i)),
-										)
-										time.Sleep(50 * time.Millisecond)
-										client, err = e.createParallelDataClientsFromListAndIndex(uint32(i))
-										if err != nil {
-											e.logger.Error("failed to reconnect", zap.Error(err))
-										}
-									} else if len(e.config.Engine.DataWorkerMultiaddrs) == 0 {
-										e.logger.Error(
-											"client failed, reconnecting after 50ms",
-											zap.Uint32("client", uint32(i)),
-										)
-										time.Sleep(50 * time.Millisecond)
-										client, err =
-											e.createParallelDataClientsFromBaseMultiaddrAndIndex(uint32(i))
-										if err != nil {
-											e.logger.Error(
-												"failed to reconnect",
-												zap.Uint32("client", uint32(i)),
-												zap.Error(err),
-											)
-										}
-									}
-									e.clients[i] = client
-									continue
-								}
-							}
-							wg.Done()
-						}()
-					}
-					wg.Wait()
-					e.clientReconnectTest = 0
-				}
-
-				outputs := e.PerformTimeProof(latestFrame, latestFrame.Difficulty, ring)
-				if outputs == nil || len(outputs) < 3 {
-					e.logger.Info("workers not yet available for proving")
-					return latestFrame
-				}
-				modulo := len(outputs)
-				proofTree, output, err := tries.PackOutputIntoPayloadAndProof(
-					outputs,
-					modulo,
-					latestFrame,
-					e.previousTree,
-				)
-				if err != nil {
-					e.logger.Error(
-						"could not successfully pack proof, reattempting",
-						zap.Error(err),
-					)
-					return latestFrame
-				}
-				e.previousFrameProven = latestFrame
-				e.previousTree = proofTree
-
-				mint := &protobufs.MintCoinRequest{
-					Proofs: output,
-				}
-				if err := mint.SignED448(e.pubSub.GetPublicKey(), e.pubSub.SignMessage); err != nil {
-					e.logger.Error("could not sign mint", zap.Error(err))
-					return latestFrame
-				}
-				if err := mint.Validate(); err != nil {
-					e.logger.Error("mint validation failed", zap.Error(err))
-					return latestFrame
-				}
-
-				e.logger.Info(
-					"submitting data proof",
-					zap.Int("ring", ring),
-					zap.Int("active_workers", len(outputs)),
-					zap.Uint64("frame_number", latestFrame.FrameNumber),
-					zap.Duration("frame_age", frametime.Since(latestFrame)),
-				)
-
-				if err := e.publishMessage(e.txFilter, mint.TokenRequest()); err != nil {
-					e.logger.Error("could not publish mint", zap.Error(err))
-				}
-
-				if e.config.Engine.AutoMergeCoins {
-					_, addrs, _, err := e.coinStore.GetCoinsForOwner(
-						peerProvingKeyAddress,
-					)
-					if err != nil {
-						e.logger.Error(
-							"received error while iterating coins",
-							zap.Error(err),
-						)
-						return latestFrame
-					}
-
-					if len(addrs) > 25 {
-						refs := []*protobufs.CoinRef{}
-						for _, addr := range addrs {
-							refs = append(refs, &protobufs.CoinRef{
-								Address: addr,
-							})
-						}
-
-						merge := &protobufs.MergeCoinRequest{
-							Coins: refs,
-						}
-						if err := merge.SignED448(
-							e.pubSub.GetPublicKey(),
-							e.pubSub.SignMessage,
-						); err != nil {
-							e.logger.Error("could not sign merge", zap.Error(err))
-							return latestFrame
-						}
-						if err := merge.Validate(); err != nil {
-							e.logger.Error("merge validation failed", zap.Error(err))
-							return latestFrame
-						}
-
-						if err := e.publishMessage(e.txFilter, merge.TokenRequest()); err != nil {
-							e.logger.Warn("could not publish merge", zap.Error(err))
-						}
-					}
-				}
-			}
-		}
 		return latestFrame
 	}
 }

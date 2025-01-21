@@ -10,9 +10,12 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/data/internal"
 	"source.quilibrium.com/quilibrium/monorepo/node/internal/frametime"
+	"source.quilibrium.com/quilibrium/monorepo/node/tries"
 
+	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
+	mt "github.com/txaty/go-merkletree"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
@@ -27,15 +30,13 @@ func (e *DataClockConsensusEngine) syncWithMesh() error {
 	if err != nil {
 		return errors.Wrap(err, "sync")
 	}
+	var doneChs []<-chan struct{}
 	for {
 		candidates := e.GetAheadPeers(max(latest.FrameNumber, e.latestFrameReceived))
 		if len(candidates) == 0 {
 			break
 		}
 		for _, candidate := range candidates {
-			if candidate.MaxFrame <= max(latest.FrameNumber, e.latestFrameReceived) {
-				continue
-			}
 			head, err := e.dataTimeReel.Head()
 			if err != nil {
 				return errors.Wrap(err, "sync")
@@ -43,10 +44,21 @@ func (e *DataClockConsensusEngine) syncWithMesh() error {
 			if latest.FrameNumber < head.FrameNumber {
 				latest = head
 			}
-			latest, err = e.syncWithPeer(latest, candidate.MaxFrame, candidate.PeerID)
+			if candidate.MaxFrame <= max(latest.FrameNumber, e.latestFrameReceived) {
+				continue
+			}
+			latest, doneChs, err = e.syncWithPeer(latest, doneChs, candidate.MaxFrame, candidate.PeerID)
 			if err != nil {
 				e.logger.Debug("error syncing frame", zap.Error(err))
 			}
+		}
+	}
+
+	for _, doneCh := range doneChs {
+		select {
+		case <-e.ctx.Done():
+			return e.ctx.Err()
+		case <-doneCh:
 		}
 	}
 
@@ -312,13 +324,13 @@ func (e *DataClockConsensusEngine) GetAheadPeers(frameNumber uint64) []internal.
 }
 
 func (e *DataClockConsensusEngine) syncWithPeer(
-	currentLatest *protobufs.ClockFrame,
+	latest *protobufs.ClockFrame,
+	doneChs []<-chan struct{},
 	maxFrame uint64,
 	peerId []byte,
-) (*protobufs.ClockFrame, error) {
+) (*protobufs.ClockFrame, []<-chan struct{}, error) {
 	e.syncingStatus = SyncStatusSynchronizing
 	defer func() { e.syncingStatus = SyncStatusNotSyncing }()
-	latest := currentLatest
 	e.logger.Info(
 		"polling peer for new frames",
 		zap.String("peer_id", peer.ID(peerId).String()),
@@ -350,7 +362,7 @@ func (e *DataClockConsensusEngine) syncWithPeer(
 			zap.Error(err),
 		)
 		cooperative = false
-		return latest, errors.Wrap(err, "sync")
+		return latest, doneChs, errors.Wrap(err, "sync")
 	}
 	defer func() {
 		if err := cc.Close(); err != nil {
@@ -378,12 +390,12 @@ func (e *DataClockConsensusEngine) syncWithPeer(
 				zap.Error(err),
 			)
 			cooperative = false
-			return latest, errors.Wrap(err, "sync")
+			return latest, doneChs, errors.Wrap(err, "sync")
 		}
 
 		if response == nil {
 			e.logger.Debug("received no response from peer")
-			return latest, nil
+			return latest, doneChs, nil
 		}
 
 		if response.ClockFrame == nil ||
@@ -391,7 +403,7 @@ func (e *DataClockConsensusEngine) syncWithPeer(
 			response.ClockFrame.Timestamp < latest.Timestamp {
 			e.logger.Debug("received invalid response from peer")
 			cooperative = false
-			return latest, nil
+			return latest, doneChs, nil
 		}
 		e.logger.Info(
 			"received new leading frame",
@@ -406,12 +418,159 @@ func (e *DataClockConsensusEngine) syncWithPeer(
 		if err := e.frameProver.VerifyDataClockFrame(
 			response.ClockFrame,
 		); err != nil {
-			return nil, errors.Wrap(err, "sync")
+			return latest, doneChs, errors.Wrap(err, "sync")
 		}
-		e.dataTimeReel.Insert(e.ctx, response.ClockFrame, true)
+		doneCh, err := e.dataTimeReel.Insert(e.ctx, response.ClockFrame)
+		if err != nil {
+			return latest, doneChs, errors.Wrap(err, "sync")
+		}
+		doneChs = append(doneChs, doneCh)
 		latest = response.ClockFrame
 		if latest.FrameNumber >= maxFrame {
-			return latest, nil
+			return latest, doneChs, nil
+		}
+	}
+}
+
+func (e *DataClockConsensusEngine) initiateProvers(
+	latestFrame *protobufs.ClockFrame,
+) {
+	if latestFrame.Timestamp > time.Now().UnixMilli()-60000 {
+		if !e.IsInProverTrie(e.pubSub.GetPeerID()) {
+			e.logger.Info("announcing prover join")
+			for _, eng := range e.executionEngines {
+				eng.AnnounceProverJoin()
+				break
+			}
+		} else {
+			if e.previousFrameProven != nil &&
+				e.previousFrameProven.FrameNumber == latestFrame.FrameNumber {
+				return
+			}
+
+			h, err := poseidon.HashBytes(e.pubSub.GetPeerID())
+			if err != nil {
+				panic(err)
+			}
+			peerProvingKeyAddress := h.FillBytes(make([]byte, 32))
+
+			ring := -1
+			if tries := e.GetFrameProverTries(); len(tries) > 1 {
+				for i, tries := range tries[1:] {
+					i := i
+					if tries.Contains(peerProvingKeyAddress) {
+						ring = i
+					}
+				}
+			}
+
+			e.clientReconnectTest++
+			if e.clientReconnectTest >= 10 {
+				e.tryReconnectDataWorkerClients()
+				e.clientReconnectTest = 0
+			}
+
+			previousTreeRoot := []byte{}
+			if e.previousTree != nil {
+				previousTreeRoot = e.previousTree.Root
+			}
+			outputs := e.PerformTimeProof(latestFrame, previousTreeRoot, latestFrame.Difficulty, ring)
+			if outputs == nil || len(outputs) < 3 {
+				e.logger.Info("workers not yet available for proving")
+				return
+			}
+			modulo := len(outputs)
+			var proofTree *mt.MerkleTree
+			var output [][]byte
+			if latestFrame.FrameNumber >= application.PROOF_FRAME_COMBINE_CUTOFF {
+				proofTree, output, err = tries.PackOutputIntoMultiPayloadAndProof(
+					outputs,
+					modulo,
+					latestFrame,
+					e.previousTree,
+				)
+			} else {
+				proofTree, output, err = tries.PackOutputIntoPayloadAndProof(
+					outputs,
+					modulo,
+					latestFrame,
+					e.previousTree,
+				)
+			}
+			if err != nil {
+				e.logger.Error(
+					"could not successfully pack proof, reattempting",
+					zap.Error(err),
+				)
+				return
+			}
+			e.previousFrameProven = latestFrame
+			e.previousTree = proofTree
+
+			mint := &protobufs.MintCoinRequest{
+				Proofs: output,
+			}
+			if err := mint.SignED448(e.pubSub.GetPublicKey(), e.pubSub.SignMessage); err != nil {
+				e.logger.Error("could not sign mint", zap.Error(err))
+				return
+			}
+			if err := mint.Validate(); err != nil {
+				e.logger.Error("mint validation failed", zap.Error(err))
+				return
+			}
+
+			e.logger.Info(
+				"submitting data proof",
+				zap.Int("ring", ring),
+				zap.Int("active_workers", len(outputs)),
+				zap.Uint64("frame_number", latestFrame.FrameNumber),
+				zap.Duration("frame_age", frametime.Since(latestFrame)),
+			)
+
+			if err := e.publishMessage(e.txFilter, mint.TokenRequest()); err != nil {
+				e.logger.Error("could not publish mint", zap.Error(err))
+			}
+
+			if e.config.Engine.AutoMergeCoins {
+				_, addrs, _, err := e.coinStore.GetCoinsForOwner(
+					peerProvingKeyAddress,
+				)
+				if err != nil {
+					e.logger.Error(
+						"received error while iterating coins",
+						zap.Error(err),
+					)
+					return
+				}
+
+				if len(addrs) > 25 {
+					refs := []*protobufs.CoinRef{}
+					for _, addr := range addrs {
+						refs = append(refs, &protobufs.CoinRef{
+							Address: addr,
+						})
+					}
+
+					merge := &protobufs.MergeCoinRequest{
+						Coins: refs,
+					}
+					if err := merge.SignED448(
+						e.pubSub.GetPublicKey(),
+						e.pubSub.SignMessage,
+					); err != nil {
+						e.logger.Error("could not sign merge", zap.Error(err))
+						return
+					}
+					if err := merge.Validate(); err != nil {
+						e.logger.Error("merge validation failed", zap.Error(err))
+						return
+					}
+
+					if err := e.publishMessage(e.txFilter, merge.TokenRequest()); err != nil {
+						e.logger.Warn("could not publish merge", zap.Error(err))
+					}
+				}
+			}
 		}
 	}
 }
