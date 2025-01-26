@@ -14,9 +14,15 @@ var ErrInvalidLocation = errors.New("invalid location")
 var ErrMissingExtrinsics = errors.New("missing extrinsics")
 var ErrIsExtrinsic = errors.New("is extrinsic")
 
+type Encrypted interface {
+	RawRepresentation() []byte
+	Verify() bool
+}
+
 type Vertex struct {
 	AppAddress  [32]byte
 	DataAddress [32]byte
+	Data        Encrypted
 }
 
 type Hyperedge struct {
