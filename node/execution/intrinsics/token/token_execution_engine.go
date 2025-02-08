@@ -5,7 +5,9 @@ import (
 	"context"
 	"crypto"
 	"encoding/hex"
+	"fmt"
 	"math/big"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -26,6 +28,7 @@ import (
 	qcrypto "source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
+	hypergraph "source.quilibrium.com/quilibrium/monorepo/node/hypergraph/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/internal/frametime"
 	qruntime "source.quilibrium.com/quilibrium/monorepo/node/internal/runtime"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
@@ -87,6 +90,7 @@ type TokenExecutionEngine struct {
 	logger                *zap.Logger
 	clock                 *data.DataClockConsensusEngine
 	clockStore            store.ClockStore
+	hypergraphStore       store.HypergraphStore
 	coinStore             store.CoinStore
 	keyStore              store.KeyStore
 	keyManager            keys.KeyManager
@@ -104,7 +108,8 @@ type TokenExecutionEngine struct {
 	intrinsicFilter       []byte
 	frameProver           qcrypto.FrameProver
 	peerSeniority         *PeerSeniority
-	stateTree             *qcrypto.VectorCommitmentTree
+	hypergraph            *hypergraph.Hypergraph
+	mpcithVerEnc          *qcrypto.MPCitHVerifiableEncryptor
 }
 
 func NewTokenExecutionEngine(
@@ -116,6 +121,7 @@ func NewTokenExecutionEngine(
 	inclusionProver qcrypto.InclusionProver,
 	clockStore store.ClockStore,
 	dataProofStore store.DataProofStore,
+	hypergraphStore store.HypergraphStore,
 	coinStore store.CoinStore,
 	masterTimeReel *time.MasterTimeReel,
 	peerInfoManager p2p.PeerInfoManager,
@@ -138,7 +144,10 @@ func NewTokenExecutionEngine(
 	var inclusionProof *qcrypto.InclusionAggregateProof
 	var proverKeys [][]byte
 	var peerSeniority map[string]uint64
-	stateTree := &qcrypto.VectorCommitmentTree{}
+	hypergraph := hypergraph.NewHypergraph()
+	mpcithVerEnc := qcrypto.NewMPCitHVerifiableEncryptor(
+		runtime.NumCPU(),
+	)
 
 	if err != nil && errors.Is(err, store.ErrNotFound) {
 		origin, inclusionProof, proverKeys, peerSeniority = CreateGenesisState(
@@ -148,7 +157,9 @@ func NewTokenExecutionEngine(
 			inclusionProver,
 			clockStore,
 			coinStore,
-			stateTree,
+			hypergraphStore,
+			hypergraph,
+			mpcithVerEnc,
 			uint(cfg.P2P.Network),
 		)
 		if err := coinStore.SetMigrationVersion(
@@ -159,25 +170,29 @@ func NewTokenExecutionEngine(
 	} else if err != nil {
 		panic(err)
 	} else {
-		err := coinStore.Migrate(
-			intrinsicFilter,
-			config.GetGenesis().GenesisSeedHex,
-		)
-		if err != nil {
-			panic(err)
-		}
-		_, err = clockStore.GetEarliestDataClockFrame(intrinsicFilter)
-		if err != nil && errors.Is(err, store.ErrNotFound) {
-			origin, inclusionProof, proverKeys, peerSeniority = CreateGenesisState(
-				logger,
-				cfg.Engine,
-				nil,
-				inclusionProver,
-				clockStore,
-				coinStore,
-				stateTree,
-				uint(cfg.P2P.Network),
+		if pubSub.GetNetwork() == 0 {
+			err := coinStore.Migrate(
+				intrinsicFilter,
+				config.GetGenesis().GenesisSeedHex,
 			)
+			if err != nil {
+				panic(err)
+			}
+			_, err = clockStore.GetEarliestDataClockFrame(intrinsicFilter)
+			if err != nil && errors.Is(err, store.ErrNotFound) {
+				origin, inclusionProof, proverKeys, peerSeniority = CreateGenesisState(
+					logger,
+					cfg.Engine,
+					nil,
+					inclusionProver,
+					clockStore,
+					coinStore,
+					hypergraphStore,
+					hypergraph,
+					mpcithVerEnc,
+					uint(cfg.P2P.Network),
+				)
+			}
 		}
 	}
 
@@ -222,6 +237,7 @@ func NewTokenExecutionEngine(
 		keyManager:            keyManager,
 		clockStore:            clockStore,
 		coinStore:             coinStore,
+		hypergraphStore:       hypergraphStore,
 		keyStore:              keyStore,
 		pubSub:                pubSub,
 		inclusionProver:       inclusionProver,
@@ -231,6 +247,7 @@ func NewTokenExecutionEngine(
 		alreadyPublishedShare: false,
 		intrinsicFilter:       intrinsicFilter,
 		peerSeniority:         NewFromMap(peerSeniority),
+		mpcithVerEnc:          mpcithVerEnc,
 	}
 
 	alwaysSend := false
@@ -346,13 +363,21 @@ func NewTokenExecutionEngine(
 	e.proverPublicKey = publicKeyBytes
 	e.provingKeyAddress = provingKeyAddress
 
-	e.stateTree, err = e.clockStore.GetDataStateTree(e.intrinsicFilter)
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		panic(err)
-	}
+	_, _, err = e.clockStore.GetLatestDataClockFrame(e.intrinsicFilter)
+	if err != nil {
+		e.rebuildHypergraph()
+	} else {
+		e.hypergraph, err = e.hypergraphStore.LoadHypergraph()
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			e.logger.Error(
+				"error encountered while fetching hypergraph, rebuilding",
+				zap.Error(err),
+			)
+		}
 
-	if e.stateTree == nil {
-		e.rebuildStateTree()
+		if e.hypergraph == nil || len(e.hypergraph.GetVertexAdds()) == 0 {
+			e.rebuildHypergraph()
+		}
 	}
 
 	e.wg.Add(1)
@@ -419,34 +444,107 @@ func NewTokenExecutionEngine(
 
 var _ execution.ExecutionEngine = (*TokenExecutionEngine)(nil)
 
-func (e *TokenExecutionEngine) rebuildStateTree() {
-	e.logger.Info("rebuilding state tree")
-	e.stateTree = &qcrypto.VectorCommitmentTree{}
+func (e *TokenExecutionEngine) addBatchToHypergraph(batchKey [][]byte, batchValue [][]byte) {
+	var wg sync.WaitGroup
+	throttle := make(chan struct{}, runtime.NumCPU())
+	batchCompressed := make([][]hypergraph.Encrypted, len(batchKey))
+	for i, chunk := range batchValue {
+		throttle <- struct{}{}
+		wg.Add(1)
+		go func(chunk []byte, i int) {
+			defer func() { <-throttle }()
+			defer wg.Done()
+			e.logger.Debug(
+				"encrypting coin",
+				zap.String("address", hex.EncodeToString(batchKey[i])),
+			)
+			data := e.mpcithVerEnc.EncryptAndCompress(
+				chunk,
+				config.GetGenesis().Beacon,
+			)
+			compressed := []hypergraph.Encrypted{}
+			for _, d := range data {
+				compressed = append(compressed, d)
+			}
+			e.logger.Debug(
+				"encrypted coin",
+				zap.String("address", hex.EncodeToString(batchKey[i])),
+			)
+			batchCompressed[i] = compressed
+		}(chunk, i)
+	}
+	wg.Wait()
+
+	for i := range batchKey {
+		if err := e.hypergraph.AddVertex(
+			hypergraph.NewVertex(
+				[32]byte(application.TOKEN_ADDRESS),
+				[32]byte(batchKey[i]),
+				batchCompressed[i],
+			),
+		); err != nil {
+			panic(err)
+		}
+	}
+}
+
+func (e *TokenExecutionEngine) rebuildHypergraph() {
+	e.logger.Info("rebuilding hypergraph")
+	e.hypergraph = hypergraph.NewHypergraph()
 	iter, err := e.coinStore.RangeCoins()
 	if err != nil {
 		panic(err)
 	}
+	var batchKey, batchValue [][]byte
 	for iter.First(); iter.Valid(); iter.Next() {
-		e.stateTree.Insert(iter.Key()[2:], iter.Value())
+		key := make([]byte, len(iter.Key()[2:]))
+		copy(key, iter.Key()[2:])
+		batchKey = append(batchKey, key)
+
+		coin := &protobufs.Coin{}
+		err := proto.Unmarshal(iter.Value()[8:], coin)
+		if err != nil {
+			panic(err)
+		}
+
+		value := []byte{}
+		value = append(value, iter.Value()[:8]...)
+		value = append(value, coin.Amount...)
+		// implicit
+		value = append(value, 0x00)
+		value = append(value, coin.Owner.GetImplicitAccount().GetAddress()...)
+		// domain len
+		value = append(value, 0x00)
+		value = append(value, coin.Intersection...)
+		batchValue = append(batchValue, value)
+
+		if len(batchKey) == runtime.NumCPU() {
+			e.addBatchToHypergraph(batchKey, batchValue)
+			batchKey = [][]byte{}
+			batchValue = [][]byte{}
+		}
 	}
 	iter.Close()
 
-	iter, err = e.coinStore.RangePreCoinProofs()
-	if err != nil {
-		panic(err)
+	if len(batchKey) != 0 {
+		e.addBatchToHypergraph(batchKey, batchValue)
 	}
-	for iter.First(); iter.Valid(); iter.Next() {
-		e.stateTree.Insert(iter.Key()[2:], iter.Value())
-	}
-	iter.Close()
-	e.logger.Info("saving rebuilt state tree")
 
 	txn, err := e.clockStore.NewTransaction(false)
 	if err != nil {
 		panic(err)
 	}
 
-	err = e.clockStore.SetDataStateTree(txn, e.intrinsicFilter, e.stateTree)
+	e.logger.Info("committing hypergraph")
+
+	roots := e.hypergraph.Commit()
+
+	e.logger.Info(
+		"committed hypergraph state",
+		zap.String("root", fmt.Sprintf("%x", roots[0])),
+	)
+
+	err = e.hypergraphStore.SaveHypergraph(txn, e.hypergraph)
 	if err != nil {
 		txn.Abort()
 		panic(err)
@@ -623,10 +721,10 @@ func (e *TokenExecutionEngine) ProcessFrame(
 	}
 	wg.Wait()
 
-	stateTree, err := e.clockStore.GetDataStateTree(e.intrinsicFilter)
+	hg, err := e.hypergraphStore.LoadHypergraph()
 	if err != nil {
 		txn.Abort()
-		return nil, errors.Wrap(err, "process frame")
+		panic(err)
 	}
 
 	for i, output := range app.TokenOutputs.Outputs {
@@ -642,11 +740,42 @@ func (e *TokenExecutionEngine) ProcessFrame(
 				frame.FrameNumber,
 				address,
 				o.Coin,
-				stateTree,
 			)
 			if err != nil {
 				txn.Abort()
 				return nil, errors.Wrap(err, "process frame")
+			}
+
+			value := []byte{}
+			value = append(value, make([]byte, 8)...)
+			value = append(value, o.Coin.Amount...)
+			// implicit
+			value = append(value, 0x00)
+			value = append(
+				value,
+				o.Coin.Owner.GetImplicitAccount().GetAddress()...,
+			)
+			// domain len
+			value = append(value, 0x00)
+			value = append(value, o.Coin.Intersection...)
+
+			proofs := e.mpcithVerEnc.EncryptAndCompress(
+				value,
+				config.GetGenesis().Beacon,
+			)
+			compressed := []hypergraph.Encrypted{}
+			for _, d := range proofs {
+				compressed = append(compressed, d)
+			}
+			if err := hg.AddVertex(
+				hypergraph.NewVertex(
+					[32]byte(application.TOKEN_ADDRESS),
+					[32]byte(address),
+					compressed,
+				),
+			); err != nil {
+				txn.Abort()
+				panic(err)
 			}
 		case *protobufs.TokenOutput_DeletedCoin:
 			coin, err := e.coinStore.GetCoinByAddress(nil, o.DeletedCoin.Address)
@@ -658,11 +787,42 @@ func (e *TokenExecutionEngine) ProcessFrame(
 				txn,
 				o.DeletedCoin.Address,
 				coin,
-				stateTree,
 			)
 			if err != nil {
 				txn.Abort()
 				return nil, errors.Wrap(err, "process frame")
+			}
+
+			value := []byte{}
+			value = append(value, make([]byte, 8)...)
+			value = append(value, coin.Amount...)
+			// implicit
+			value = append(value, 0x00)
+			value = append(
+				value,
+				coin.Owner.GetImplicitAccount().GetAddress()...,
+			)
+			// domain len
+			value = append(value, 0x00)
+			value = append(value, coin.Intersection...)
+
+			proofs := e.mpcithVerEnc.EncryptAndCompress(
+				value,
+				config.GetGenesis().Beacon,
+			)
+			compressed := []hypergraph.Encrypted{}
+			for _, d := range proofs {
+				compressed = append(compressed, d)
+			}
+			if err := hg.RemoveVertex(
+				hypergraph.NewVertex(
+					[32]byte(application.TOKEN_ADDRESS),
+					[32]byte(o.DeletedCoin.Address),
+					compressed,
+				),
+			); err != nil {
+				txn.Abort()
+				panic(err)
 			}
 		case *protobufs.TokenOutput_Proof:
 			address, err := outputAddresses[i], outputAddressErrors[i]
@@ -675,12 +835,12 @@ func (e *TokenExecutionEngine) ProcessFrame(
 				frame.FrameNumber,
 				address,
 				o.Proof,
-				stateTree,
 			)
 			if err != nil {
 				txn.Abort()
 				return nil, errors.Wrap(err, "process frame")
 			}
+
 			if len(o.Proof.Amount) == 32 &&
 				!bytes.Equal(o.Proof.Amount, make([]byte, 32)) &&
 				o.Proof.Commitment != nil {
@@ -713,7 +873,6 @@ func (e *TokenExecutionEngine) ProcessFrame(
 				txn,
 				address,
 				o.DeletedProof,
-				stateTree,
 			)
 			if err != nil {
 				txn.Abort()
@@ -1029,17 +1188,25 @@ func (e *TokenExecutionEngine) ProcessFrame(
 		}
 	}
 
-	err = e.clockStore.SetDataStateTree(
+	e.logger.Info("committing hypergraph")
+
+	roots := hg.Commit()
+
+	e.logger.Info(
+		"commited hypergraph",
+		zap.String("root", fmt.Sprintf("%x", roots[0])),
+	)
+
+	err = e.hypergraphStore.SaveHypergraph(
 		txn,
-		e.intrinsicFilter,
-		stateTree,
+		hg,
 	)
 	if err != nil {
 		txn.Abort()
 		return nil, errors.Wrap(err, "process frame")
 	}
 
-	e.stateTree = stateTree
+	e.hypergraph = hg
 
 	return app.Tries, nil
 }

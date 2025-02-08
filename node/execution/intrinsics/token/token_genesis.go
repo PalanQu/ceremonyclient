@@ -2,6 +2,7 @@ package token
 
 import (
 	_ "embed"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -17,9 +18,9 @@ import (
 	"google.golang.org/protobuf/proto"
 	"source.quilibrium.com/quilibrium/monorepo/nekryptology/pkg/vdf"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
-	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	qcrypto "source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
+	hypergraph "source.quilibrium.com/quilibrium/monorepo/node/hypergraph/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
@@ -504,7 +505,9 @@ func CreateGenesisState(
 	inclusionProver qcrypto.InclusionProver,
 	clockStore store.ClockStore,
 	coinStore store.CoinStore,
-	stateTree *crypto.VectorCommitmentTree,
+	hypergraphStore store.HypergraphStore,
+	hg *hypergraph.Hypergraph,
+	mpcithVerEnc *qcrypto.MPCitHVerifiableEncryptor,
 	network uint,
 ) (
 	[]byte,
@@ -865,9 +868,39 @@ func CreateGenesisState(
 				0,
 				address,
 				output.GetCoin(),
-				stateTree,
 			)
 			if err != nil {
+				panic(err)
+			}
+
+			value := []byte{}
+			value = append(value, make([]byte, 8)...)
+			value = append(value, output.GetCoin().Amount...)
+			// implicit
+			value = append(value, 0x00)
+			value = append(
+				value,
+				output.GetCoin().Owner.GetImplicitAccount().GetAddress()...,
+			)
+			// domain len
+			value = append(value, 0x00)
+			value = append(value, output.GetCoin().Intersection...)
+
+			proofs := mpcithVerEnc.EncryptAndCompress(
+				value,
+				config.GetGenesis().Beacon,
+			)
+			compressed := []hypergraph.Encrypted{}
+			for _, d := range proofs {
+				compressed = append(compressed, d)
+			}
+			if err := hg.AddVertex(
+				hypergraph.NewVertex(
+					[32]byte(application.TOKEN_ADDRESS),
+					[32]byte(address),
+					compressed,
+				),
+			); err != nil {
 				panic(err)
 			}
 		}
@@ -890,7 +923,7 @@ func CreateGenesisState(
 		}
 
 		intrinsicFilter := p2p.GetBloomFilter(application.TOKEN_ADDRESS, 256, 3)
-		err = clockStore.SetDataStateTree(txn, intrinsicFilter, stateTree)
+		err = hypergraphStore.SaveHypergraph(txn, hg)
 		if err != nil {
 			txn.Abort()
 			panic(err)
@@ -1012,14 +1045,38 @@ func CreateGenesisState(
 				0,
 				address,
 				output.GetCoin(),
-				stateTree,
 			)
 			if err != nil {
 				panic(err)
 			}
+			coinBytes, err := proto.Marshal(output.GetCoin())
+			if err != nil {
+				panic(err)
+			}
+
+			data := []byte{}
+			data = binary.BigEndian.AppendUint64(data, 0)
+			data = append(data, coinBytes...)
+			proofs := mpcithVerEnc.EncryptAndCompress(
+				data,
+				config.GetGenesis().Beacon,
+			)
+			compressed := []hypergraph.Encrypted{}
+			for _, d := range proofs {
+				compressed = append(compressed, d)
+			}
+			if err := hg.AddVertex(
+				hypergraph.NewVertex(
+					[32]byte(application.TOKEN_ADDRESS),
+					[32]byte(address),
+					compressed,
+				),
+			); err != nil {
+				panic(err)
+			}
 		}
 		intrinsicFilter := p2p.GetBloomFilter(application.TOKEN_ADDRESS, 256, 3)
-		err = clockStore.SetDataStateTree(txn, intrinsicFilter, stateTree)
+		err = hypergraphStore.SaveHypergraph(txn, hg)
 		if err != nil {
 			txn.Abort()
 			panic(err)

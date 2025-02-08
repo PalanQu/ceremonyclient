@@ -19,12 +19,12 @@ import (
 )
 
 // for tests, these need to be var
-var PROOF_FRAME_CUTOFF = uint64(46500)
-var PROOF_FRAME_RING_RESET = uint64(52000)
-var PROOF_FRAME_RING_RESET_2 = uint64(53028)
-var PROOF_FRAME_COMBINE_CUTOFF = uint64(162000)
+var PROOF_FRAME_CUTOFF = uint64(0)
+var PROOF_FRAME_RING_RESET = uint64(0)
+var PROOF_FRAME_RING_RESET_2 = uint64(0)
+var PROOF_FRAME_COMBINE_CUTOFF = uint64(0)
 
-const PROOF_FRAME_SENIORITY_REPAIR = 59029
+const PROOF_FRAME_SENIORITY_REPAIR = 0
 
 type processedMint struct {
 	isPre2          bool
@@ -160,12 +160,12 @@ func (a *TokenApplication) preProcessMint(
 			)
 		}
 
-		// Current frame - 2 is because the current frame is the newly created frame,
+		// Current frame - 1 is because the current frame is the newly created frame,
 		// and the provers are submitting proofs on the frame preceding the one they
 		// last saw. This enforces liveness and creates a punishment for being
 		// late.
 		if (previousFrame != nil && newFrameNumber <= previousFrame.FrameNumber) ||
-			newFrameNumber < currentFrameNumber-2 {
+			newFrameNumber < currentFrameNumber-1 {
 			previousFrameNumber := uint64(0)
 			if previousFrame != nil {
 				previousFrameNumber = previousFrame.FrameNumber
@@ -338,12 +338,12 @@ func (a *TokenApplication) preProcessMint(
 			)
 		}
 
-		// Current frame - 2 is because the current frame is the newly created frame,
+		// Current frame - 1 is because the current frame is the newly created frame,
 		// and the provers are submitting proofs on the frame preceding the one they
 		// last saw. This enforces liveness and creates a punishment for being
 		// late.
 		if (previousFrame != nil && newFrameNumber <= previousFrame.FrameNumber) ||
-			newFrameNumber < currentFrameNumber-2 {
+			newFrameNumber < currentFrameNumber-1 {
 			previousFrameNumber := uint64(0)
 			if previousFrame != nil {
 				previousFrameNumber = previousFrame.FrameNumber
