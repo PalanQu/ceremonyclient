@@ -729,10 +729,7 @@ func (b *BlossomSub) GetPeerID() []byte {
 }
 
 func (b *BlossomSub) GetRandomPeer(bitmask []byte) ([]byte, error) {
-	// TODO: Fix this, it is broken - the bitmask parameter is not sliced, and the
-	// network is not pre-pended to the bitmask.
-	networkBitmask := append([]byte{b.p2pConfig.Network}, bitmask...)
-	peers := b.ps.ListPeers(networkBitmask)
+	peers := b.ps.ListPeers(bitmask)
 	if len(peers) == 0 {
 		return nil, errors.Wrap(
 			ErrNoPeersAvailable,
