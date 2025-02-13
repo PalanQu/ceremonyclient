@@ -575,7 +575,9 @@ func (e *TokenExecutionEngine) addBatchToHypergraph(batchKey [][]byte, batchValu
 }
 
 func (e *TokenExecutionEngine) hyperSync() {
-	peer, err := e.pubSub.GetRandomPeer(e.intrinsicFilter)
+	peer, err := e.pubSub.GetRandomPeer(
+		append([]byte{0x00}, e.intrinsicFilter...),
+	)
 	if err != nil {
 		e.logger.Error("error getting peer", zap.Error(err))
 		return
