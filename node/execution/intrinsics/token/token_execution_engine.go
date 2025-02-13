@@ -19,6 +19,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
@@ -30,10 +31,12 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token/application"
 	hypergraph "source.quilibrium.com/quilibrium/monorepo/node/hypergraph/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/internal/frametime"
+	qgrpc "source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
 	qruntime "source.quilibrium.com/quilibrium/monorepo/node/internal/runtime"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/node/rpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 	"source.quilibrium.com/quilibrium/monorepo/node/tries"
 )
@@ -110,6 +113,7 @@ type TokenExecutionEngine struct {
 	peerSeniority         *PeerSeniority
 	hypergraph            *hypergraph.Hypergraph
 	mpcithVerEnc          *qcrypto.MPCitHVerifiableEncryptor
+	grpcServers           []*grpc.Server
 }
 
 func NewTokenExecutionEngine(
@@ -144,7 +148,7 @@ func NewTokenExecutionEngine(
 	var inclusionProof *qcrypto.InclusionAggregateProof
 	var proverKeys [][]byte
 	var peerSeniority map[string]uint64
-	hypergraph := hypergraph.NewHypergraph()
+	hg := hypergraph.NewHypergraph()
 	mpcithVerEnc := qcrypto.NewMPCitHVerifiableEncryptor(
 		runtime.NumCPU(),
 	)
@@ -158,7 +162,7 @@ func NewTokenExecutionEngine(
 			clockStore,
 			coinStore,
 			hypergraphStore,
-			hypergraph,
+			hg,
 			mpcithVerEnc,
 			uint(cfg.P2P.Network),
 		)
@@ -188,7 +192,7 @@ func NewTokenExecutionEngine(
 					clockStore,
 					coinStore,
 					hypergraphStore,
-					hypergraph,
+					hg,
 					mpcithVerEnc,
 					uint(cfg.P2P.Network),
 				)
@@ -380,6 +384,37 @@ func NewTokenExecutionEngine(
 		}
 	}
 
+	syncServer := qgrpc.NewServer(
+		grpc.MaxRecvMsgSize(e.engineConfig.SyncMessageLimits.MaxRecvMsgSize),
+		grpc.MaxSendMsgSize(e.engineConfig.SyncMessageLimits.MaxSendMsgSize),
+	)
+	e.grpcServers = append(e.grpcServers[:0:0], syncServer)
+	hyperSync := rpc.NewHypergraphComparisonServer(
+		e.hypergraphStore,
+		e.hypergraph,
+	)
+	protobufs.RegisterHypergraphComparisonServiceServer(syncServer, hyperSync)
+	go func() {
+		if err := e.pubSub.StartDirectChannelListener(
+			e.pubSub.GetPeerID(),
+			"hypersync",
+			syncServer,
+		); err != nil {
+			e.logger.Error("error starting sync server", zap.Error(err))
+		}
+	}()
+
+	go func() {
+		for {
+			select {
+			case <-gotime.After(5 * gotime.Second):
+				e.hyperSync()
+			case <-e.ctx.Done():
+				return
+			}
+		}
+	}()
+
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
@@ -448,12 +483,36 @@ func (e *TokenExecutionEngine) addBatchToHypergraph(batchKey [][]byte, batchValu
 	var wg sync.WaitGroup
 	throttle := make(chan struct{}, runtime.NumCPU())
 	batchCompressed := make([]hypergraph.Vertex, len(batchKey))
+	batchTrees := make([]*qcrypto.VectorCommitmentTree, len(batchKey))
+	txn, err := e.hypergraphStore.NewTransaction(false)
+	if err != nil {
+		panic(err)
+	}
+
 	for i, chunk := range batchValue {
 		throttle <- struct{}{}
 		wg.Add(1)
 		go func(chunk []byte, i int) {
 			defer func() { <-throttle }()
 			defer wg.Done()
+			id := append(
+				append([]byte{}, application.TOKEN_ADDRESS...),
+				batchKey[i]...,
+			)
+
+			vertTree, err := e.hypergraphStore.LoadVertexTree(
+				id,
+			)
+			if err == nil {
+				batchCompressed[i] = hypergraph.NewVertex(
+					[32]byte(application.TOKEN_ADDRESS),
+					[32]byte(batchKey[i]),
+					vertTree.Commit(false),
+					vertTree.GetSize(),
+				)
+				return
+			}
+
 			e.logger.Debug(
 				"encrypting coin",
 				zap.String("address", hex.EncodeToString(batchKey[i])),
@@ -470,15 +529,41 @@ func (e *TokenExecutionEngine) addBatchToHypergraph(batchKey [][]byte, batchValu
 				"encrypted coin",
 				zap.String("address", hex.EncodeToString(batchKey[i])),
 			)
+
+			vertTree = hypergraph.EncryptedToVertexTree(compressed)
+			batchTrees[i] = vertTree
 			batchCompressed[i] = hypergraph.NewVertex(
 				[32]byte(application.TOKEN_ADDRESS),
 				[32]byte(batchKey[i]),
-				compressed,
+				vertTree.Commit(false),
+				vertTree.GetSize(),
 			)
-			batchCompressed[i].Commit()
+
 		}(chunk, i)
 	}
 	wg.Wait()
+
+	for i, vertTree := range batchTrees {
+		if vertTree == nil {
+			continue
+		}
+
+		id := append(
+			append([]byte{}, application.TOKEN_ADDRESS...),
+			batchKey[i]...,
+		)
+
+		err = e.hypergraphStore.SaveVertexTree(txn, id, vertTree)
+		if err != nil {
+			txn.Abort()
+			panic(err)
+		}
+	}
+
+	if err := txn.Commit(); err != nil {
+		txn.Abort()
+		panic(err)
+	}
 
 	for i := range batchKey {
 		if err := e.hypergraph.AddVertex(
@@ -489,10 +574,82 @@ func (e *TokenExecutionEngine) addBatchToHypergraph(batchKey [][]byte, batchValu
 	}
 }
 
+func (e *TokenExecutionEngine) hyperSync() {
+	peer, err := e.pubSub.GetRandomPeer(e.intrinsicFilter)
+	if err != nil {
+		e.logger.Error("error getting peer", zap.Error(err))
+		return
+	}
+
+	syncTimeout := e.engineConfig.SyncTimeout
+	dialCtx, cancelDial := context.WithTimeout(e.ctx, syncTimeout)
+	defer cancelDial()
+	cc, err := e.pubSub.GetDirectChannel(dialCtx, peer, "hypersync")
+	if err != nil {
+		e.logger.Debug(
+			"could not establish direct channel",
+			zap.Error(err),
+		)
+		return
+	}
+	defer func() {
+		if err := cc.Close(); err != nil {
+			e.logger.Error("error while closing connection", zap.Error(err))
+		}
+	}()
+
+	client := protobufs.NewHypergraphComparisonServiceClient(cc)
+
+	stream, err := client.HyperStream(e.ctx)
+	if err != nil {
+		e.logger.Error("could not open stream", zap.Error(err))
+		return
+	}
+
+	sets := e.hypergraph.GetVertexAdds()
+	for key, set := range sets {
+		err := rpc.SyncTreeBidirectionally(
+			stream,
+			append(append([]byte{}, key.L1[:]...), key.L2[:]...),
+			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+			e.hypergraphStore,
+			set.GetTree(),
+			false,
+		)
+		if err != nil {
+			e.logger.Error("error while synchronizing", zap.Error(err))
+			return
+		}
+	}
+
+	roots := e.hypergraph.Commit()
+	e.logger.Info(
+		"hypergraph root commit",
+		zap.String("root", hex.EncodeToString(roots[0])),
+	)
+}
+
 func (e *TokenExecutionEngine) rebuildHypergraph() {
 	e.logger.Info("rebuilding hypergraph")
 	e.hypergraph = hypergraph.NewHypergraph()
-	iter, err := e.coinStore.RangeCoins()
+	if e.engineConfig.RebuildStart == "" {
+		e.engineConfig.RebuildStart = "0000000000000000000000000000000000000000000000000000000000000000"
+	}
+	if e.engineConfig.RebuildEnd == "" {
+		e.engineConfig.RebuildEnd = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	}
+	start, err := hex.DecodeString(e.engineConfig.RebuildStart)
+	if err != nil {
+		panic(err)
+	}
+	end, err := hex.DecodeString(e.engineConfig.RebuildEnd)
+	if err != nil {
+		panic(err)
+	}
+	iter, err := e.coinStore.RangeCoins(
+		start,
+		end,
+	)
 	if err != nil {
 		panic(err)
 	}
@@ -768,11 +925,23 @@ func (e *TokenExecutionEngine) ProcessFrame(
 			for _, d := range proofs {
 				compressed = append(compressed, d)
 			}
+
+			vertTree, commitment, err := e.hypergraphStore.CommitAndSaveVertexData(
+				txn,
+				append(append([]byte{}, application.TOKEN_ADDRESS...), address...),
+				compressed,
+			)
+			if err != nil {
+				txn.Abort()
+				panic(err)
+			}
+
 			if err := hg.AddVertex(
 				hypergraph.NewVertex(
 					[32]byte(application.TOKEN_ADDRESS),
 					[32]byte(address),
-					compressed,
+					commitment,
+					vertTree.GetSize(),
 				),
 			); err != nil {
 				txn.Abort()
@@ -794,32 +963,51 @@ func (e *TokenExecutionEngine) ProcessFrame(
 				return nil, errors.Wrap(err, "process frame")
 			}
 
-			value := []byte{}
-			value = append(value, make([]byte, 8)...)
-			value = append(value, coin.Amount...)
-			// implicit
-			value = append(value, 0x00)
-			value = append(
-				value,
-				coin.Owner.GetImplicitAccount().GetAddress()...,
+			vertId := append(
+				append([]byte{}, application.TOKEN_ADDRESS...),
+				o.DeletedCoin.Address...,
 			)
-			// domain len
-			value = append(value, 0x00)
-			value = append(value, coin.Intersection...)
+			vertTree, err := e.hypergraphStore.LoadVertexTree(vertId)
+			if err != nil {
+				value := []byte{}
+				value = append(value, make([]byte, 8)...)
+				value = append(value, coin.Amount...)
+				// implicit
+				value = append(value, 0x00)
+				value = append(
+					value,
+					coin.Owner.GetImplicitAccount().GetAddress()...,
+				)
+				// domain len
+				value = append(value, 0x00)
+				value = append(value, coin.Intersection...)
 
-			proofs := e.mpcithVerEnc.EncryptAndCompress(
-				value,
-				config.GetGenesis().Beacon,
-			)
-			compressed := []hypergraph.Encrypted{}
-			for _, d := range proofs {
-				compressed = append(compressed, d)
+				proofs := e.mpcithVerEnc.EncryptAndCompress(
+					value,
+					config.GetGenesis().Beacon,
+				)
+				compressed := []hypergraph.Encrypted{}
+				for _, d := range proofs {
+					compressed = append(compressed, d)
+				}
+
+				vertTree, _, err = e.hypergraphStore.CommitAndSaveVertexData(
+					txn,
+					vertId,
+					compressed,
+				)
+				if err != nil {
+					txn.Abort()
+					panic(err)
+				}
 			}
+
 			if err := hg.RemoveVertex(
 				hypergraph.NewVertex(
 					[32]byte(application.TOKEN_ADDRESS),
 					[32]byte(o.DeletedCoin.Address),
-					compressed,
+					vertTree.Commit(false),
+					vertTree.GetSize(),
 				),
 			); err != nil {
 				txn.Abort()

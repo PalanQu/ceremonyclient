@@ -42,3 +42,85 @@ message Message {
   bytes address = 2;
   bytes payload = 3;
 }
+
+// The HypergraphPhaseSet defines the specific phase set for further operation.
+enum HypergraphPhaseSet {
+  HYPERGRAPH_PHASE_SET_VERTEX_ADDS = 0;
+  HYPERGRAPH_PHASE_SET_VERTEX_REMOVES = 1;
+  HYPERGRAPH_PHASE_SET_HYPEREDGE_ADDS = 2;
+  HYPERGRAPH_PHASE_SET_HYPEREDGE_REMOVES = 3;
+}
+
+// Defines the request for comparison of hypergraph data
+message HypergraphComparisonQuery {
+  // The shard to compare.
+  bytes shard_key = 1;
+  // The phase set to compare.
+  HypergraphPhaseSet phase_set = 2;
+  // The branch path (sequence of nibble indices) in the vector commitment tree.
+  repeated int32 path = 3;
+  // The commitment for the node at this path.
+  bytes commitment = 4;
+  // For branch nodes, a list of its immediate children (by index) and their
+  // commitments. When the list is empty, it means either the node is a leaf or
+  // no children diff info is needed.
+  repeated BranchChild children = 5;
+  // If set, the comparison response will contain the data of leaves if present
+  // in the results.
+  bool include_leaf_data = 6;
+}
+
+// Defines the response containing the commitment for a node and (optionally)
+// its immediate children. The children are identified by their index (0–63) and
+// their commitments.
+message HypergraphComparisonResponse {
+  // The branch path for this node.
+  repeated int32 path = 1;
+  // The commitment for the node at this path.
+  bytes commitment = 2;
+  // If non-empty, a list of children for which the node can report commitments.
+  // (For instance, if the node is a branch you may want to send the commitment
+  // for each child.)
+  repeated BranchChild children = 3;
+}
+
+// Defines the child commitment.
+message BranchChild {
+  // The index on the branch's children.
+  int32 index = 1;
+  // The commitment of the data.
+  bytes commitment = 2;
+}
+
+// Defines the data of the leaf.
+message LeafData {
+  // The full key of the leaf.
+  bytes key = 1;
+  // The value for the leaf.
+  bytes value = 2;
+  // The hash target if any.
+  bytes hash_target = 3;
+  // The size, represented as big endian unsigned bytes.
+  bytes size = 4;
+  // The underlying data backing the leaf, if a vertex.
+  bytes underlying_data = 5;
+}
+
+// Defines the bidirectional sync payload options.
+message HypergraphComparison {
+  oneof payload {
+    HypergraphComparisonQuery query = 1;
+    HypergraphComparisonResponse response = 2;
+    LeafData leaf_data = 3;
+  }
+}
+
+// A bidirectional streaming service in which nodes send queries for a
+// particular hypergraph shard phase set (identified by its key, phase and path)
+// and the other responds with the commitment for that branch and its children.
+// Note: this should be used for synchronization purposes only – attempting to
+// use this as a query service will explicitly reveal the query data to the
+// node.
+service HypergraphComparisonService {
+  rpc HyperStream(stream HypergraphComparison) returns (stream HypergraphComparison);
+}

@@ -1,13 +1,32 @@
 package store
 
 import (
+	"bytes"
+	"encoding/gob"
+
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/hypergraph/application"
 )
 
 type HypergraphStore interface {
 	NewTransaction(indexed bool) (Transaction, error)
+	LoadVertexTree(id []byte) (
+		*crypto.VectorCommitmentTree,
+		error,
+	)
+	LoadVertexData(id []byte) ([]application.Encrypted, error)
+	SaveVertexTree(
+		txn Transaction,
+		id []byte,
+		vertTree *crypto.VectorCommitmentTree,
+	) error
+	CommitAndSaveVertexData(
+		txn Transaction,
+		id []byte,
+		data []application.Encrypted,
+	) (*crypto.VectorCommitmentTree, []byte, error)
 	LoadHypergraph() (
 		*application.Hypergraph,
 		error,
@@ -39,6 +58,7 @@ const (
 	HYPERGRAPH_SHARD  = 0x09
 	VERTEX_ADDS       = 0x00
 	VERTEX_REMOVES    = 0x10
+	VERTEX_DATA       = 0xF0
 	HYPEREDGE_ADDS    = 0x01
 	HYPEREDGE_REMOVES = 0x11
 )
@@ -47,6 +67,12 @@ func hypergraphVertexAddsKey(shardKey application.ShardKey) []byte {
 	key := []byte{HYPERGRAPH_SHARD, VERTEX_ADDS}
 	key = append(key, shardKey.L1[:]...)
 	key = append(key, shardKey.L2[:]...)
+	return key
+}
+
+func hypergraphVertexDataKey(id []byte) []byte {
+	key := []byte{HYPERGRAPH_SHARD, VERTEX_DATA}
+	key = append(key, id...)
 	return key
 }
 
@@ -83,6 +109,91 @@ func (p *PebbleHypergraphStore) NewTransaction(indexed bool) (
 	error,
 ) {
 	return p.db.NewBatch(indexed), nil
+}
+
+func (p *PebbleHypergraphStore) LoadVertexTree(id []byte) (
+	*crypto.VectorCommitmentTree,
+	error,
+) {
+	tree := &crypto.VectorCommitmentTree{}
+	var b bytes.Buffer
+	vertexData, closer, err := p.db.Get(hypergraphVertexDataKey(id))
+	if err != nil {
+		return nil, errors.Wrap(err, "load vertex data")
+	}
+	defer closer.Close()
+	b.Write(vertexData)
+
+	dec := gob.NewDecoder(&b)
+	if err := dec.Decode(tree); err != nil {
+		return nil, errors.Wrap(err, "load vertex data")
+	}
+
+	return tree, nil
+}
+
+func (p *PebbleHypergraphStore) LoadVertexData(id []byte) (
+	[]application.Encrypted,
+	error,
+) {
+	tree := &crypto.VectorCommitmentTree{}
+	var b bytes.Buffer
+	vertexData, closer, err := p.db.Get(hypergraphVertexDataKey(id))
+	if err != nil {
+		return nil, errors.Wrap(err, "load vertex data")
+	}
+	defer closer.Close()
+	b.Write(vertexData)
+
+	dec := gob.NewDecoder(&b)
+	if err := dec.Decode(tree); err != nil {
+		return nil, errors.Wrap(err, "load vertex data")
+	}
+
+	encData := []application.Encrypted{}
+	for _, d := range crypto.GetAllLeaves(tree) {
+		verencData := crypto.MPCitHVerEncFromBytes(d.Value)
+		encData = append(encData, verencData)
+	}
+
+	return encData, nil
+}
+
+func (p *PebbleHypergraphStore) SaveVertexTree(
+	txn Transaction,
+	id []byte,
+	vertTree *crypto.VectorCommitmentTree,
+) error {
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(vertTree); err != nil {
+		return errors.Wrap(err, "save vertex tree")
+	}
+
+	return errors.Wrap(
+		txn.Set(hypergraphVertexDataKey(id), buf.Bytes()),
+		"save vertex tree",
+	)
+}
+
+func (p *PebbleHypergraphStore) CommitAndSaveVertexData(
+	txn Transaction,
+	id []byte,
+	data []application.Encrypted,
+) (*crypto.VectorCommitmentTree, []byte, error) {
+	dataTree := application.EncryptedToVertexTree(data)
+	commit := dataTree.Commit(false)
+
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(dataTree); err != nil {
+		return nil, nil, errors.Wrap(err, "commit and save vertex data")
+	}
+
+	return dataTree, commit, errors.Wrap(
+		txn.Set(hypergraphVertexDataKey(id), buf.Bytes()),
+		"commit and save vertex data",
+	)
 }
 
 func (p *PebbleHypergraphStore) LoadHypergraph() (

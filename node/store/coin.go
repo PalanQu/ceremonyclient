@@ -23,7 +23,7 @@ type CoinStore interface {
 	)
 	GetCoinByAddress(txn Transaction, address []byte) (*protobufs.Coin, error)
 	GetPreCoinProofByAddress(address []byte) (*protobufs.PreCoinProof, error)
-	RangeCoins() (Iterator, error)
+	RangeCoins(start []byte, end []byte) (Iterator, error)
 	RangePreCoinProofs() (Iterator, error)
 	PutCoin(
 		txn Transaction,
@@ -263,10 +263,13 @@ func (p *PebbleCoinStore) RangePreCoinProofs() (Iterator, error) {
 	return iter, nil
 }
 
-func (p *PebbleCoinStore) RangeCoins() (Iterator, error) {
+func (p *PebbleCoinStore) RangeCoins(
+	start []byte,
+	end []byte,
+) (Iterator, error) {
 	iter, err := p.db.NewIter(
-		coinKey(bytes.Repeat([]byte{0x00}, 32)),
-		coinKey(bytes.Repeat([]byte{0xff}, 32)),
+		coinKey(start),
+		coinKey(end),
 	)
 	if err != nil {
 		return nil, errors.Wrap(err, "range pre coin proofs")

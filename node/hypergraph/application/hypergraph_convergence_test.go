@@ -2,7 +2,9 @@ package application_test
 
 import (
 	crand "crypto/rand"
+	"crypto/sha512"
 	"fmt"
+	"math/big"
 	"math/rand"
 	"testing"
 	"time"
@@ -23,13 +25,22 @@ func TestConvergence(t *testing.T) {
 	numOperations := 100000
 	enc := crypto.NewMPCitHVerifiableEncryptor(1)
 	pub, _, _ := ed448.GenerateKey(crand.Reader)
-	enc.Encrypt(make([]byte, 20), pub)
+	data := enc.Encrypt(make([]byte, 20), pub)
+	verenc := data[0].Compress()
 	vertices := make([]application.Vertex, numOperations)
+	dataTree := &crypto.VectorCommitmentTree{}
+	for _, d := range []application.Encrypted{verenc} {
+		dataBytes := d.ToBytes()
+		id := sha512.Sum512(dataBytes)
+		dataTree.Insert(id[:], dataBytes, d.GetStatement(), big.NewInt(int64(len(data)*54)))
+	}
+	dataTree.Commit(false)
 	for i := 0; i < numOperations; i++ {
 		vertices[i] = application.NewVertex(
 			[32]byte{byte((i >> 8) % 256), byte((i % 256))},
 			[32]byte{byte((i >> 8) / 256), byte(i / 256)},
-			[]application.Encrypted{},
+			dataTree.Commit(false),
+			dataTree.GetSize(),
 		)
 	}
 

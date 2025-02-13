@@ -894,13 +894,25 @@ func CreateGenesisState(
 			for _, d := range proofs {
 				compressed = append(compressed, d)
 			}
+			vertTree, commitment, err := hypergraphStore.CommitAndSaveVertexData(
+				txn,
+				append(append([]byte{}, application.TOKEN_ADDRESS...), address...),
+				compressed,
+			)
+			if err != nil {
+				txn.Abort()
+				panic(err)
+			}
+
 			if err := hg.AddVertex(
 				hypergraph.NewVertex(
 					[32]byte(application.TOKEN_ADDRESS),
 					[32]byte(address),
-					compressed,
+					commitment,
+					vertTree.GetSize(),
 				),
 			); err != nil {
+				txn.Abort()
 				panic(err)
 			}
 		}
@@ -1065,13 +1077,25 @@ func CreateGenesisState(
 			for _, d := range proofs {
 				compressed = append(compressed, d)
 			}
+			vertTree, commitment, err := hypergraphStore.CommitAndSaveVertexData(
+				txn,
+				append(append([]byte{}, application.TOKEN_ADDRESS...), address...),
+				compressed,
+			)
+			if err != nil {
+				txn.Abort()
+				panic(err)
+			}
+
 			if err := hg.AddVertex(
 				hypergraph.NewVertex(
 					[32]byte(application.TOKEN_ADDRESS),
 					[32]byte(address),
-					compressed,
+					commitment,
+					vertTree.GetSize(),
 				),
 			); err != nil {
+				txn.Abort()
 				panic(err)
 			}
 		}

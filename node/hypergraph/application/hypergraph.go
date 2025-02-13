@@ -42,7 +42,7 @@ type Vertex interface {
 	GetAppAddress() [32]byte
 	GetDataAddress() [32]byte
 	ToBytes() []byte
-	GetData() []Encrypted
+	GetData(func(id []byte) ([]Encrypted, error)) ([]Encrypted, error)
 	GetSize() *big.Int
 	Commit() []byte
 }
@@ -64,8 +64,8 @@ type Hyperedge interface {
 type vertex struct {
 	appAddress  [32]byte
 	dataAddress [32]byte
-	data        []Encrypted
-	dataTree    *crypto.VectorCommitmentTree
+	commitment  []byte
+	size        *big.Int
 }
 
 type hyperedge struct {
@@ -89,31 +89,46 @@ type Atom interface {
 	Commit() []byte
 }
 
-func atomFromBytes(data []byte) Atom {
-	tree := &crypto.VectorCommitmentTree{}
-	var b bytes.Buffer
-	b.Write(data[65:])
-	dec := gob.NewDecoder(&b)
-	if err := dec.Decode(tree); err != nil {
-		return nil
+func EncryptedToVertexTree(encrypted []Encrypted) *crypto.VectorCommitmentTree {
+	dataTree := &crypto.VectorCommitmentTree{}
+	for _, d := range encrypted {
+		dataBytes := d.ToBytes()
+		id := sha512.Sum512(dataBytes)
+		dataTree.Insert(
+			id[:],
+			dataBytes,
+			d.GetStatement(),
+			big.NewInt(int64(len(encrypted)*54)),
+		)
 	}
+	dataTree.Commit(false)
+	return dataTree
+}
 
+func AtomFromBytes(data []byte) Atom {
 	if data[0] == 0x00 {
-		encData := []Encrypted{}
-		for _, d := range crypto.GetAllLeaves(tree) {
-			verencData := crypto.MPCitHVerEncFromBytes(d.Value)
-			encData = append(encData, verencData)
+		if len(data) < 161 {
+			return nil
 		}
+
 		return &vertex{
 			appAddress:  [32]byte(data[1:33]),
 			dataAddress: [32]byte(data[33:65]),
-			data:        encData,
-			dataTree:    tree,
+			commitment:  data[65 : len(data)-32],
+			size:        new(big.Int).SetBytes(data[len(data)-32:]),
 		}
 	} else {
+		tree := &crypto.VectorCommitmentTree{}
+		var b bytes.Buffer
+		b.Write(data[65:])
+		dec := gob.NewDecoder(&b)
+		if err := dec.Decode(tree); err != nil {
+			return nil
+		}
+
 		extrinsics := make(map[[64]byte]Atom)
 		for _, a := range crypto.GetAllLeaves(tree) {
-			atom := atomFromBytes(a.Value)
+			atom := AtomFromBytes(a.Value)
 			extrinsics[[64]byte(a.Key)] = atom
 		}
 		return &hyperedge{
@@ -128,19 +143,14 @@ func atomFromBytes(data []byte) Atom {
 func NewVertex(
 	appAddress [32]byte,
 	dataAddress [32]byte,
-	data []Encrypted,
+	commitment []byte,
+	size *big.Int,
 ) Vertex {
-	dataTree := &crypto.VectorCommitmentTree{}
-	for _, d := range data {
-		dataBytes := d.ToBytes()
-		id := sha512.Sum512(dataBytes)
-		dataTree.Insert(id[:], dataBytes, d.GetStatement(), big.NewInt(int64(len(data)*54)))
-	}
 	return &vertex{
 		appAddress,
 		dataAddress,
-		data,
-		dataTree,
+		commitment,
+		size,
 	}
 }
 
@@ -164,7 +174,7 @@ func (v *vertex) GetID() [64]byte {
 }
 
 func (v *vertex) GetSize() *big.Int {
-	return big.NewInt(int64(len(v.data) * 54))
+	return v.size
 }
 
 func (v *vertex) GetAtomType() AtomType {
@@ -186,30 +196,31 @@ func (v *vertex) GetDataAddress() [32]byte {
 	return v.dataAddress
 }
 
-func (v *vertex) GetData() []Encrypted {
-	return v.data
+func (v *vertex) GetData(
+	retrievalFunc func(id []byte) ([]Encrypted, error),
+) ([]Encrypted, error) {
+	id := v.GetID()
+	return retrievalFunc(id[:])
 }
 
 func (v *vertex) ToBytes() []byte {
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	if err := enc.Encode(v.dataTree); err != nil {
-		return nil
-	}
 	return append(
 		append(
 			append(
-				[]byte{0x00},
-				v.appAddress[:]...,
+				append(
+					[]byte{0x00},
+					v.appAddress[:]...,
+				),
+				v.dataAddress[:]...,
 			),
-			v.dataAddress[:]...,
+			v.commitment[:]...,
 		),
-		buf.Bytes()...,
+		v.size.FillBytes(make([]byte, 32))...,
 	)
 }
 
 func (v *vertex) Commit() []byte {
-	return v.dataTree.Commit(false)
+	return v.commitment
 }
 
 func (h *hyperedge) GetID() [64]byte {
@@ -341,7 +352,7 @@ func (set *IdSet) FromBytes(treeData []byte) error {
 	}
 
 	for _, leaf := range crypto.GetAllLeaves(set.tree.Root) {
-		set.atoms[[64]byte(leaf.Key)] = atomFromBytes(leaf.Value)
+		set.atoms[[64]byte(leaf.Key)] = AtomFromBytes(leaf.Value)
 	}
 
 	return nil
@@ -399,6 +410,10 @@ func (set *IdSet) Delete(atom Atom) bool {
 func (set *IdSet) Has(key [64]byte) bool {
 	_, ok := set.atoms[key]
 	return ok
+}
+
+func (set *IdSet) GetTree() *crypto.VectorCommitmentTree {
+	return set.tree
 }
 
 type Hypergraph struct {
