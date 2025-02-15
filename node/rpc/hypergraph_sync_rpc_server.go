@@ -321,10 +321,8 @@ func syncTreeBidirectionallyServer(
 		return err
 	}
 
-	pendingQueries := make(chan []int32)
-	go func(path []int32) {
-		pendingQueries <- path
-	}(rootPath)
+	pendingIn, pendingOut := UnboundedChan[[]int32]()
+	pendingIn <- rootPath
 
 	incoming := make(chan *protobufs.HypergraphComparison, 10000)
 	go func() {
@@ -344,7 +342,7 @@ func syncTreeBidirectionallyServer(
 
 	for {
 		select {
-		case path := <-pendingQueries:
+		case path := <-pendingOut:
 			logger.Info(
 				"server sending comparison query",
 				zap.String("path", hex.EncodeToString(packNibbles(path))),
@@ -460,9 +458,8 @@ func syncTreeBidirectionallyServer(
 									append([]int32(nil), remoteInfo.Path...),
 									remoteChild.Index,
 								)
-								go func(path []int32) {
-									pendingQueries <- path
-								}(newPath)
+
+								pendingIn <- newPath
 							}
 						}
 					}
@@ -608,10 +605,8 @@ func SyncTreeBidirectionally(
 		return err
 	}
 
-	pendingQueries := make(chan []int32)
-	go func(path []int32) {
-		pendingQueries <- path
-	}([]int32{})
+	pendingIn, pendingOut := UnboundedChan[[]int32]()
+	pendingIn <- []int32{}
 
 	incoming := make(chan *protobufs.HypergraphComparison, 10000)
 	go func() {
@@ -631,7 +626,7 @@ func SyncTreeBidirectionally(
 
 	for {
 		select {
-		case path := <-pendingQueries:
+		case path := <-pendingOut:
 			logger.Info(
 				"sending comparison query",
 				zap.String("path", hex.EncodeToString(packNibbles(path))),
@@ -736,9 +731,8 @@ func SyncTreeBidirectionally(
 									append([]int32(nil), remoteInfo.Path...),
 									remoteChild.Index,
 								)
-								go func(path []int32) {
-									pendingQueries <- path
-								}(newPath)
+
+								pendingIn <- newPath
 							}
 						}
 					}
@@ -831,6 +825,29 @@ func SyncTreeBidirectionally(
 			return nil
 		}
 	}
+}
+
+func UnboundedChan[T any]() (chan<- T, <-chan T) {
+	in := make(chan T)
+	out := make(chan T)
+	go func() {
+		var queue []T
+		for {
+			var active chan T
+			var next T
+			if len(queue) > 0 {
+				active = out
+				next = queue[0]
+			}
+			select {
+			case msg := <-in:
+				queue = append(queue, msg)
+			case active <- next:
+				queue = queue[1:]
+			}
+		}
+	}()
+	return in, out
 }
 
 func packNibbles(values []int32) []byte {
