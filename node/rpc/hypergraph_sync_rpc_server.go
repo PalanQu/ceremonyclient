@@ -321,8 +321,10 @@ func syncTreeBidirectionallyServer(
 		return err
 	}
 
-	pendingQueries := make(chan []int32, 10000)
-	pendingQueries <- rootPath
+	pendingQueries := make(chan []int32)
+	go func(path []int32) {
+		pendingQueries <- path
+	}(rootPath)
 
 	incoming := make(chan *protobufs.HypergraphComparison, 10000)
 	go func() {
@@ -458,7 +460,9 @@ func syncTreeBidirectionallyServer(
 									append([]int32(nil), remoteInfo.Path...),
 									remoteChild.Index,
 								)
-								pendingQueries <- newPath
+								go func(path []int32) {
+									pendingQueries <- path
+								}(newPath)
 							}
 						}
 					}
@@ -604,8 +608,10 @@ func SyncTreeBidirectionally(
 		return err
 	}
 
-	pendingQueries := make(chan []int32, 10000)
-	pendingQueries <- []int32{}
+	pendingQueries := make(chan []int32)
+	go func(path []int32) {
+		pendingQueries <- path
+	}([]int32{})
 
 	incoming := make(chan *protobufs.HypergraphComparison, 10000)
 	go func() {
@@ -730,7 +736,9 @@ func SyncTreeBidirectionally(
 									append([]int32(nil), remoteInfo.Path...),
 									remoteChild.Index,
 								)
-								pendingQueries <- newPath
+								go func(path []int32) {
+									pendingQueries <- path
+								}(newPath)
 							}
 						}
 					}
