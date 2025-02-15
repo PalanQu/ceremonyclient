@@ -390,6 +390,7 @@ func NewTokenExecutionEngine(
 	)
 	e.grpcServers = append(e.grpcServers[:0:0], syncServer)
 	hyperSync := rpc.NewHypergraphComparisonServer(
+		e.logger,
 		e.hypergraphStore,
 		e.hypergraph,
 	)
@@ -575,7 +576,7 @@ func (e *TokenExecutionEngine) addBatchToHypergraph(batchKey [][]byte, batchValu
 }
 
 func (e *TokenExecutionEngine) hyperSync() {
-	peer, err := e.pubSub.GetRandomPeer(
+	peerId, err := e.pubSub.GetRandomPeer(
 		append([]byte{0x00}, e.intrinsicFilter...),
 	)
 	if err != nil {
@@ -583,12 +584,16 @@ func (e *TokenExecutionEngine) hyperSync() {
 		return
 	}
 
+	e.logger.Info(
+		"syncing hypergraph with peer",
+		zap.String("peer", peer.ID(peerId).String()),
+	)
 	syncTimeout := e.engineConfig.SyncTimeout
 	dialCtx, cancelDial := context.WithTimeout(e.ctx, syncTimeout)
 	defer cancelDial()
-	cc, err := e.pubSub.GetDirectChannel(dialCtx, peer, "hypersync")
+	cc, err := e.pubSub.GetDirectChannel(dialCtx, peerId, "hypersync")
 	if err != nil {
-		e.logger.Debug(
+		e.logger.Info(
 			"could not establish direct channel",
 			zap.Error(err),
 		)
@@ -612,6 +617,7 @@ func (e *TokenExecutionEngine) hyperSync() {
 	for key, set := range sets {
 		err := rpc.SyncTreeBidirectionally(
 			stream,
+			e.logger,
 			append(append([]byte{}, key.L1[:]...), key.L2[:]...),
 			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
 			e.hypergraphStore,
