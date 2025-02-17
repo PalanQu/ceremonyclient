@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/cloudflare/circl/sign/ed448"
+	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -37,7 +38,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 	data := enc.Encrypt(make([]byte, 20), pub)
 	verenc := data[0].Compress()
 	vertices := make([]application.Vertex, numOperations)
-	dataTree := &crypto.VectorCommitmentTree{}
+	dataTree := &crypto.RawVectorCommitmentTree{}
 	for _, d := range []application.Encrypted{verenc} {
 		dataBytes := d.ToBytes()
 		id := sha512.Sum512(dataBytes)
@@ -88,15 +89,35 @@ func TestHypergraphSyncServer(t *testing.T) {
 		}
 	}
 
-	clientKvdb := store.NewInMemKVDB()
 	serverKvdb := store.NewInMemKVDB()
+	clientKvdb := store.NewInMemKVDB()
+	controlKvdb := store.NewInMemKVDB()
 	logger, _ := zap.NewProduction()
-	clientHypergraphStore := store.NewPebbleHypergraphStore(clientKvdb, logger)
 	serverHypergraphStore := store.NewPebbleHypergraphStore(serverKvdb, logger)
+	clientHypergraphStore := store.NewPebbleHypergraphStore(clientKvdb, logger)
+	controlHypergraphStore := store.NewPebbleHypergraphStore(controlKvdb, logger)
 	crdts := make([]*application.Hypergraph, numParties)
-	for i := 0; i < numParties; i++ {
-		crdts[i] = application.NewHypergraph()
-	}
+	crdts[0] = application.NewHypergraph(func(shardKey application.ShardKey, phaseSet protobufs.HypergraphPhaseSet) crypto.VectorCommitmentTree {
+		return store.NewPersistentVectorTree(
+			serverHypergraphStore,
+			shardKey,
+			phaseSet,
+		)
+	})
+	crdts[1] = application.NewHypergraph(func(shardKey application.ShardKey, phaseSet protobufs.HypergraphPhaseSet) crypto.VectorCommitmentTree {
+		return store.NewPersistentVectorTree(
+			clientHypergraphStore,
+			shardKey,
+			phaseSet,
+		)
+	})
+	crdts[2] = application.NewHypergraph(func(shardKey application.ShardKey, phaseSet protobufs.HypergraphPhaseSet) crypto.VectorCommitmentTree {
+		return store.NewPersistentVectorTree(
+			controlHypergraphStore,
+			shardKey,
+			phaseSet,
+		)
+	})
 
 	txn, _ := serverHypergraphStore.NewTransaction(false)
 	for _, op := range operations1[:5000] {
@@ -114,7 +135,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 		}
 	}
 	txn.Commit()
-	for _, op := range operations2[:500] {
+	for _, op := range operations2[:5000] {
 		switch op.Type {
 		case "AddVertex":
 			crdts[0].AddVertex(op.Vertex)
@@ -143,7 +164,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 		}
 	}
 	txn.Commit()
-	for _, op := range operations2[500:] {
+	for _, op := range operations2[5000:] {
 		switch op.Type {
 		case "AddVertex":
 			crdts[1].AddVertex(op.Vertex)
@@ -184,7 +205,31 @@ func TestHypergraphSyncServer(t *testing.T) {
 	crdts[0].Commit()
 	crdts[1].Commit()
 	crdts[2].Commit()
+	txn, _ = serverHypergraphStore.NewTransaction(false)
+	serverHypergraphStore.SaveHypergraph(txn, crdts[0])
+	txn.Commit()
+	txn, _ = clientHypergraphStore.NewTransaction(false)
+	clientHypergraphStore.SaveHypergraph(txn, crdts[1])
+	txn.Commit()
+	txn, _ = controlHypergraphStore.NewTransaction(false)
+	controlHypergraphStore.SaveHypergraph(txn, crdts[2])
+	txn.Commit()
+	var err error
+	eval0, err := serverHypergraphStore.LoadHypergraph()
+	assert.NoError(t, err)
+	eval1, err := clientHypergraphStore.LoadHypergraph()
+	assert.NoError(t, err)
 	log.Printf("Generated data")
+	leaves0 := crypto.CompareLeaves(
+		crdts[0].GetVertexAdds()[shardKey].GetTree().(*store.PersistentVectorTree).GetInternalTree(),
+		eval0.GetVertexAdds()[shardKey].GetTree().(*store.PersistentVectorTree).GetInternalTree(),
+	)
+	leaves1 := crypto.CompareLeaves(
+		crdts[1].GetVertexAdds()[shardKey].GetTree().(*store.PersistentVectorTree).GetInternalTree(),
+		eval1.GetVertexAdds()[shardKey].GetTree().(*store.PersistentVectorTree).GetInternalTree(),
+	)
+	assert.Len(t, leaves0, 0)
+	assert.Len(t, leaves1, 0)
 
 	lis, err := net.Listen("tcp", ":50051")
 	if err != nil {
@@ -212,14 +257,22 @@ func TestHypergraphSyncServer(t *testing.T) {
 		log.Fatalf("Client: failed to stream: %v", err)
 	}
 
-	err = rpc.SyncTreeBidirectionally(str, logger, append(append([]byte{}, shardKey.L1[:]...), shardKey.L2[:]...), protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, clientHypergraphStore, crdts[1].GetVertexAdds()[shardKey].GetTree(), false)
+	err = rpc.SyncTreeBidirectionally(
+		str,
+		logger,
+		append(append([]byte{}, shardKey.L1[:]...), shardKey.L2[:]...),
+		protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+		clientHypergraphStore,
+		crdts[1].GetVertexAdds()[shardKey].GetTree(),
+		false,
+	)
 	if err != nil {
 		log.Fatalf("Client: failed to sync 1: %v", err)
 	}
 
 	leaves := crypto.CompareLeaves(
-		crdts[0].GetVertexAdds()[shardKey].GetTree(),
-		crdts[1].GetVertexAdds()[shardKey].GetTree(),
+		crdts[0].GetVertexAdds()[shardKey].GetTree().(*store.PersistentVectorTree).GetInternalTree(),
+		crdts[1].GetVertexAdds()[shardKey].GetTree().(*store.PersistentVectorTree).GetInternalTree(),
 	)
 	fmt.Println(len(leaves))
 
@@ -241,8 +294,8 @@ func TestHypergraphSyncServer(t *testing.T) {
 		crdts[1].GetVertexAdds()[shardKey].GetTree().Commit(false),
 	) {
 		leaves := crypto.CompareLeaves(
-			crdts[0].GetVertexAdds()[shardKey].GetTree(),
-			crdts[1].GetVertexAdds()[shardKey].GetTree(),
+			crdts[0].GetVertexAdds()[shardKey].GetTree().(*store.PersistentVectorTree).GetInternalTree(),
+			crdts[1].GetVertexAdds()[shardKey].GetTree().(*store.PersistentVectorTree).GetInternalTree(),
 		)
 		fmt.Println(len(leaves))
 		log.Fatalf(

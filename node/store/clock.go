@@ -104,11 +104,11 @@ type ClockStore interface {
 		minFrameNumber uint64,
 		maxFrameNumber uint64,
 	) error
-	GetDataStateTree(filter []byte) (*crypto.VectorCommitmentTree, error)
+	GetDataStateTree(filter []byte) (*crypto.RawVectorCommitmentTree, error)
 	SetDataStateTree(
 		txn Transaction,
 		filter []byte,
-		tree *crypto.VectorCommitmentTree,
+		tree *crypto.RawVectorCommitmentTree,
 	) error
 }
 
@@ -1696,7 +1696,7 @@ func (p *PebbleClockStore) SetProverTriesForFrame(
 }
 
 func (p *PebbleClockStore) GetDataStateTree(filter []byte) (
-	*crypto.VectorCommitmentTree,
+	*crypto.RawVectorCommitmentTree,
 	error,
 ) {
 	data, closer, err := p.db.Get(clockDataStateTreeKey(filter))
@@ -1708,7 +1708,7 @@ func (p *PebbleClockStore) GetDataStateTree(filter []byte) (
 		return nil, errors.Wrap(err, "get data state tree")
 	}
 	defer closer.Close()
-	tree := &crypto.VectorCommitmentTree{}
+	tree := &crypto.RawVectorCommitmentTree{}
 	var b bytes.Buffer
 	b.Write(data)
 	dec := gob.NewDecoder(&b)
@@ -1722,7 +1722,7 @@ func (p *PebbleClockStore) GetDataStateTree(filter []byte) (
 func (p *PebbleClockStore) SetDataStateTree(
 	txn Transaction,
 	filter []byte,
-	tree *crypto.VectorCommitmentTree,
+	tree *crypto.RawVectorCommitmentTree,
 ) error {
 	b := new(bytes.Buffer)
 	enc := gob.NewEncoder(b)

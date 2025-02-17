@@ -11,10 +11,13 @@ import (
 	"github.com/cloudflare/circl/sign/ed448"
 	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/hypergraph/application"
+	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
 func TestHypergraph(t *testing.T) {
-	hg := application.NewHypergraph()
+	hg := application.NewHypergraph(func(shardKey application.ShardKey, phaseSet protobufs.HypergraphPhaseSet) crypto.VectorCommitmentTree {
+		return &crypto.RawVectorCommitmentTree{}
+	})
 
 	// Test vertex operations
 	t.Run("Vertex Operations", func(t *testing.T) {
@@ -22,7 +25,7 @@ func TestHypergraph(t *testing.T) {
 		pub, _, _ := ed448.GenerateKey(crand.Reader)
 		data := enc.Encrypt(make([]byte, 20), pub)
 		verenc := data[0].Compress()
-		dataTree := &crypto.VectorCommitmentTree{}
+		dataTree := &crypto.RawVectorCommitmentTree{}
 		for _, d := range []application.Encrypted{verenc} {
 			dataBytes := d.ToBytes()
 			id := sha512.Sum512(dataBytes)
@@ -69,7 +72,7 @@ func TestHypergraph(t *testing.T) {
 		pub, _, _ := ed448.GenerateKey(crand.Reader)
 		data := enc.Encrypt(make([]byte, 20), pub)
 		verenc := data[0].Compress()
-		dataTree := &crypto.VectorCommitmentTree{}
+		dataTree := &crypto.RawVectorCommitmentTree{}
 		for _, d := range []application.Encrypted{verenc} {
 			dataBytes := d.ToBytes()
 			id := sha512.Sum512(dataBytes)
@@ -113,7 +116,7 @@ func TestHypergraph(t *testing.T) {
 		pub, _, _ := ed448.GenerateKey(crand.Reader)
 		data := enc.Encrypt(make([]byte, 20), pub)
 		verenc := data[0].Compress()
-		dataTree := &crypto.VectorCommitmentTree{}
+		dataTree := &crypto.RawVectorCommitmentTree{}
 		for _, d := range []application.Encrypted{verenc} {
 			dataBytes := d.ToBytes()
 			id := sha512.Sum512(dataBytes)
@@ -151,7 +154,7 @@ func TestHypergraph(t *testing.T) {
 		pub, _, _ := ed448.GenerateKey(crand.Reader)
 		data := enc.Encrypt(make([]byte, 20), pub)
 		verenc := data[0].Compress()
-		dataTree := &crypto.VectorCommitmentTree{}
+		dataTree := &crypto.RawVectorCommitmentTree{}
 		for _, d := range []application.Encrypted{verenc} {
 			dataBytes := d.ToBytes()
 			id := sha512.Sum512(dataBytes)
@@ -186,7 +189,7 @@ func TestHypergraph(t *testing.T) {
 		pub, _, _ := ed448.GenerateKey(crand.Reader)
 		data := enc.Encrypt(make([]byte, 20), pub)
 		verenc := data[0].Compress()
-		dataTree := &crypto.VectorCommitmentTree{}
+		dataTree := &crypto.RawVectorCommitmentTree{}
 		for _, d := range []application.Encrypted{verenc} {
 			dataBytes := d.ToBytes()
 			id := sha512.Sum512(dataBytes)
@@ -222,7 +225,7 @@ func TestHypergraph(t *testing.T) {
 		pub, _, _ := ed448.GenerateKey(crand.Reader)
 		data := enc.Encrypt(make([]byte, 20), pub)
 		verenc := data[0].Compress()
-		dataTree := &crypto.VectorCommitmentTree{}
+		dataTree := &crypto.RawVectorCommitmentTree{}
 		for _, d := range []application.Encrypted{verenc} {
 			dataBytes := d.ToBytes()
 			id := sha512.Sum512(dataBytes)

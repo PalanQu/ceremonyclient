@@ -6,7 +6,7 @@ import (
 )
 
 // CompareTreesAtHeight compares two vector commitment trees at each level
-func CompareTreesAtHeight(tree1, tree2 *VectorCommitmentTree) [][]ComparisonResult {
+func CompareTreesAtHeight(tree1, tree2 *RawVectorCommitmentTree) [][]ComparisonResult {
 	if tree1 == nil || tree2 == nil {
 		return nil
 	}
@@ -104,7 +104,7 @@ func compareLevelCommits(node1, node2 VectorCommitmentNode, targetHeight, curren
 
 		// If we're still below target height after prefix, traverse children
 		if nextHeight < targetHeight {
-			for i := 0; i < BranchNodes; i++ {
+			for i := 0; i < NodesPerBranch; i++ {
 				childResults := compareLevelCommits(n1.Children[i], n2.Children[i], targetHeight, nextHeight+1)
 				results = append(results, childResults...)
 			}
@@ -115,7 +115,7 @@ func compareLevelCommits(node1, node2 VectorCommitmentNode, targetHeight, curren
 }
 
 // TraverseAndCompare provides a channel-based iterator for comparing trees
-func TraverseAndCompare(tree1, tree2 *VectorCommitmentTree) chan ComparisonResult {
+func TraverseAndCompare(tree1, tree2 *RawVectorCommitmentTree) chan ComparisonResult {
 	resultChan := make(chan ComparisonResult)
 
 	go func() {
@@ -150,7 +150,7 @@ type LeafDifference struct {
 }
 
 // CompareLeaves returns all leaves that differ between the two trees
-func CompareLeaves(tree1, tree2 *VectorCommitmentTree) []LeafDifference {
+func CompareLeaves(tree1, tree2 *RawVectorCommitmentTree) []LeafDifference {
 	// Get all leaves from both trees
 	leaves1 := GetAllLeaves(tree1.Root)
 	leaves2 := GetAllLeaves(tree2.Root)
@@ -231,8 +231,8 @@ func GetAllLeaves(node VectorCommitmentNode) []*VectorCommitmentLeafNode {
 
 func ExampleComparison() {
 	// Create and populate two trees
-	tree1 := &VectorCommitmentTree{}
-	tree2 := &VectorCommitmentTree{}
+	tree1 := &RawVectorCommitmentTree{}
+	tree2 := &RawVectorCommitmentTree{}
 
 	// Compare trees using channel-based iterator
 	for result := range TraverseAndCompare(tree1, tree2) {
