@@ -109,6 +109,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 			serverHypergraphStore,
 			shardKey,
 			phaseSet,
+			logger,
 		)
 	})
 	crdts[1] = application.NewHypergraph(func(shardKey application.ShardKey, phaseSet protobufs.HypergraphPhaseSet) crypto.VectorCommitmentTree {
@@ -116,6 +117,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 			clientHypergraphStore,
 			shardKey,
 			phaseSet,
+			logger,
 		)
 	})
 	crdts[2] = application.NewHypergraph(func(shardKey application.ShardKey, phaseSet protobufs.HypergraphPhaseSet) crypto.VectorCommitmentTree {
@@ -123,6 +125,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 			controlHypergraphStore,
 			shardKey,
 			phaseSet,
+			logger,
 		)
 	})
 
