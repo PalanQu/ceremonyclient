@@ -126,12 +126,11 @@ func TestHypergraphSyncServer(t *testing.T) {
 		)
 	})
 
-	txn, _ := serverHypergraphStore.NewOversizedBatch()
 	for _, op := range operations1[:5000] {
 		switch op.Type {
 		case "AddVertex":
 			id := op.Vertex.GetID()
-			serverHypergraphStore.SaveVertexTree(txn, id[:], dataTree)
+			serverHypergraphStore.SaveVertexTree(id[:], dataTree)
 			crdts[0].AddVertex(op.Vertex)
 		case "RemoveVertex":
 			crdts[0].RemoveVertex(op.Vertex)
@@ -141,7 +140,6 @@ func TestHypergraphSyncServer(t *testing.T) {
 			crdts[0].RemoveHyperedge(op.Hyperedge)
 		}
 	}
-	txn.Commit()
 	for _, op := range operations2[:5000] {
 		switch op.Type {
 		case "AddVertex":
@@ -155,12 +153,11 @@ func TestHypergraphSyncServer(t *testing.T) {
 		}
 	}
 
-	txn, _ = clientHypergraphStore.NewOversizedBatch()
 	for _, op := range operations1[5000:] {
 		switch op.Type {
 		case "AddVertex":
 			id := op.Vertex.GetID()
-			clientHypergraphStore.SaveVertexTree(txn, id[:], dataTree)
+			clientHypergraphStore.SaveVertexTree(id[:], dataTree)
 			crdts[1].AddVertex(op.Vertex)
 		case "RemoveVertex":
 			crdts[1].RemoveVertex(op.Vertex)
@@ -170,7 +167,6 @@ func TestHypergraphSyncServer(t *testing.T) {
 			crdts[1].RemoveHyperedge(op.Hyperedge)
 		}
 	}
-	txn.Commit()
 	for _, op := range operations2[5000:] {
 		switch op.Type {
 		case "AddVertex":
@@ -212,16 +208,9 @@ func TestHypergraphSyncServer(t *testing.T) {
 	crdts[0].Commit()
 	crdts[1].Commit()
 	crdts[2].Commit()
-	txn, _ = serverHypergraphStore.NewOversizedBatch()
-	serverHypergraphStore.SaveHypergraph(txn, crdts[0])
-	txn.Commit()
-	txn, _ = clientHypergraphStore.NewOversizedBatch()
-	clientHypergraphStore.SaveHypergraph(txn, crdts[1])
-	txn.Commit()
-	txn, _ = controlHypergraphStore.NewOversizedBatch()
-	controlHypergraphStore.SaveHypergraph(txn, crdts[2])
-	txn.Commit()
-	var err error
+	serverHypergraphStore.SaveHypergraph(crdts[0])
+	clientHypergraphStore.SaveHypergraph(crdts[1])
+	controlHypergraphStore.SaveHypergraph(crdts[2])
 	eval0, err := serverHypergraphStore.LoadHypergraph()
 	assert.NoError(t, err)
 	eval1, err := clientHypergraphStore.LoadHypergraph()
