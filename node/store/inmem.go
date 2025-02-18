@@ -374,6 +374,19 @@ func (d *InMemKVDB) NewBatch(indexed bool) Transaction {
 	}
 }
 
+func (d *InMemKVDB) NewOversizedBatch() Transaction {
+	if !d.open {
+		return nil
+	}
+
+	id := rand.Int()
+	return &InMemKVDBTransaction{
+		id:      id,
+		db:      d,
+		changes: []InMemKVDBOperation{},
+	}
+}
+
 func (d *InMemKVDB) NewIter(lowerBound []byte, upperBound []byte) (Iterator, error) {
 	if !d.open {
 		return nil, errors.New("inmem db closed")

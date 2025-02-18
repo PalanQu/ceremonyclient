@@ -16,6 +16,7 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/hypergraph/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
@@ -89,9 +90,15 @@ func TestHypergraphSyncServer(t *testing.T) {
 		}
 	}
 
-	serverKvdb := store.NewInMemKVDB()
-	clientKvdb := store.NewInMemKVDB()
-	controlKvdb := store.NewInMemKVDB()
+	serverKvdb := store.NewPebbleDB(&config.DBConfig{
+		Path: ".testconfigserver/store",
+	})
+	clientKvdb := store.NewPebbleDB(&config.DBConfig{
+		Path: ".testconfigclient/store",
+	})
+	controlKvdb := store.NewPebbleDB(&config.DBConfig{
+		Path: ".testconfigcontrol/store",
+	})
 	logger, _ := zap.NewProduction()
 	serverHypergraphStore := store.NewPebbleHypergraphStore(serverKvdb, logger)
 	clientHypergraphStore := store.NewPebbleHypergraphStore(clientKvdb, logger)
@@ -119,7 +126,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 		)
 	})
 
-	txn, _ := serverHypergraphStore.NewTransaction(false)
+	txn, _ := serverHypergraphStore.NewOversizedBatch()
 	for _, op := range operations1[:5000] {
 		switch op.Type {
 		case "AddVertex":
@@ -148,7 +155,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 		}
 	}
 
-	txn, _ = clientHypergraphStore.NewTransaction(false)
+	txn, _ = clientHypergraphStore.NewOversizedBatch()
 	for _, op := range operations1[5000:] {
 		switch op.Type {
 		case "AddVertex":
@@ -205,13 +212,13 @@ func TestHypergraphSyncServer(t *testing.T) {
 	crdts[0].Commit()
 	crdts[1].Commit()
 	crdts[2].Commit()
-	txn, _ = serverHypergraphStore.NewTransaction(false)
+	txn, _ = serverHypergraphStore.NewOversizedBatch()
 	serverHypergraphStore.SaveHypergraph(txn, crdts[0])
 	txn.Commit()
-	txn, _ = clientHypergraphStore.NewTransaction(false)
+	txn, _ = clientHypergraphStore.NewOversizedBatch()
 	clientHypergraphStore.SaveHypergraph(txn, crdts[1])
 	txn.Commit()
-	txn, _ = controlHypergraphStore.NewTransaction(false)
+	txn, _ = controlHypergraphStore.NewOversizedBatch()
 	controlHypergraphStore.SaveHypergraph(txn, crdts[2])
 	txn.Commit()
 	var err error
