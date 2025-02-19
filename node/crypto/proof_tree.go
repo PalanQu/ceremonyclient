@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sync"
 
 	rbls48581 "source.quilibrium.com/quilibrium/monorepo/bls48581"
+	"source.quilibrium.com/quilibrium/monorepo/node/internal/runtime"
 )
 
 func init() {
@@ -66,28 +68,40 @@ func (n *VectorCommitmentLeafNode) GetSize() *big.Int {
 
 func (n *VectorCommitmentBranchNode) Commit(recalculate bool) []byte {
 	if n.Commitment == nil || recalculate {
-		data := []byte{}
-		for _, child := range n.Children {
-			if child != nil {
-				out := child.Commit(recalculate)
-				switch c := child.(type) {
-				case *VectorCommitmentBranchNode:
-					h := sha512.New()
-					h.Write([]byte{1})
-					for _, p := range c.Prefix {
-						h.Write(binary.BigEndian.AppendUint32([]byte{}, uint32(p)))
+		vector := make([][]byte, len(n.Children))
+		wg := sync.WaitGroup{}
+		throttle := make(chan struct{}, runtime.WorkerCount(0, false))
+		for i, child := range n.Children {
+			throttle <- struct{}{}
+			wg.Add(1)
+			go func(i int, child VectorCommitmentNode) {
+				defer func() { <-throttle }()
+				defer wg.Done()
+				if child != nil {
+					out := child.Commit(recalculate)
+					switch c := child.(type) {
+					case *VectorCommitmentBranchNode:
+						h := sha512.New()
+						h.Write([]byte{1})
+						for _, p := range c.Prefix {
+							h.Write(binary.BigEndian.AppendUint32([]byte{}, uint32(p)))
+						}
+						h.Write(out)
+						out = h.Sum(nil)
+					case *VectorCommitmentLeafNode:
+						// do nothing
 					}
-					h.Write(out)
-					out = h.Sum(nil)
-				case *VectorCommitmentLeafNode:
-					// do nothing
+					vector[i] = out
+				} else {
+					vector[i] = make([]byte, 64)
 				}
-				data = append(data, out...)
-			} else {
-				data = append(data, make([]byte, 64)...)
-			}
+			}(i, child)
 		}
-
+		wg.Wait()
+		data := []byte{}
+		for _, vec := range vector {
+			data = append(data, vec...)
+		}
 		n.Commitment = rbls48581.CommitRaw(data, 64)
 	}
 

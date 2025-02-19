@@ -3,9 +3,17 @@ package store
 import (
 	"bytes"
 	"encoding/gob"
+	"encoding/hex"
+	"fmt"
+	"io/fs"
+	"os"
+	"path"
+	"path/filepath"
+	"strings"
 
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/hypergraph/application"
 )
@@ -32,7 +40,6 @@ type HypergraphStore interface {
 		error,
 	)
 	SaveHypergraph(
-		txn Transaction,
 		hg *application.Hypergraph,
 	) error
 }
@@ -40,15 +47,18 @@ type HypergraphStore interface {
 var _ HypergraphStore = (*PebbleHypergraphStore)(nil)
 
 type PebbleHypergraphStore struct {
+	config *config.DBConfig
 	db     KVDB
 	logger *zap.Logger
 }
 
 func NewPebbleHypergraphStore(
+	config *config.DBConfig,
 	db KVDB,
 	logger *zap.Logger,
 ) *PebbleHypergraphStore {
 	return &PebbleHypergraphStore{
+		config,
 		db,
 		logger,
 	}
@@ -201,108 +211,100 @@ func (p *PebbleHypergraphStore) LoadHypergraph() (
 	error,
 ) {
 	hg := application.NewHypergraph()
-	vertexAddsIter, err := p.db.NewIter(
+	hypergraphDir := path.Join(p.config.Path, "hypergraph")
+
+	vertexAddsPrefix := hex.EncodeToString(
 		[]byte{HYPERGRAPH_SHARD, VERTEX_ADDS},
+	)
+	vertexRemovesPrefix := hex.EncodeToString(
 		[]byte{HYPERGRAPH_SHARD, VERTEX_REMOVES},
 	)
-	if err != nil {
-		return nil, errors.Wrap(err, "load hypergraph")
-	}
-	defer vertexAddsIter.Close()
-	for vertexAddsIter.First(); vertexAddsIter.Valid(); vertexAddsIter.Next() {
-		shardKey := make([]byte, len(vertexAddsIter.Key()))
-		copy(shardKey, vertexAddsIter.Key())
-
-		err := hg.ImportFromBytes(
-			application.VertexAtomType,
-			application.AddsPhaseType,
-			shardKeyFromKey(shardKey),
-			vertexAddsIter.Value(),
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "load hypergraph")
-		}
-	}
-
-	vertexRemovesIter, err := p.db.NewIter(
-		[]byte{HYPERGRAPH_SHARD, VERTEX_REMOVES},
-		[]byte{HYPERGRAPH_SHARD, VERTEX_REMOVES + 1},
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "load hypergraph")
-	}
-	defer vertexRemovesIter.Close()
-	for vertexRemovesIter.First(); vertexRemovesIter.Valid(); vertexRemovesIter.Next() {
-		shardKey := make([]byte, len(vertexRemovesIter.Key()))
-		copy(shardKey, vertexRemovesIter.Key())
-
-		err := hg.ImportFromBytes(
-			application.VertexAtomType,
-			application.RemovesPhaseType,
-			shardKeyFromKey(shardKey),
-			vertexRemovesIter.Value(),
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "load hypergraph")
-		}
-	}
-
-	hyperedgeAddsIter, err := p.db.NewIter(
+	hyperedgeAddsPrefix := hex.EncodeToString(
 		[]byte{HYPERGRAPH_SHARD, HYPEREDGE_ADDS},
+	)
+	hyperedgeRemovesPrefix := hex.EncodeToString(
 		[]byte{HYPERGRAPH_SHARD, HYPEREDGE_REMOVES},
 	)
-	if err != nil {
-		return nil, errors.Wrap(err, "load hypergraph")
-	}
-	defer hyperedgeAddsIter.Close()
-	for hyperedgeAddsIter.First(); hyperedgeAddsIter.Valid(); hyperedgeAddsIter.Next() {
-		shardKey := make([]byte, len(hyperedgeAddsIter.Key()))
-		copy(shardKey, hyperedgeAddsIter.Key())
 
-		err := hg.ImportFromBytes(
-			application.HyperedgeAtomType,
-			application.AddsPhaseType,
-			shardKeyFromKey(shardKey),
-			hyperedgeAddsIter.Value(),
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "load hypergraph")
-		}
-	}
+	return hg, errors.Wrap(
+		filepath.WalkDir(
+			hypergraphDir,
+			func(p string, d fs.DirEntry, err error) error {
+				if d.IsDir() {
+					return nil
+				}
 
-	hyperedgeRemovesIter, err := p.db.NewIter(
-		[]byte{HYPERGRAPH_SHARD, HYPEREDGE_REMOVES},
-		[]byte{HYPERGRAPH_SHARD, HYPEREDGE_REMOVES + 1},
+				if err != nil {
+					return err
+				}
+
+				fmt.Println(d.Name())
+
+				shardSet, err := hex.DecodeString(d.Name())
+				if err != nil {
+					return err
+				}
+
+				var atomType application.AtomType
+				var setType application.PhaseType
+
+				if strings.HasPrefix(d.Name(), vertexAddsPrefix) {
+					atomType = application.VertexAtomType
+					setType = application.AddsPhaseType
+				} else if strings.HasPrefix(d.Name(), vertexRemovesPrefix) {
+					atomType = application.VertexAtomType
+					setType = application.RemovesPhaseType
+				} else if strings.HasPrefix(d.Name(), hyperedgeAddsPrefix) {
+					atomType = application.HyperedgeAtomType
+					setType = application.AddsPhaseType
+				} else if strings.HasPrefix(d.Name(), hyperedgeRemovesPrefix) {
+					atomType = application.HyperedgeAtomType
+					setType = application.RemovesPhaseType
+				}
+
+				fileBytes, err := os.ReadFile(p)
+				if err != nil {
+					return err
+				}
+
+				err = hg.ImportFromBytes(
+					atomType,
+					setType,
+					shardKeyFromKey(shardSet),
+					fileBytes,
+				)
+				if err != nil {
+					return err
+				}
+
+				return nil
+			},
+		),
+		"load hypergraph",
 	)
-	if err != nil {
-		return nil, errors.Wrap(err, "load hypergraph")
-	}
-	defer hyperedgeRemovesIter.Close()
-	for hyperedgeRemovesIter.First(); hyperedgeRemovesIter.Valid(); hyperedgeRemovesIter.Next() {
-		shardKey := make([]byte, len(hyperedgeRemovesIter.Key()))
-		copy(shardKey, hyperedgeRemovesIter.Key())
-
-		err := hg.ImportFromBytes(
-			application.HyperedgeAtomType,
-			application.RemovesPhaseType,
-			shardKeyFromKey(shardKey),
-			hyperedgeRemovesIter.Value(),
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "load hypergraph")
-		}
-	}
-
-	return hg, nil
 }
 
 func (p *PebbleHypergraphStore) SaveHypergraph(
-	txn Transaction,
 	hg *application.Hypergraph,
 ) error {
+	hypergraphDir := path.Join(p.config.Path, "hypergraph")
+	if _, err := os.Stat(hypergraphDir); os.IsNotExist(err) {
+		err := os.MkdirAll(hypergraphDir, 0777)
+		if err != nil {
+			return errors.Wrap(err, "save hypergraph")
+		}
+	}
+
 	for shardKey, vertexAdds := range hg.GetVertexAdds() {
 		if vertexAdds.IsDirty() {
-			err := txn.Set(hypergraphVertexAddsKey(shardKey), vertexAdds.ToBytes())
+			err := os.WriteFile(
+				path.Join(
+					hypergraphDir,
+					hex.EncodeToString(hypergraphVertexAddsKey(shardKey)),
+				),
+				vertexAdds.ToBytes(),
+				os.FileMode(0644),
+			)
 			if err != nil {
 				return errors.Wrap(err, "save hypergraph")
 			}
@@ -311,9 +313,13 @@ func (p *PebbleHypergraphStore) SaveHypergraph(
 
 	for shardKey, vertexRemoves := range hg.GetVertexRemoves() {
 		if vertexRemoves.IsDirty() {
-			err := txn.Set(
-				hypergraphVertexRemovesKey(shardKey),
+			err := os.WriteFile(
+				path.Join(
+					hypergraphDir,
+					hex.EncodeToString(hypergraphVertexRemovesKey(shardKey)),
+				),
 				vertexRemoves.ToBytes(),
+				os.FileMode(0644),
 			)
 			if err != nil {
 				return errors.Wrap(err, "save hypergraph")
@@ -323,9 +329,13 @@ func (p *PebbleHypergraphStore) SaveHypergraph(
 
 	for shardKey, hyperedgeAdds := range hg.GetHyperedgeAdds() {
 		if hyperedgeAdds.IsDirty() {
-			err := txn.Set(
-				hypergraphHyperedgeAddsKey(shardKey),
+			err := os.WriteFile(
+				path.Join(
+					hypergraphDir,
+					hex.EncodeToString(hypergraphHyperedgeAddsKey(shardKey)),
+				),
 				hyperedgeAdds.ToBytes(),
+				os.FileMode(0644),
 			)
 			if err != nil {
 				return errors.Wrap(err, "save hypergraph")
@@ -335,9 +345,13 @@ func (p *PebbleHypergraphStore) SaveHypergraph(
 
 	for shardKey, hyperedgeRemoves := range hg.GetHyperedgeRemoves() {
 		if hyperedgeRemoves.IsDirty() {
-			err := txn.Set(
-				hypergraphHyperedgeRemovesKey(shardKey),
+			err := os.WriteFile(
+				path.Join(
+					hypergraphDir,
+					hex.EncodeToString(hypergraphHyperedgeRemovesKey(shardKey)),
+				),
 				hyperedgeRemoves.ToBytes(),
+				os.FileMode(0644),
 			)
 			if err != nil {
 				return errors.Wrap(err, "save hypergraph")

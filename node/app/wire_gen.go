@@ -47,7 +47,7 @@ func NewDebugNode(configConfig *config.Config, selfTestReport *protobufs.SelfTes
 	blossomSub := p2p.NewBlossomSub(p2PConfig, zapLogger)
 	frameProver := crypto.NewCachedWesolowskiFrameProver(zapLogger)
 	kzgInclusionProver := crypto.NewKZGInclusionProver(zapLogger)
-	pebbleHypergraphStore := store.NewPebbleHypergraphStore(pebbleDB, zapLogger)
+	pebbleHypergraphStore := store.NewPebbleHypergraphStore(dbConfig, pebbleDB, zapLogger)
 	engineConfig := configConfig.Engine
 	masterTimeReel := time.NewMasterTimeReel(zapLogger, pebbleClockStore, engineConfig, frameProver)
 	inMemoryPeerInfoManager := p2p.NewInMemoryPeerInfoManager(zapLogger)
@@ -74,7 +74,7 @@ func NewNode(configConfig *config.Config, selfTestReport *protobufs.SelfTestRepo
 	blossomSub := p2p.NewBlossomSub(p2PConfig, zapLogger)
 	frameProver := crypto.NewCachedWesolowskiFrameProver(zapLogger)
 	kzgInclusionProver := crypto.NewKZGInclusionProver(zapLogger)
-	pebbleHypergraphStore := store.NewPebbleHypergraphStore(pebbleDB, zapLogger)
+	pebbleHypergraphStore := store.NewPebbleHypergraphStore(dbConfig, pebbleDB, zapLogger)
 	engineConfig := configConfig.Engine
 	masterTimeReel := time.NewMasterTimeReel(zapLogger, pebbleClockStore, engineConfig, frameProver)
 	inMemoryPeerInfoManager := p2p.NewInMemoryPeerInfoManager(zapLogger)

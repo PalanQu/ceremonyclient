@@ -12,9 +12,11 @@ import (
 	"testing"
 
 	"github.com/cloudflare/circl/sign/ed448"
+	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/hypergraph/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
@@ -91,8 +93,16 @@ func TestHypergraphSyncServer(t *testing.T) {
 	clientKvdb := store.NewInMemKVDB()
 	serverKvdb := store.NewInMemKVDB()
 	logger, _ := zap.NewProduction()
-	clientHypergraphStore := store.NewPebbleHypergraphStore(clientKvdb, logger)
-	serverHypergraphStore := store.NewPebbleHypergraphStore(serverKvdb, logger)
+	clientHypergraphStore := store.NewPebbleHypergraphStore(
+		&config.DBConfig{Path: ".configtestclient/store"},
+		clientKvdb,
+		logger,
+	)
+	serverHypergraphStore := store.NewPebbleHypergraphStore(
+		&config.DBConfig{Path: ".configtestserver/store"},
+		serverKvdb,
+		logger,
+	)
 	crdts := make([]*application.Hypergraph, numParties)
 	for i := 0; i < numParties; i++ {
 		crdts[i] = application.NewHypergraph()
@@ -184,6 +194,22 @@ func TestHypergraphSyncServer(t *testing.T) {
 	crdts[0].Commit()
 	crdts[1].Commit()
 	crdts[2].Commit()
+	err := serverHypergraphStore.SaveHypergraph(crdts[0])
+	assert.NoError(t, err)
+	err = clientHypergraphStore.SaveHypergraph(crdts[1])
+	assert.NoError(t, err)
+	serverLoad, err := serverHypergraphStore.LoadHypergraph()
+	assert.NoError(t, err)
+	clientLoad, err := clientHypergraphStore.LoadHypergraph()
+	assert.NoError(t, err)
+	assert.Len(t, crypto.CompareLeaves(
+		crdts[0].GetVertexAdds()[shardKey].GetTree(),
+		serverLoad.GetVertexAdds()[shardKey].GetTree(),
+	), 0)
+	assert.Len(t, crypto.CompareLeaves(
+		crdts[1].GetVertexAdds()[shardKey].GetTree(),
+		clientLoad.GetVertexAdds()[shardKey].GetTree(),
+	), 0)
 	log.Printf("Generated data")
 
 	lis, err := net.Listen("tcp", ":50051")

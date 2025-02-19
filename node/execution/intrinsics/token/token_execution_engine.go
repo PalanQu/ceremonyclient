@@ -710,7 +710,7 @@ func (e *TokenExecutionEngine) rebuildHypergraph() {
 		zap.String("root", fmt.Sprintf("%x", roots[0])),
 	)
 
-	err = e.hypergraphStore.SaveHypergraph(txn, e.hypergraph)
+	err = e.hypergraphStore.SaveHypergraph(e.hypergraph)
 	if err != nil {
 		txn.Abort()
 		panic(err)
@@ -1395,7 +1395,6 @@ func (e *TokenExecutionEngine) ProcessFrame(
 	)
 
 	err = e.hypergraphStore.SaveHypergraph(
-		txn,
 		hg,
 	)
 	if err != nil {

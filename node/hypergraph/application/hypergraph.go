@@ -106,6 +106,10 @@ func EncryptedToVertexTree(encrypted []Encrypted) *crypto.VectorCommitmentTree {
 }
 
 func AtomFromBytes(data []byte) Atom {
+	if len(data) == 0 {
+		return nil
+	}
+
 	if data[0] == 0x00 {
 		if len(data) < 161 {
 			return nil
