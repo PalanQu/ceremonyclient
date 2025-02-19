@@ -895,6 +895,7 @@ func CreateGenesisState(
 				compressed = append(compressed, d)
 			}
 			vertTree, commitment, err := hypergraphStore.CommitAndSaveVertexData(
+				txn,
 				append(append([]byte{}, application.TOKEN_ADDRESS...), address...),
 				compressed,
 			)
@@ -934,7 +935,7 @@ func CreateGenesisState(
 		}
 
 		intrinsicFilter := p2p.GetBloomFilter(application.TOKEN_ADDRESS, 256, 3)
-		err = hypergraphStore.SaveHypergraph(hg)
+		err = hypergraphStore.SaveHypergraph(txn, hg)
 		if err != nil {
 			txn.Abort()
 			panic(err)
@@ -1077,6 +1078,7 @@ func CreateGenesisState(
 				compressed = append(compressed, d)
 			}
 			vertTree, commitment, err := hypergraphStore.CommitAndSaveVertexData(
+				txn,
 				append(append([]byte{}, application.TOKEN_ADDRESS...), address...),
 				compressed,
 			)
@@ -1098,7 +1100,7 @@ func CreateGenesisState(
 			}
 		}
 		intrinsicFilter := p2p.GetBloomFilter(application.TOKEN_ADDRESS, 256, 3)
-		err = hypergraphStore.SaveHypergraph(hg)
+		err = hypergraphStore.SaveHypergraph(txn, hg)
 		if err != nil {
 			txn.Abort()
 			panic(err)

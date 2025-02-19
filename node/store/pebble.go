@@ -1,7 +1,13 @@
 package store
 
 import (
+	"fmt"
 	"io"
+	"io/fs"
+	"os"
+	"path"
+	"path/filepath"
+	"time"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/pkg/errors"
@@ -9,7 +15,8 @@ import (
 )
 
 type PebbleDB struct {
-	db *pebble.DB
+	config *config.DBConfig
+	db     *pebble.DB
 }
 
 func NewPebbleDB(config *config.DBConfig) *PebbleDB {
@@ -18,7 +25,7 @@ func NewPebbleDB(config *config.DBConfig) *PebbleDB {
 		panic(err)
 	}
 
-	return &PebbleDB{db}
+	return &PebbleDB{config, db}
 }
 
 func (p *PebbleDB) Get(key []byte) ([]byte, io.Closer, error) {
@@ -42,6 +49,24 @@ func (p *PebbleDB) NewBatch(indexed bool) Transaction {
 		return &PebbleTransaction{
 			b: p.db.NewBatch(),
 		}
+	}
+}
+
+func (p *PebbleDB) NewOversizedBatch() Transaction {
+	path := path.Join(
+		p.config.Path,
+		fmt.Sprintf("batch-%d", time.Now().UnixMilli()),
+	)
+
+	db, err := pebble.Open(path, &pebble.Options{})
+	if err != nil {
+		panic(err)
+	}
+
+	return &PebbleIngestTransaction{
+		path:   path,
+		parent: p.db,
+		b:      db,
 	}
 }
 
@@ -103,6 +128,73 @@ type Transaction interface {
 	DeleteRange(lowerBound []byte, upperBound []byte) error
 }
 
+type PebbleIngestTransaction struct {
+	path   string
+	parent *pebble.DB
+	b      *pebble.DB
+}
+
+func (t *PebbleIngestTransaction) Get(key []byte) ([]byte, io.Closer, error) {
+	return t.b.Get(key)
+}
+
+func (t *PebbleIngestTransaction) Set(key []byte, value []byte) error {
+	return t.b.Set(key, value, &pebble.WriteOptions{Sync: true})
+}
+
+func (t *PebbleIngestTransaction) Commit() error {
+	t.b.Close()
+	find := func(root, ext string) []string {
+		var a []string
+		filepath.WalkDir(root, func(s string, d fs.DirEntry, e error) error {
+			if e != nil {
+				return e
+			}
+			if filepath.Ext(d.Name()) == ext {
+				a = append(a, s)
+			}
+			return nil
+		})
+		return a
+	}
+
+	err := t.parent.Ingest(find(t.path, ".sst"))
+	if err != nil {
+		return errors.Wrap(err, "commit")
+	}
+
+	wait, err := t.parent.AsyncFlush()
+	if err != nil {
+		return errors.Wrap(err, "commit")
+	}
+
+	<-wait
+	return nil
+}
+
+func (t *PebbleIngestTransaction) Delete(key []byte) error {
+	return t.b.Delete(key, &pebble.WriteOptions{Sync: true})
+}
+
+func (t *PebbleIngestTransaction) Abort() error {
+	t.b.Close()
+	return errors.Wrap(os.RemoveAll(t.path), "abort")
+}
+
+func (t *PebbleIngestTransaction) NewIter(lowerBound []byte, upperBound []byte) (
+	Iterator,
+	error,
+) {
+	return nil, errors.New("unsupported")
+}
+
+func (t *PebbleIngestTransaction) DeleteRange(
+	lowerBound []byte,
+	upperBound []byte,
+) error {
+	return errors.New("unsupported")
+}
+
 type PebbleTransaction struct {
 	b *pebble.Batch
 }
@@ -149,6 +241,7 @@ func (t *PebbleTransaction) DeleteRange(
 }
 
 var _ Transaction = (*PebbleTransaction)(nil)
+var _ Transaction = (*PebbleIngestTransaction)(nil)
 
 func rightAlign(data []byte, size int) []byte {
 	l := len(data)

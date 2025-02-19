@@ -21,10 +21,12 @@ type HypergraphStore interface {
 	)
 	LoadVertexData(id []byte) ([]application.Encrypted, error)
 	SaveVertexTree(
+		txn Transaction,
 		id []byte,
 		vertTree *crypto.RawVectorCommitmentTree,
 	) error
 	CommitAndSaveVertexData(
+		txn Transaction,
 		id []byte,
 		data []application.Encrypted,
 	) (*crypto.RawVectorCommitmentTree, []byte, error)
@@ -33,11 +35,13 @@ type HypergraphStore interface {
 		error,
 	)
 	SaveHypergraph(
+		txn Transaction,
 		hg *application.Hypergraph,
 	) error
 	GetBranchNode(id NodeID) (*StoredBranchNode, error)
 	GetLeafNode(id NodeID) (*StoredLeafNode, error)
 	BatchWrite(
+		txn Transaction,
 		branches map[NodeID]*StoredBranchNode,
 		leaves map[NodeID]*StoredLeafNode,
 		deletions map[NodeID]struct{},
@@ -154,6 +158,10 @@ func (p *PebbleHypergraphStore) NewTransaction(indexed bool) (
 	return p.db.NewBatch(indexed), nil
 }
 
+func (p *PebbleHypergraphStore) NewOversizedBatch() (Transaction, error) {
+	return p.db.NewOversizedBatch(), nil
+}
+
 func (p *PebbleHypergraphStore) LoadVertexTree(id []byte) (
 	*crypto.RawVectorCommitmentTree,
 	error,
@@ -203,6 +211,7 @@ func (p *PebbleHypergraphStore) LoadVertexData(id []byte) (
 }
 
 func (p *PebbleHypergraphStore) SaveVertexTree(
+	txn Transaction,
 	id []byte,
 	vertTree *crypto.RawVectorCommitmentTree,
 ) error {
@@ -213,12 +222,13 @@ func (p *PebbleHypergraphStore) SaveVertexTree(
 	}
 
 	return errors.Wrap(
-		p.db.Set(hypergraphVertexDataKey(id), buf.Bytes()),
+		txn.Set(hypergraphVertexDataKey(id), buf.Bytes()),
 		"save vertex tree",
 	)
 }
 
 func (p *PebbleHypergraphStore) CommitAndSaveVertexData(
+	txn Transaction,
 	id []byte,
 	data []application.Encrypted,
 ) (*crypto.RawVectorCommitmentTree, []byte, error) {
@@ -232,7 +242,7 @@ func (p *PebbleHypergraphStore) CommitAndSaveVertexData(
 	}
 
 	return dataTree, commit, errors.Wrap(
-		p.db.Set(hypergraphVertexDataKey(id), buf.Bytes()),
+		txn.Set(hypergraphVertexDataKey(id), buf.Bytes()),
 		"commit and save vertex data",
 	)
 }
@@ -417,13 +427,14 @@ func (p *PebbleHypergraphStore) LoadHypergraph() (
 }
 
 func (p *PebbleHypergraphStore) SaveHypergraph(
+	txn Transaction,
 	hg *application.Hypergraph,
 ) error {
 	hg.Commit()
 
 	for _, vertexAdds := range hg.GetVertexAdds() {
 		if vertexAdds.IsDirty() {
-			err := vertexAdds.GetTree().(*PersistentVectorTree).WriteBatch()
+			err := vertexAdds.GetTree().(*PersistentVectorTree).WriteBatch(txn)
 			if err != nil {
 				return errors.Wrap(err, "save hypergraph")
 			}
@@ -432,7 +443,7 @@ func (p *PebbleHypergraphStore) SaveHypergraph(
 
 	for _, vertexRemoves := range hg.GetVertexRemoves() {
 		if vertexRemoves.IsDirty() {
-			err := vertexRemoves.GetTree().(*PersistentVectorTree).WriteBatch()
+			err := vertexRemoves.GetTree().(*PersistentVectorTree).WriteBatch(txn)
 			if err != nil {
 				return errors.Wrap(err, "save hypergraph")
 			}
@@ -441,7 +452,7 @@ func (p *PebbleHypergraphStore) SaveHypergraph(
 
 	for _, hyperedgeAdds := range hg.GetHyperedgeAdds() {
 		if hyperedgeAdds.IsDirty() {
-			err := hyperedgeAdds.GetTree().(*PersistentVectorTree).WriteBatch()
+			err := hyperedgeAdds.GetTree().(*PersistentVectorTree).WriteBatch(txn)
 			if err != nil {
 				return errors.Wrap(err, "save hypergraph")
 			}
@@ -450,7 +461,7 @@ func (p *PebbleHypergraphStore) SaveHypergraph(
 
 	for _, hyperedgeRemoves := range hg.GetHyperedgeRemoves() {
 		if hyperedgeRemoves.IsDirty() {
-			err := hyperedgeRemoves.GetTree().(*PersistentVectorTree).WriteBatch()
+			err := hyperedgeRemoves.GetTree().(*PersistentVectorTree).WriteBatch(txn)
 			if err != nil {
 				return errors.Wrap(err, "save hypergraph")
 			}
@@ -505,12 +516,13 @@ func (p *PebbleHypergraphStore) GetLeafNode(id NodeID) (
 }
 
 func (p *PebbleHypergraphStore) BatchWrite(
+	txn Transaction,
 	branches map[NodeID]*StoredBranchNode,
 	leaves map[NodeID]*StoredLeafNode,
 	deletions map[NodeID]struct{},
 ) error {
 	for id := range deletions {
-		if err := p.db.Delete([]byte(id)); err != nil {
+		if err := txn.Delete([]byte(id)); err != nil {
 			return errors.Wrap(err, "batch write")
 		}
 	}
@@ -522,7 +534,7 @@ func (p *PebbleHypergraphStore) BatchWrite(
 			return errors.Wrap(err, "batch write")
 		}
 
-		if err := p.db.Set([]byte(id), buf.Bytes()); err != nil {
+		if err := txn.Set([]byte(id), buf.Bytes()); err != nil {
 			return errors.Wrap(err, "batch write")
 		}
 	}
@@ -534,7 +546,7 @@ func (p *PebbleHypergraphStore) BatchWrite(
 			return errors.Wrap(err, "batch write")
 		}
 
-		if err := p.db.Set([]byte(id), buf.Bytes()); err != nil {
+		if err := txn.Set([]byte(id), buf.Bytes()); err != nil {
 			return errors.Wrap(err, "batch write")
 		}
 	}
@@ -1205,8 +1217,8 @@ func (t *PersistentVectorTree) Commit(recalculate bool) []byte {
 	return t.tree.Commit(recalculate)
 }
 
-func (t *PersistentVectorTree) WriteBatch() error {
-	err := t.store.BatchWrite(t.addedBranches, t.addedLeaves, t.deletions)
+func (t *PersistentVectorTree) WriteBatch(txn Transaction) error {
+	err := t.store.BatchWrite(txn, t.addedBranches, t.addedLeaves, t.deletions)
 	if err != nil {
 		return errors.Wrap(err, "write batch")
 	}

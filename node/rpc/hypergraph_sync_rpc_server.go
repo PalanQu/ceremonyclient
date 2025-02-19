@@ -520,16 +520,27 @@ func syncTreeBidirectionallyServer(
 					),
 				)
 				if len(remoteUpdate.UnderlyingData) != 0 {
+					txn, err := localHypergraphStore.NewTransaction(false)
+					if err != nil {
+						return err
+					}
 					tree := &crypto.RawVectorCommitmentTree{}
 					var b bytes.Buffer
 					b.Write(remoteUpdate.UnderlyingData)
 
 					dec := gob.NewDecoder(&b)
 					if err := dec.Decode(tree); err != nil {
+						txn.Abort()
 						return err
 					}
-					err = localHypergraphStore.SaveVertexTree(remoteUpdate.Key, tree)
+					err = localHypergraphStore.SaveVertexTree(txn, remoteUpdate.Key, tree)
 					if err != nil {
+						txn.Abort()
+						return err
+					}
+
+					if err = txn.Commit(); err != nil {
+						txn.Abort()
 						return err
 					}
 				}
@@ -792,15 +803,29 @@ func SyncTreeBidirectionally(
 				remoteUpdate := payload.LeafData
 				size := new(big.Int).SetBytes(remoteUpdate.Size)
 				if len(remoteUpdate.UnderlyingData) != 0 {
+					txn, err := hypergraphStore.NewTransaction(false)
+					if err != nil {
+						return err
+					}
 					tree := &crypto.RawVectorCommitmentTree{}
 					var b bytes.Buffer
 					b.Write(remoteUpdate.UnderlyingData)
 
 					dec := gob.NewDecoder(&b)
 					if err := dec.Decode(tree); err != nil {
+						txn.Abort()
 						return err
 					}
-					err = hypergraphStore.SaveVertexTree(remoteUpdate.Key, tree)
+					err = hypergraphStore.SaveVertexTree(txn, remoteUpdate.Key, tree)
+					if err != nil {
+						txn.Abort()
+						return err
+					}
+
+					if err = txn.Commit(); err != nil {
+						txn.Abort()
+						return err
+					}
 				}
 
 				localTree.Insert(

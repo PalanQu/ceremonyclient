@@ -565,7 +565,7 @@ func (e *TokenExecutionEngine) addBatchToHypergraph(batchKey [][]byte, batchValu
 			batchKey[i]...,
 		)
 
-		err = e.hypergraphStore.SaveVertexTree(id, vertTree)
+		err = e.hypergraphStore.SaveVertexTree(txn, id, vertTree)
 		if err != nil {
 			txn.Abort()
 			panic(err)
@@ -718,6 +718,11 @@ func (e *TokenExecutionEngine) rebuildHypergraph() {
 		e.addBatchToHypergraph(batchKey, batchValue)
 	}
 
+	txn, err := e.clockStore.NewTransaction(false)
+	if err != nil {
+		panic(err)
+	}
+
 	e.logger.Info("committing hypergraph")
 
 	roots := e.hypergraph.Commit()
@@ -727,8 +732,14 @@ func (e *TokenExecutionEngine) rebuildHypergraph() {
 		zap.String("root", fmt.Sprintf("%x", roots[0])),
 	)
 
-	err = e.hypergraphStore.SaveHypergraph(e.hypergraph)
+	err = e.hypergraphStore.SaveHypergraph(txn, e.hypergraph)
 	if err != nil {
+		txn.Abort()
+		panic(err)
+	}
+
+	if err = txn.Commit(); err != nil {
+		txn.Abort()
 		panic(err)
 	}
 }
@@ -946,6 +957,7 @@ func (e *TokenExecutionEngine) ProcessFrame(
 			}
 
 			vertTree, commitment, err := e.hypergraphStore.CommitAndSaveVertexData(
+				txn,
 				append(append([]byte{}, application.TOKEN_ADDRESS...), address...),
 				compressed,
 			)
@@ -1010,6 +1022,7 @@ func (e *TokenExecutionEngine) ProcessFrame(
 				}
 
 				vertTree, _, err = e.hypergraphStore.CommitAndSaveVertexData(
+					txn,
 					vertId,
 					compressed,
 				)
@@ -1403,7 +1416,10 @@ func (e *TokenExecutionEngine) ProcessFrame(
 		zap.String("root", fmt.Sprintf("%x", roots[0])),
 	)
 
-	err = e.hypergraphStore.SaveHypergraph(hg)
+	err = e.hypergraphStore.SaveHypergraph(
+		txn,
+		hg,
+	)
 	if err != nil {
 		txn.Abort()
 		return nil, errors.Wrap(err, "process frame")
