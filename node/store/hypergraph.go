@@ -158,10 +158,6 @@ func (p *PebbleHypergraphStore) NewTransaction(indexed bool) (
 	return p.db.NewBatch(indexed), nil
 }
 
-func (p *PebbleHypergraphStore) NewOversizedBatch() (Transaction, error) {
-	return p.db.NewOversizedBatch(), nil
-}
-
 func (p *PebbleHypergraphStore) LoadVertexTree(id []byte) (
 	*crypto.RawVectorCommitmentTree,
 	error,
