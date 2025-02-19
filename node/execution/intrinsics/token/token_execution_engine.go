@@ -148,18 +148,7 @@ func NewTokenExecutionEngine(
 	var inclusionProof *qcrypto.InclusionAggregateProof
 	var proverKeys [][]byte
 	var peerSeniority map[string]uint64
-	hg := hypergraph.NewHypergraph(
-		func(
-			shardKey hypergraph.ShardKey,
-			phaseSet protobufs.HypergraphPhaseSet,
-		) qcrypto.VectorCommitmentTree {
-			return store.NewPersistentVectorTree(
-				hypergraphStore,
-				shardKey,
-				phaseSet,
-			)
-		},
-	)
+	hg := hypergraph.NewHypergraph()
 	mpcithVerEnc := qcrypto.NewMPCitHVerifiableEncryptor(
 		runtime.NumCPU(),
 	)
@@ -495,7 +484,7 @@ func (e *TokenExecutionEngine) addBatchToHypergraph(batchKey [][]byte, batchValu
 	var wg sync.WaitGroup
 	throttle := make(chan struct{}, runtime.NumCPU())
 	batchCompressed := make([]hypergraph.Vertex, len(batchKey))
-	batchTrees := make([]*qcrypto.RawVectorCommitmentTree, len(batchKey))
+	batchTrees := make([]*qcrypto.VectorCommitmentTree, len(batchKey))
 	txn, err := e.hypergraphStore.NewTransaction(false)
 	if err != nil {
 		panic(err)
@@ -650,18 +639,7 @@ func (e *TokenExecutionEngine) hyperSync() {
 
 func (e *TokenExecutionEngine) rebuildHypergraph() {
 	e.logger.Info("rebuilding hypergraph")
-	e.hypergraph = hypergraph.NewHypergraph(
-		func(
-			shardKey hypergraph.ShardKey,
-			phaseSet protobufs.HypergraphPhaseSet,
-		) qcrypto.VectorCommitmentTree {
-			return store.NewPersistentVectorTree(
-				e.hypergraphStore,
-				shardKey,
-				phaseSet,
-			)
-		},
-	)
+	e.hypergraph = hypergraph.NewHypergraph()
 	if e.engineConfig.RebuildStart == "" {
 		e.engineConfig.RebuildStart = "0000000000000000000000000000000000000000000000000000000000000000"
 	}

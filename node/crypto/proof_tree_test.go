@@ -11,7 +11,7 @@ import (
 )
 
 func BenchmarkVectorCommitmentTreeInsert(b *testing.B) {
-	tree := &RawVectorCommitmentTree{}
+	tree := &VectorCommitmentTree{}
 	addresses := [][]byte{}
 
 	for i := range b.N {
@@ -26,7 +26,7 @@ func BenchmarkVectorCommitmentTreeInsert(b *testing.B) {
 }
 
 func BenchmarkVectorCommitmentTreeCommit(b *testing.B) {
-	tree := &RawVectorCommitmentTree{}
+	tree := &VectorCommitmentTree{}
 	addresses := [][]byte{}
 
 	for i := range b.N {
@@ -42,7 +42,7 @@ func BenchmarkVectorCommitmentTreeCommit(b *testing.B) {
 }
 
 func BenchmarkVectorCommitmentTreeProve(b *testing.B) {
-	tree := &RawVectorCommitmentTree{}
+	tree := &VectorCommitmentTree{}
 	addresses := [][]byte{}
 
 	for i := range b.N {
@@ -58,7 +58,7 @@ func BenchmarkVectorCommitmentTreeProve(b *testing.B) {
 }
 
 func BenchmarkVectorCommitmentTreeVerify(b *testing.B) {
-	tree := &RawVectorCommitmentTree{}
+	tree := &VectorCommitmentTree{}
 	addresses := [][]byte{}
 
 	for i := range b.N {
@@ -78,7 +78,7 @@ func BenchmarkVectorCommitmentTreeVerify(b *testing.B) {
 
 func TestVectorCommitmentTrees(t *testing.T) {
 	bls48581.Init()
-	tree := &RawVectorCommitmentTree{}
+	tree := &VectorCommitmentTree{}
 
 	// Test single insert
 	err := tree.Insert([]byte("key1"), []byte("value1"), nil, big.NewInt(1))
@@ -106,7 +106,7 @@ func TestVectorCommitmentTrees(t *testing.T) {
 		t.Error("Expected error for empty key, got none")
 	}
 
-	tree = &RawVectorCommitmentTree{}
+	tree = &VectorCommitmentTree{}
 
 	// Test get on empty tree
 	_, err = tree.Get([]byte("nonexistent"))
@@ -130,7 +130,7 @@ func TestVectorCommitmentTrees(t *testing.T) {
 		t.Error("Expected error for empty key, got none")
 	}
 
-	tree = &RawVectorCommitmentTree{}
+	tree = &VectorCommitmentTree{}
 
 	// Test delete on empty tree
 	err = tree.Delete([]byte("nonexistent"))
@@ -157,7 +157,7 @@ func TestVectorCommitmentTrees(t *testing.T) {
 		t.Error("Expected error for empty key, got none")
 	}
 
-	tree = &RawVectorCommitmentTree{}
+	tree = &VectorCommitmentTree{}
 
 	// Insert keys that share common prefix
 	keys := []string{
@@ -212,7 +212,7 @@ func TestVectorCommitmentTrees(t *testing.T) {
 		}
 	}
 
-	tree = &RawVectorCommitmentTree{}
+	tree = &VectorCommitmentTree{}
 
 	// Empty tree should be empty
 	emptyRoot := tree.Root
@@ -244,8 +244,8 @@ func TestVectorCommitmentTrees(t *testing.T) {
 		t.Error("Root hash should match empty tree after deleting all entries")
 	}
 
-	tree = &RawVectorCommitmentTree{}
-	cmptree := &RawVectorCommitmentTree{}
+	tree = &VectorCommitmentTree{}
+	cmptree := &VectorCommitmentTree{}
 
 	addresses := [][]byte{}
 
@@ -332,7 +332,7 @@ func TestVectorCommitmentTrees(t *testing.T) {
 		t.Errorf("invalid tree size: %s", tree.GetSize().String())
 	}
 
-	cmptree = &RawVectorCommitmentTree{}
+	cmptree = &VectorCommitmentTree{}
 
 	for i := 0; i < 10000; i++ {
 		cmptree.Insert(kept[i], kept[i], nil, big.NewInt(1))

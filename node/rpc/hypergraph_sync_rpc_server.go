@@ -43,7 +43,7 @@ func NewHypergraphComparisonServer(
 func sendLeafData(
 	stream protobufs.HypergraphComparisonService_HyperStreamClient,
 	hypergraphStore store.HypergraphStore,
-	localTree *crypto.RawVectorCommitmentTree,
+	localTree *crypto.VectorCommitmentTree,
 	path []int32,
 	metadataOnly bool,
 ) error {
@@ -161,7 +161,7 @@ func getNodeAtPath(
 // getBranchInfoFromTree looks up the node at the given path in the local tree,
 // computes its commitment, and (if it is a branch) collects its immediate
 // children's commitments.
-func getBranchInfoFromTree(tree *crypto.RawVectorCommitmentTree, path []int32) (
+func getBranchInfoFromTree(tree *crypto.VectorCommitmentTree, path []int32) (
 	*protobufs.HypergraphComparisonResponse,
 	error,
 ) {
@@ -207,7 +207,7 @@ func isLeaf(info *protobufs.HypergraphComparisonResponse) bool {
 func sendLeafDataServer(
 	stream protobufs.HypergraphComparisonService_HyperStreamServer,
 	hypergraphStore store.HypergraphStore,
-	localTree *crypto.RawVectorCommitmentTree,
+	localTree *crypto.VectorCommitmentTree,
 	path []int32,
 	metadataOnly bool,
 ) error {
@@ -309,10 +309,7 @@ func syncTreeBidirectionallyServer(
 
 	// Send our root branch info.
 	rootPath := []int32{}
-	rootInfo, err := getBranchInfoFromTree(
-		idSet.GetTree().(*store.PersistentVectorTree).GetInternalTree(),
-		rootPath,
-	)
+	rootInfo, err := getBranchInfoFromTree(idSet.GetTree(), rootPath)
 	if err != nil {
 		return err
 	}
@@ -377,7 +374,7 @@ func syncTreeBidirectionallyServer(
 					zap.String("path", hex.EncodeToString(packNibbles(remoteInfo.Path))),
 				)
 				localInfo, err := getBranchInfoFromTree(
-					idSet.GetTree().(*store.PersistentVectorTree).GetInternalTree(),
+					idSet.GetTree(),
 					remoteInfo.Path,
 				)
 				if err != nil {
@@ -425,7 +422,7 @@ func syncTreeBidirectionallyServer(
 						if err := sendLeafDataServer(
 							stream,
 							localHypergraphStore,
-							idSet.GetTree().(*store.PersistentVectorTree).GetInternalTree(),
+							idSet.GetTree(),
 							remoteInfo.Path,
 							metadataOnly,
 						); err != nil {
@@ -480,7 +477,7 @@ func syncTreeBidirectionallyServer(
 					if err := sendLeafDataServer(
 						stream,
 						localHypergraphStore,
-						idSet.GetTree().(*store.PersistentVectorTree).GetInternalTree(),
+						idSet.GetTree(),
 						queryPath,
 						metadataOnly,
 					); err != nil {
@@ -494,10 +491,7 @@ func syncTreeBidirectionallyServer(
 							hex.EncodeToString(packNibbles(queryPath)),
 						),
 					)
-					branchInfo, err := getBranchInfoFromTree(
-						idSet.GetTree().(*store.PersistentVectorTree).GetInternalTree(),
-						queryPath,
-					)
+					branchInfo, err := getBranchInfoFromTree(idSet.GetTree(), queryPath)
 					if err != nil {
 						continue
 					}
@@ -524,7 +518,7 @@ func syncTreeBidirectionallyServer(
 					if err != nil {
 						return err
 					}
-					tree := &crypto.RawVectorCommitmentTree{}
+					tree := &crypto.VectorCommitmentTree{}
 					var b bytes.Buffer
 					b.Write(remoteUpdate.UnderlyingData)
 
@@ -576,7 +570,7 @@ func SyncTreeBidirectionally(
 	shardKey []byte,
 	phaseSet protobufs.HypergraphPhaseSet,
 	hypergraphStore store.HypergraphStore,
-	localTree crypto.VectorCommitmentTree,
+	localTree *crypto.VectorCommitmentTree,
 	metadataOnly bool,
 ) error {
 	logger.Info(
@@ -599,10 +593,7 @@ func SyncTreeBidirectionally(
 	}
 
 	rootPath := []int32{}
-	rootInfo, err := getBranchInfoFromTree(
-		localTree.(*store.PersistentVectorTree).GetInternalTree(),
-		rootPath,
-	)
+	rootInfo, err := getBranchInfoFromTree(localTree, rootPath)
 	if err != nil {
 		return err
 	}
@@ -662,10 +653,7 @@ func SyncTreeBidirectionally(
 					"handling response",
 					zap.String("path", hex.EncodeToString(packNibbles(remoteInfo.Path))),
 				)
-				localInfo, err := getBranchInfoFromTree(
-					localTree.(*store.PersistentVectorTree).GetInternalTree(),
-					remoteInfo.Path,
-				)
+				localInfo, err := getBranchInfoFromTree(localTree, remoteInfo.Path)
 				if err != nil {
 					logger.Info(
 						"requesting missing node",
@@ -707,7 +695,7 @@ func SyncTreeBidirectionally(
 						if err := sendLeafData(
 							stream,
 							hypergraphStore,
-							localTree.(*store.PersistentVectorTree).GetInternalTree(),
+							localTree,
 							remoteInfo.Path,
 							metadataOnly,
 						); err != nil {
@@ -762,7 +750,7 @@ func SyncTreeBidirectionally(
 					if err := sendLeafData(
 						stream,
 						hypergraphStore,
-						localTree.(*store.PersistentVectorTree).GetInternalTree(),
+						localTree,
 						queryPath,
 						metadataOnly,
 					); err != nil {
@@ -776,10 +764,7 @@ func SyncTreeBidirectionally(
 							hex.EncodeToString(packNibbles(queryPath)),
 						),
 					)
-					branchInfo, err := getBranchInfoFromTree(
-						localTree.(*store.PersistentVectorTree).GetInternalTree(),
-						queryPath,
-					)
+					branchInfo, err := getBranchInfoFromTree(localTree, queryPath)
 					if err != nil {
 						continue
 					}
@@ -807,7 +792,7 @@ func SyncTreeBidirectionally(
 					if err != nil {
 						return err
 					}
-					tree := &crypto.RawVectorCommitmentTree{}
+					tree := &crypto.VectorCommitmentTree{}
 					var b bytes.Buffer
 					b.Write(remoteUpdate.UnderlyingData)
 

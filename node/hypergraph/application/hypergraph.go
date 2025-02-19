@@ -9,7 +9,6 @@ import (
 	"github.com/pkg/errors"
 	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
-	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 )
 
 type AtomType string
@@ -73,7 +72,7 @@ type hyperedge struct {
 	appAddress  [32]byte
 	dataAddress [32]byte
 	extrinsics  map[[64]byte]Atom
-	extTree     *crypto.RawVectorCommitmentTree
+	extTree     *crypto.VectorCommitmentTree
 }
 
 var _ Vertex = (*vertex)(nil)
@@ -90,8 +89,8 @@ type Atom interface {
 	Commit() []byte
 }
 
-func EncryptedToVertexTree(encrypted []Encrypted) *crypto.RawVectorCommitmentTree {
-	dataTree := &crypto.RawVectorCommitmentTree{}
+func EncryptedToVertexTree(encrypted []Encrypted) *crypto.VectorCommitmentTree {
+	dataTree := &crypto.VectorCommitmentTree{}
 	for _, d := range encrypted {
 		dataBytes := d.ToBytes()
 		id := sha512.Sum512(dataBytes)
@@ -119,7 +118,7 @@ func AtomFromBytes(data []byte) Atom {
 			size:        new(big.Int).SetBytes(data[len(data)-32:]),
 		}
 	} else {
-		tree := &crypto.RawVectorCommitmentTree{}
+		tree := &crypto.VectorCommitmentTree{}
 		var b bytes.Buffer
 		b.Write(data[65:])
 		dec := gob.NewDecoder(&b)
@@ -163,7 +162,7 @@ func NewHyperedge(
 		appAddress:  appAddress,
 		dataAddress: dataAddress,
 		extrinsics:  make(map[[64]byte]Atom),
-		extTree:     &crypto.RawVectorCommitmentTree{},
+		extTree:     &crypto.VectorCommitmentTree{},
 	}
 }
 
@@ -331,36 +330,46 @@ type IdSet struct {
 	dirty    bool
 	atomType AtomType
 	atoms    map[[64]byte]Atom
-	tree     crypto.VectorCommitmentTree
+	tree     *crypto.VectorCommitmentTree
 }
 
-func NewIdSet(
-	shardKey ShardKey,
-	phaseSet protobufs.HypergraphPhaseSet,
-	tree crypto.VectorCommitmentTree,
-) *IdSet {
-	atomType := VertexAtomType
-	switch phaseSet {
-	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS:
-		fallthrough
-	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_REMOVES:
-		atomType = VertexAtomType
-	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_ADDS:
-		fallthrough
-	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_REMOVES:
-		atomType = HyperedgeAtomType
-	}
-
+func NewIdSet(atomType AtomType) *IdSet {
 	return &IdSet{
 		dirty:    false,
 		atomType: atomType,
 		atoms:    make(map[[64]byte]Atom),
-		tree:     tree,
+		tree:     &crypto.VectorCommitmentTree{},
 	}
+}
+
+func (set *IdSet) FromBytes(treeData []byte) error {
+	set.tree = &crypto.VectorCommitmentTree{}
+	var b bytes.Buffer
+	b.Write(treeData)
+	dec := gob.NewDecoder(&b)
+	if err := dec.Decode(set.tree); err != nil {
+		return errors.Wrap(err, "load set")
+	}
+
+	for _, leaf := range crypto.GetAllLeaves(set.tree.Root) {
+		set.atoms[[64]byte(leaf.Key)] = AtomFromBytes(leaf.Value)
+	}
+
+	return nil
 }
 
 func (set *IdSet) IsDirty() bool {
 	return set.dirty
+}
+
+func (set *IdSet) ToBytes() []byte {
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(set.tree); err != nil {
+		return nil
+	}
+
+	return buf.Bytes()
 }
 
 func (set *IdSet) Add(atom Atom) error {
@@ -403,31 +412,21 @@ func (set *IdSet) Has(key [64]byte) bool {
 	return ok
 }
 
-func (set *IdSet) GetTree() crypto.VectorCommitmentTree {
+func (set *IdSet) GetTree() *crypto.VectorCommitmentTree {
 	return set.tree
 }
 
 type Hypergraph struct {
-	size            *big.Int
-	treeConstructor func(
-		shardKey ShardKey,
-		phaseSet protobufs.HypergraphPhaseSet,
-	) crypto.VectorCommitmentTree
+	size             *big.Int
 	vertexAdds       map[ShardKey]*IdSet
 	vertexRemoves    map[ShardKey]*IdSet
 	hyperedgeAdds    map[ShardKey]*IdSet
 	hyperedgeRemoves map[ShardKey]*IdSet
 }
 
-func NewHypergraph(
-	treeConstructor func(
-		shardKey ShardKey,
-		phaseSet protobufs.HypergraphPhaseSet,
-	) crypto.VectorCommitmentTree,
-) *Hypergraph {
+func NewHypergraph() *Hypergraph {
 	return &Hypergraph{
 		size:             big.NewInt(0),
-		treeConstructor:  treeConstructor,
 		vertexAdds:       make(map[ShardKey]*IdSet),
 		vertexRemoves:    make(map[ShardKey]*IdSet),
 		hyperedgeAdds:    make(map[ShardKey]*IdSet),
@@ -468,26 +467,36 @@ func (hg *Hypergraph) Commit() [][]byte {
 	return commits
 }
 
-func (hg *Hypergraph) SetIdSet(
+func (hg *Hypergraph) ImportFromBytes(
+	atomType AtomType,
+	phaseType PhaseType,
 	shardKey ShardKey,
-	phaseSet protobufs.HypergraphPhaseSet,
-	tree crypto.VectorCommitmentTree,
+	data []byte,
 ) error {
-	set := NewIdSet(shardKey, phaseSet, tree)
+	set := NewIdSet(atomType)
+	if err := set.FromBytes(data); err != nil {
+		return errors.Wrap(err, "import from bytes")
+	}
 
-	switch phaseSet {
-	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS:
-		hg.size.Add(hg.size, set.GetSize())
-		hg.vertexAdds[shardKey] = set
-	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_REMOVES:
-		hg.size.Sub(hg.size, set.GetSize())
-		hg.vertexRemoves[shardKey] = set
-	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_ADDS:
-		hg.size.Add(hg.size, set.GetSize())
-		hg.hyperedgeAdds[shardKey] = set
-	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_REMOVES:
-		hg.size.Sub(hg.size, set.GetSize())
-		hg.hyperedgeRemoves[shardKey] = set
+	switch atomType {
+	case VertexAtomType:
+		switch phaseType {
+		case AddsPhaseType:
+			hg.size.Add(hg.size, set.GetSize())
+			hg.vertexAdds[shardKey] = set
+		case RemovesPhaseType:
+			hg.size.Sub(hg.size, set.GetSize())
+			hg.vertexRemoves[shardKey] = set
+		}
+	case HyperedgeAtomType:
+		switch phaseType {
+		case AddsPhaseType:
+			hg.size.Add(hg.size, set.GetSize())
+			hg.hyperedgeAdds[shardKey] = set
+		case RemovesPhaseType:
+			hg.size.Sub(hg.size, set.GetSize())
+			hg.hyperedgeRemoves[shardKey] = set
+		}
 	}
 
 	return nil
@@ -498,32 +507,18 @@ func (hg *Hypergraph) GetSize() *big.Int {
 }
 
 func (hg *Hypergraph) getOrCreateIdSet(
-	shardKey ShardKey,
+	shardAddr ShardKey,
 	addMap map[ShardKey]*IdSet,
 	removeMap map[ShardKey]*IdSet,
 	atomType AtomType,
 ) (*IdSet, *IdSet) {
-	if _, ok := addMap[shardKey]; !ok {
-		phaseSet := protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS
-		if atomType == HyperedgeAtomType {
-			phaseSet = protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_ADDS
-		}
-		addMap[shardKey] = NewIdSet(shardKey, phaseSet, hg.treeConstructor(
-			shardKey,
-			phaseSet,
-		))
+	if _, ok := addMap[shardAddr]; !ok {
+		addMap[shardAddr] = NewIdSet(atomType)
 	}
-	if _, ok := removeMap[shardKey]; !ok {
-		phaseSet := protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_REMOVES
-		if atomType == HyperedgeAtomType {
-			phaseSet = protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_REMOVES
-		}
-		removeMap[shardKey] = NewIdSet(shardKey, phaseSet, hg.treeConstructor(
-			shardKey,
-			phaseSet,
-		))
+	if _, ok := removeMap[shardAddr]; !ok {
+		removeMap[shardAddr] = NewIdSet(atomType)
 	}
-	return addMap[shardKey], removeMap[shardKey]
+	return addMap[shardAddr], removeMap[shardAddr]
 }
 
 func (hg *Hypergraph) AddVertex(v Vertex) error {
@@ -691,4 +686,38 @@ func (hg *Hypergraph) Within(a, h Atom) bool {
 		}
 	}
 	return false
+}
+
+func (hg *Hypergraph) GetReconciledVertexSetForShard(
+	shardKey ShardKey,
+) *IdSet {
+	vertices := NewIdSet(VertexAtomType)
+
+	if addSet, ok := hg.vertexAdds[shardKey]; ok {
+		removeSet := hg.vertexRemoves[shardKey]
+		for id, v := range addSet.atoms {
+			if !removeSet.Has(id) {
+				vertices.Add(v)
+			}
+		}
+	}
+
+	return vertices
+}
+
+func (hg *Hypergraph) GetReconciledHyperedgeSetForShard(
+	shardKey ShardKey,
+) *IdSet {
+	hyperedges := NewIdSet(HyperedgeAtomType)
+
+	if addSet, ok := hg.hyperedgeAdds[shardKey]; ok {
+		removeSet := hg.hyperedgeRemoves[shardKey]
+		for _, h := range addSet.atoms {
+			if !removeSet.Has(h.GetID()) {
+				hyperedges.Add(h)
+			}
+		}
+	}
+
+	return hyperedges
 }

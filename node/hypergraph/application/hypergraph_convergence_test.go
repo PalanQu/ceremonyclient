@@ -10,11 +10,8 @@ import (
 	"time"
 
 	"github.com/cloudflare/circl/sign/ed448"
-	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/hypergraph/application"
-	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
-	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
 
 type Operation struct {
@@ -25,13 +22,13 @@ type Operation struct {
 
 func TestConvergence(t *testing.T) {
 	numParties := 4
-	numOperations := 10000
+	numOperations := 100000
 	enc := crypto.NewMPCitHVerifiableEncryptor(1)
 	pub, _, _ := ed448.GenerateKey(crand.Reader)
 	data := enc.Encrypt(make([]byte, 20), pub)
 	verenc := data[0].Compress()
 	vertices := make([]application.Vertex, numOperations)
-	dataTree := &crypto.RawVectorCommitmentTree{}
+	dataTree := &crypto.VectorCommitmentTree{}
 	for _, d := range []application.Encrypted{verenc} {
 		dataBytes := d.ToBytes()
 		id := sha512.Sum512(dataBytes)
@@ -80,19 +77,9 @@ func TestConvergence(t *testing.T) {
 		}
 	}
 
-	inmem := store.NewInMemKVDB()
-	logger, _ := zap.NewProduction()
-	hgStore := store.NewPebbleHypergraphStore(inmem, logger)
-
 	crdts := make([]*application.Hypergraph, numParties)
 	for i := 0; i < numParties; i++ {
-		crdts[i] = application.NewHypergraph(func(shardKey application.ShardKey, phaseSet protobufs.HypergraphPhaseSet) crypto.VectorCommitmentTree {
-			return store.NewPersistentVectorTree(
-				hgStore,
-				shardKey,
-				phaseSet,
-			)
-		})
+		crdts[i] = application.NewHypergraph()
 	}
 
 	for i := 0; i < numParties; i++ {
