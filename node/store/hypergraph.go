@@ -230,12 +230,12 @@ func (p *PebbleHypergraphStore) LoadHypergraph() (
 		filepath.WalkDir(
 			hypergraphDir,
 			func(p string, d fs.DirEntry, err error) error {
-				if d.IsDir() {
-					return nil
-				}
-
 				if err != nil {
 					return err
+				}
+
+				if d.IsDir() {
+					return nil
 				}
 
 				fmt.Println(d.Name())
