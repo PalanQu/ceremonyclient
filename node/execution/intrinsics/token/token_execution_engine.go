@@ -157,7 +157,6 @@ func NewTokenExecutionEngine(
 				hypergraphStore,
 				shardKey,
 				phaseSet,
-				logger,
 			)
 		},
 	)
@@ -660,7 +659,6 @@ func (e *TokenExecutionEngine) rebuildHypergraph() {
 				e.hypergraphStore,
 				shardKey,
 				phaseSet,
-				e.logger,
 			)
 		},
 	)

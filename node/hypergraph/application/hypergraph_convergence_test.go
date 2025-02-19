@@ -91,7 +91,6 @@ func TestConvergence(t *testing.T) {
 				hgStore,
 				shardKey,
 				phaseSet,
-				logger,
 			)
 		})
 	}

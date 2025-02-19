@@ -3,7 +3,6 @@ package store
 import (
 	"bytes"
 	"encoding/gob"
-	"encoding/hex"
 	"fmt"
 	"math/big"
 
@@ -247,7 +246,7 @@ func (p *PebbleHypergraphStore) LoadHypergraph() (
 			shardKey application.ShardKey,
 			phaseSet protobufs.HypergraphPhaseSet,
 		) crypto.VectorCommitmentTree {
-			return NewPersistentVectorTree(p, shardKey, phaseSet, p.logger)
+			return NewPersistentVectorTree(p, shardKey, phaseSet)
 		},
 	)
 	vertexAddsIter, err := p.db.NewIter(
@@ -258,17 +257,12 @@ func (p *PebbleHypergraphStore) LoadHypergraph() (
 		return nil, errors.Wrap(err, "load hypergraph")
 	}
 	defer vertexAddsIter.Close()
-	p.logger.Debug("loading vertex add sets")
 	for vertexAddsIter.First(); vertexAddsIter.Valid(); vertexAddsIter.Next() {
 		shardKey := make([]byte, len(vertexAddsIter.Key()))
 		copy(shardKey, vertexAddsIter.Key())
 		node := &StoredBranchNode{}
 		var b bytes.Buffer
 		b.Write(vertexAddsIter.Value())
-		p.logger.Debug(
-			"loading vertex add set",
-			zap.String("set_shard_key", hex.EncodeToString(shardKey)),
-		)
 
 		dec := gob.NewDecoder(&b)
 		if err := dec.Decode(node); err != nil {
@@ -279,7 +273,6 @@ func (p *PebbleHypergraphStore) LoadHypergraph() (
 			p,
 			shardKeyFromKey(shardKey),
 			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
-			p.logger,
 		)
 
 		tree.tree.Root, err = tree.storedToBranch(node)
@@ -321,7 +314,6 @@ func (p *PebbleHypergraphStore) LoadHypergraph() (
 			p,
 			shardKeyFromKey(shardKey),
 			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_REMOVES,
-			p.logger,
 		)
 
 		tree.tree.Root, err = tree.storedToBranch(node)
@@ -363,7 +355,6 @@ func (p *PebbleHypergraphStore) LoadHypergraph() (
 			p,
 			shardKeyFromKey(shardKey),
 			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_ADDS,
-			p.logger,
 		)
 
 		tree.tree.Root, err = tree.storedToBranch(node)
@@ -405,7 +396,6 @@ func (p *PebbleHypergraphStore) LoadHypergraph() (
 			p,
 			shardKeyFromKey(shardKey),
 			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_HYPEREDGE_REMOVES,
-			p.logger,
 		)
 
 		tree.tree.Root, err = tree.storedToBranch(node)
@@ -582,7 +572,6 @@ type NodeID string
 
 type PersistentVectorTree struct {
 	store         HypergraphStore
-	logger        *zap.Logger
 	tree          *crypto.RawVectorCommitmentTree
 	shardKey      application.ShardKey
 	phaseSet      byte
@@ -597,7 +586,6 @@ func NewPersistentVectorTree(
 	store HypergraphStore,
 	shardKey application.ShardKey,
 	phaseSet protobufs.HypergraphPhaseSet,
-	logger *zap.Logger,
 ) *PersistentVectorTree {
 	phaseByte := byte(0x00)
 	switch phaseSet {
@@ -613,7 +601,6 @@ func NewPersistentVectorTree(
 
 	return &PersistentVectorTree{
 		store:         store,
-		logger:        logger,
 		tree:          &crypto.RawVectorCommitmentTree{},
 		shardKey:      shardKey,
 		phaseSet:      phaseByte,
@@ -704,16 +691,8 @@ func (t *PersistentVectorTree) storedToBranch(
 		var err error
 
 		if childID[2] == SET_TREE_BRANCH {
-			t.logger.Debug(
-				"load child branch node",
-				zap.String("child_id", hex.EncodeToString([]byte(childID))),
-			)
 			child, err = t.loadBranchNode(childID)
 		} else {
-			t.logger.Debug(
-				"load child leaf node",
-				zap.String("child_id", hex.EncodeToString([]byte(childID))),
-			)
 			child, err = t.loadLeafNode(childID)
 		}
 		if err != nil {
