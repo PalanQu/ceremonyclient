@@ -324,19 +324,19 @@ func syncTreeBidirectionallyServer(
 	pendingIn, pendingOut := UnboundedChan[[]int32]()
 	pendingIn <- rootPath
 
-	incoming := make(chan *protobufs.HypergraphComparison, 10000)
+	incomingIn, incomingOut := UnboundedChan[protobufs.HypergraphComparison]()
 	go func() {
 		for {
 			msg, err := stream.Recv()
 			if err == io.EOF {
-				close(incoming)
+				close(incomingIn)
 				return
 			}
 			if err != nil {
-				close(incoming)
+				close(incomingIn)
 				return
 			}
-			incoming <- msg
+			incomingIn <- *msg
 		}
 	}()
 
@@ -361,7 +361,7 @@ func syncTreeBidirectionallyServer(
 				return err
 			}
 
-		case msg, ok := <-incoming:
+		case msg, ok := <-incomingOut:
 			if !ok {
 				return nil
 			}
@@ -608,19 +608,19 @@ func SyncTreeBidirectionally(
 	pendingIn, pendingOut := UnboundedChan[[]int32]()
 	pendingIn <- []int32{}
 
-	incoming := make(chan *protobufs.HypergraphComparison, 10000)
+	incomingIn, incomingOut := UnboundedChan[protobufs.HypergraphComparison]()
 	go func() {
 		for {
 			msg, err := stream.Recv()
 			if err == io.EOF {
-				close(incoming)
+				close(incomingIn)
 				return
 			}
 			if err != nil {
-				close(incoming)
+				close(incomingIn)
 				return
 			}
-			incoming <- msg
+			incomingIn <- *msg
 		}
 	}()
 
@@ -642,7 +642,7 @@ func SyncTreeBidirectionally(
 			if err := stream.Send(queryMsg); err != nil {
 				return err
 			}
-		case msg, ok := <-incoming:
+		case msg, ok := <-incomingOut:
 			if !ok {
 				return nil
 			}
