@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/gob"
 	"encoding/hex"
-	"fmt"
 	"io/fs"
 	"os"
 	"path"
@@ -237,8 +236,6 @@ func (p *PebbleHypergraphStore) LoadHypergraph() (
 				if d.IsDir() {
 					return nil
 				}
-
-				fmt.Println(d.Name())
 
 				shardSet, err := hex.DecodeString(d.Name())
 				if err != nil {

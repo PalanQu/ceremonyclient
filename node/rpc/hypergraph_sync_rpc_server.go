@@ -377,7 +377,7 @@ outer:
 				},
 			}
 			if err := stream.Send(queryMsg); err != nil {
-				return err
+				break outer
 			}
 
 		case msg, ok := <-incomingOut:
@@ -797,7 +797,7 @@ outer:
 						queryPath,
 						metadataOnly,
 					); err != nil {
-						return err
+						break outer
 					}
 				} else {
 					logger.Info(

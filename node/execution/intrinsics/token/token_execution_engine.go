@@ -635,6 +635,10 @@ func (e *TokenExecutionEngine) hyperSync() {
 		"hypergraph root commit",
 		zap.String("root", hex.EncodeToString(roots[0])),
 	)
+
+	if err = e.hypergraphStore.SaveHypergraph(e.hypergraph); err != nil {
+		e.logger.Error("error while saving", zap.Error(err))
+	}
 }
 
 func (e *TokenExecutionEngine) rebuildHypergraph() {
