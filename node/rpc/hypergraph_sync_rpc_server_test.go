@@ -220,7 +220,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 	grpcServer := grpc.NewServer()
 	protobufs.RegisterHypergraphComparisonServiceServer(
 		grpcServer,
-		rpc.NewHypergraphComparisonServer(logger, serverHypergraphStore, crdts[0]),
+		rpc.NewHypergraphComparisonServer(logger, serverHypergraphStore, crdts[0], rpc.NewSyncController()),
 	)
 	log.Println("Server listening on :50051")
 	go func() {
@@ -238,7 +238,9 @@ func TestHypergraphSyncServer(t *testing.T) {
 		log.Fatalf("Client: failed to stream: %v", err)
 	}
 
-	err = rpc.SyncTreeBidirectionally(str, logger, append(append([]byte{}, shardKey.L1[:]...), shardKey.L2[:]...), protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, clientHypergraphStore, crdts[1].GetVertexAdds()[shardKey].GetTree(), false)
+	syncController := rpc.NewSyncController()
+
+	err = rpc.SyncTreeBidirectionally(str, logger, append(append([]byte{}, shardKey.L1[:]...), shardKey.L2[:]...), protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, clientHypergraphStore, crdts[1].GetVertexAdds()[shardKey].GetTree(), syncController, false)
 	if err != nil {
 		log.Fatalf("Client: failed to sync 1: %v", err)
 	}
@@ -257,7 +259,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 		log.Fatalf("Client: failed to stream: %v", err)
 	}
 
-	err = rpc.SyncTreeBidirectionally(str, logger, append(append([]byte{}, shardKey.L1[:]...), shardKey.L2[:]...), protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, clientHypergraphStore, crdts[1].GetVertexAdds()[shardKey].GetTree(), false)
+	err = rpc.SyncTreeBidirectionally(str, logger, append(append([]byte{}, shardKey.L1[:]...), shardKey.L2[:]...), protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, clientHypergraphStore, crdts[1].GetVertexAdds()[shardKey].GetTree(), syncController, false)
 	if err != nil {
 		log.Fatalf("Client: failed to sync 2: %v", err)
 	}

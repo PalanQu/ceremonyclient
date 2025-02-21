@@ -113,6 +113,7 @@ type TokenExecutionEngine struct {
 	peerSeniority         *PeerSeniority
 	hypergraph            *hypergraph.Hypergraph
 	mpcithVerEnc          *qcrypto.MPCitHVerifiableEncryptor
+	syncController        *rpc.SyncController
 	grpcServers           []*grpc.Server
 }
 
@@ -252,6 +253,7 @@ func NewTokenExecutionEngine(
 		intrinsicFilter:       intrinsicFilter,
 		peerSeniority:         NewFromMap(peerSeniority),
 		mpcithVerEnc:          mpcithVerEnc,
+		syncController:        rpc.NewSyncController(),
 	}
 
 	alwaysSend := false
@@ -393,6 +395,7 @@ func NewTokenExecutionEngine(
 		e.logger,
 		e.hypergraphStore,
 		e.hypergraph,
+		e.syncController,
 	)
 	protobufs.RegisterHypergraphComparisonServiceServer(syncServer, hyperSync)
 	go func() {
@@ -622,6 +625,7 @@ func (e *TokenExecutionEngine) hyperSync() {
 			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
 			e.hypergraphStore,
 			set.GetTree(),
+			e.syncController,
 			false,
 		)
 		if err != nil {

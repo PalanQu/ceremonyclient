@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"sync/atomic"
 	"time"
 
 	"github.com/pkg/errors"
@@ -17,6 +18,24 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
 
+type SyncController struct {
+	isSyncing atomic.Bool
+}
+
+func (s *SyncController) TryEstablishSyncSession() bool {
+	return !s.isSyncing.Swap(true)
+}
+
+func (s *SyncController) EndSyncSession() {
+	s.isSyncing.Store(false)
+}
+
+func NewSyncController() *SyncController {
+	return &SyncController{
+		isSyncing: atomic.Bool{},
+	}
+}
+
 // hypergraphComparisonServer implements the bidirectional sync service.
 type hypergraphComparisonServer struct {
 	protobufs.UnimplementedHypergraphComparisonServiceServer
@@ -24,17 +43,20 @@ type hypergraphComparisonServer struct {
 	logger               *zap.Logger
 	localHypergraphStore store.HypergraphStore
 	localHypergraph      *hypergraph.Hypergraph
+	syncController       *SyncController
 }
 
 func NewHypergraphComparisonServer(
 	logger *zap.Logger,
 	hypergraphStore store.HypergraphStore,
 	hypergraph *hypergraph.Hypergraph,
+	syncController *SyncController,
 ) *hypergraphComparisonServer {
 	return &hypergraphComparisonServer{
 		logger:               logger,
 		localHypergraphStore: hypergraphStore,
 		localHypergraph:      hypergraph,
+		syncController:       syncController,
 	}
 }
 
@@ -583,6 +605,11 @@ outer:
 func (s *hypergraphComparisonServer) HyperStream(
 	stream protobufs.HypergraphComparisonService_HyperStreamServer,
 ) error {
+	if !s.syncController.TryEstablishSyncSession() {
+		return errors.New("unavailable")
+	}
+	defer s.syncController.EndSyncSession()
+
 	return syncTreeBidirectionallyServer(
 		stream,
 		s.logger,
@@ -603,8 +630,14 @@ func SyncTreeBidirectionally(
 	phaseSet protobufs.HypergraphPhaseSet,
 	hypergraphStore store.HypergraphStore,
 	localTree *crypto.VectorCommitmentTree,
+	syncController *SyncController,
 	metadataOnly bool,
 ) error {
+	if !syncController.TryEstablishSyncSession() {
+		return errors.New("unavailable")
+	}
+	defer syncController.EndSyncSession()
+
 	logger.Info(
 		"sending initialization message",
 		zap.String("shard_key", hex.EncodeToString(shardKey)),
