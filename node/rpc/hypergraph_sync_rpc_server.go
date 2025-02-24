@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"math/big"
 	"sync/atomic"
 	"time"
 
@@ -44,6 +43,7 @@ type hypergraphComparisonServer struct {
 	localHypergraphStore store.HypergraphStore
 	localHypergraph      *hypergraph.Hypergraph
 	syncController       *SyncController
+	debugTotalCoins      int
 }
 
 func NewHypergraphComparisonServer(
@@ -51,12 +51,14 @@ func NewHypergraphComparisonServer(
 	hypergraphStore store.HypergraphStore,
 	hypergraph *hypergraph.Hypergraph,
 	syncController *SyncController,
+	debugTotalCoins int,
 ) *hypergraphComparisonServer {
 	return &hypergraphComparisonServer{
 		logger:               logger,
 		localHypergraphStore: hypergraphStore,
 		localHypergraph:      hypergraph,
 		syncController:       syncController,
+		debugTotalCoins:      debugTotalCoins,
 	}
 }
 
@@ -202,6 +204,7 @@ func getBranchInfoFromTree(tree *crypto.VectorCommitmentTree, path []int32) (
 	branchInfo := &protobufs.HypergraphComparisonResponse{
 		Path:       path,
 		Commitment: commitment,
+		IsRoot:     len(path) == 0,
 	}
 
 	if branch, ok := node.(*crypto.VectorCommitmentBranchNode); ok {
@@ -299,6 +302,7 @@ func syncTreeBidirectionallyServer(
 	localHypergraphStore store.HypergraphStore,
 	localHypergraph *hypergraph.Hypergraph,
 	metadataOnly bool,
+	debugTotalCoins int,
 ) error {
 	msg, err := stream.Recv()
 	if err != nil {
@@ -340,27 +344,14 @@ func syncTreeBidirectionallyServer(
 		return errors.New("server does not have phase set")
 	}
 
-	// Send our root branch info.
-	rootPath := []int32{}
-	rootInfo, err := getBranchInfoFromTree(idSet.GetTree(), rootPath)
-	if err != nil {
-		return err
-	}
-	if err := stream.Send(&protobufs.HypergraphComparison{
-		Payload: &protobufs.HypergraphComparison_Response{
-			Response: rootInfo,
-		},
-	}); err != nil {
-		return err
-	}
-
 	requested := map[string]struct{}{}
 	sent := map[string]struct{}{}
-	inserts := []*protobufs.LeafData{}
 	pendingIn, pendingOut := UnboundedChan[[]int32]("server pending")
-	pendingIn <- rootPath
+	pendingIn <- []int32{}
 
-	incomingIn, incomingOut := UnboundedChan[protobufs.HypergraphComparison]("server incoming")
+	incomingIn, incomingOut := UnboundedChan[protobufs.HypergraphComparison](
+		"server incoming",
+	)
 	go func() {
 		for {
 			msg, err := stream.Recv()
@@ -379,6 +370,9 @@ func syncTreeBidirectionallyServer(
 			incomingIn <- *msg
 		}
 	}()
+
+	knownRemoteCommitment := []byte{}
+	previousKnownRemoteCommitment := []byte{}
 
 outer:
 	for {
@@ -418,6 +412,12 @@ outer:
 					idSet.GetTree(),
 					remoteInfo.Path,
 				)
+
+				if remoteInfo.IsRoot {
+					previousKnownRemoteCommitment = knownRemoteCommitment
+					knownRemoteCommitment = remoteInfo.Commitment
+				}
+
 				if err != nil {
 					logger.Info(
 						"server requesting missing node",
@@ -586,18 +586,25 @@ outer:
 					}
 				}
 
-				inserts = append(inserts, remoteUpdate)
+				idSet.Add(hypergraph.AtomFromBytes(remoteUpdate.Value))
 			}
 		case <-time.After(5 * time.Second):
-			logger.Info("server timed out")
-			break outer
+			commitment := idSet.GetTree().Commit(false)
+			if !bytes.Equal(commitment, knownRemoteCommitment) &&
+				!bytes.Equal(knownRemoteCommitment, previousKnownRemoteCommitment) &&
+				!bytes.Equal(knownRemoteCommitment, []byte{}) {
+				time.Sleep(1 * time.Second)
+				requested = map[string]struct{}{}
+				sent = map[string]struct{}{}
+				pendingIn <- []int32{}
+			} else {
+				break outer
+			}
 		}
 	}
 
-	for _, remoteUpdate := range inserts {
-		idSet.Add(hypergraph.AtomFromBytes(remoteUpdate.Value))
-	}
-
+	total, _ := idSet.GetTree().GetMetadata()
+	logger.Info("current progress", zap.Float32("percentage", float32(total*100)/float32(debugTotalCoins)))
 	return nil
 }
 
@@ -616,6 +623,7 @@ func (s *hypergraphComparisonServer) HyperStream(
 		s.localHypergraphStore,
 		s.localHypergraph,
 		false,
+		s.debugTotalCoins,
 	)
 }
 
@@ -629,15 +637,11 @@ func SyncTreeBidirectionally(
 	shardKey []byte,
 	phaseSet protobufs.HypergraphPhaseSet,
 	hypergraphStore store.HypergraphStore,
-	localTree *crypto.VectorCommitmentTree,
+	set *hypergraph.IdSet,
 	syncController *SyncController,
+	debugTotalCoins int,
 	metadataOnly bool,
 ) error {
-	if !syncController.TryEstablishSyncSession() {
-		return errors.New("unavailable")
-	}
-	defer syncController.EndSyncSession()
-
 	logger.Info(
 		"sending initialization message",
 		zap.String("shard_key", hex.EncodeToString(shardKey)),
@@ -649,7 +653,7 @@ func SyncTreeBidirectionally(
 				ShardKey:        shardKey,
 				PhaseSet:        phaseSet,
 				Path:            []int32{},
-				Commitment:      localTree.Commit(false),
+				Commitment:      set.GetTree().Commit(false),
 				IncludeLeafData: false,
 			},
 		},
@@ -657,26 +661,14 @@ func SyncTreeBidirectionally(
 		return err
 	}
 
-	rootPath := []int32{}
-	rootInfo, err := getBranchInfoFromTree(localTree, rootPath)
-	if err != nil {
-		return err
-	}
-	if err := stream.Send(&protobufs.HypergraphComparison{
-		Payload: &protobufs.HypergraphComparison_Response{
-			Response: rootInfo,
-		},
-	}); err != nil {
-		return err
-	}
-
 	requested := map[string]struct{}{}
 	sent := map[string]struct{}{}
-	inserts := []*protobufs.LeafData{}
 	pendingIn, pendingOut := UnboundedChan[[]int32]("client pending")
 	pendingIn <- []int32{}
 
-	incomingIn, incomingOut := UnboundedChan[protobufs.HypergraphComparison]("client incoming")
+	incomingIn, incomingOut := UnboundedChan[protobufs.HypergraphComparison](
+		"client incoming",
+	)
 	go func() {
 		for {
 			msg, err := stream.Recv()
@@ -694,6 +686,9 @@ func SyncTreeBidirectionally(
 			incomingIn <- *msg
 		}
 	}()
+
+	knownRemoteCommitment := []byte{}
+	previousKnownRemoteCommitment := []byte{}
 
 outer:
 	for {
@@ -725,7 +720,13 @@ outer:
 					"handling response",
 					zap.String("path", hex.EncodeToString(packNibbles(remoteInfo.Path))),
 				)
-				localInfo, err := getBranchInfoFromTree(localTree, remoteInfo.Path)
+
+				if remoteInfo.IsRoot {
+					previousKnownRemoteCommitment = knownRemoteCommitment
+					knownRemoteCommitment = remoteInfo.Commitment
+				}
+
+				localInfo, err := getBranchInfoFromTree(set.GetTree(), remoteInfo.Path)
 				if err != nil {
 					logger.Info(
 						"requesting missing node",
@@ -771,7 +772,7 @@ outer:
 							stream,
 							hypergraphStore,
 							sent,
-							localTree,
+							set.GetTree(),
 							remoteInfo.Path,
 							metadataOnly,
 						); err != nil {
@@ -826,7 +827,7 @@ outer:
 						stream,
 						hypergraphStore,
 						sent,
-						localTree,
+						set.GetTree(),
 						queryPath,
 						metadataOnly,
 					); err != nil {
@@ -840,7 +841,7 @@ outer:
 							hex.EncodeToString(packNibbles(queryPath)),
 						),
 					)
-					branchInfo, err := getBranchInfoFromTree(localTree, queryPath)
+					branchInfo, err := getBranchInfoFromTree(set.GetTree(), queryPath)
 					if err != nil {
 						continue
 					}
@@ -888,25 +889,25 @@ outer:
 					}
 				}
 
-				inserts = append(inserts, remoteUpdate)
+				set.Add(hypergraph.AtomFromBytes(remoteUpdate.Value))
 			}
 		case <-time.After(5 * time.Second):
-			logger.Info("timed out")
-			break outer
+			commitment := set.GetTree().Commit(false)
+			if !bytes.Equal(commitment, knownRemoteCommitment) &&
+				!bytes.Equal(knownRemoteCommitment, previousKnownRemoteCommitment) &&
+				!bytes.Equal(knownRemoteCommitment, []byte{}) {
+				time.Sleep(1 * time.Second)
+				requested = map[string]struct{}{}
+				sent = map[string]struct{}{}
+				pendingIn <- []int32{}
+			} else {
+				break outer
+			}
 		}
 	}
 
-	for _, remoteUpdate := range inserts {
-		size := new(big.Int).SetBytes(remoteUpdate.Size)
-
-		localTree.Insert(
-			remoteUpdate.Key,
-			remoteUpdate.Value,
-			remoteUpdate.HashTarget,
-			size,
-		)
-	}
-
+	total, _ := set.GetTree().GetMetadata()
+	logger.Info("current progress", zap.Float32("percentage", float32(total*100)/float32(debugTotalCoins)))
 	return nil
 }
 

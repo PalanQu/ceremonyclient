@@ -369,9 +369,44 @@ func NewTokenExecutionEngine(
 	e.proverPublicKey = publicKeyBytes
 	e.provingKeyAddress = provingKeyAddress
 
+	// debug carveout for M5 testing
+	iter, err := e.coinStore.RangeCoins(
+		[]byte{0x00},
+		[]byte{0xff},
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	totalCoins := 0
+	specificRange := 0
+	if e.engineConfig.RebuildStart == "" {
+		e.engineConfig.RebuildStart = "0000000000000000000000000000000000000000000000000000000000000000"
+	}
+	if e.engineConfig.RebuildEnd == "" {
+		e.engineConfig.RebuildEnd = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	}
+	start, err := hex.DecodeString(e.engineConfig.RebuildStart)
+	if err != nil {
+		panic(err)
+	}
+	end, err := hex.DecodeString(e.engineConfig.RebuildEnd)
+	if err != nil {
+		panic(err)
+	}
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		if bytes.Compare(iter.Key()[2:], start) >= 0 && bytes.Compare(iter.Key()[2:], end) < 0 {
+			specificRange++
+		}
+		totalCoins++
+	}
+	iter.Close()
+	// end debug carveout for M5 testing
+
 	_, _, err = e.clockStore.GetLatestDataClockFrame(e.intrinsicFilter)
 	if err != nil {
-		e.rebuildHypergraph()
+		e.rebuildHypergraph(specificRange)
 	} else {
 		e.hypergraph, err = e.hypergraphStore.LoadHypergraph()
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
@@ -382,7 +417,7 @@ func NewTokenExecutionEngine(
 		}
 
 		if e.hypergraph == nil || len(e.hypergraph.GetVertexAdds()) == 0 {
-			e.rebuildHypergraph()
+			e.rebuildHypergraph(specificRange)
 		}
 	}
 
@@ -396,6 +431,7 @@ func NewTokenExecutionEngine(
 		e.hypergraphStore,
 		e.hypergraph,
 		e.syncController,
+		totalCoins,
 	)
 	protobufs.RegisterHypergraphComparisonServiceServer(syncServer, hyperSync)
 	go func() {
@@ -412,7 +448,7 @@ func NewTokenExecutionEngine(
 		for {
 			select {
 			case <-gotime.After(5 * gotime.Second):
-				e.hyperSync()
+				e.hyperSync(totalCoins)
 			case <-e.ctx.Done():
 				return
 			}
@@ -578,7 +614,12 @@ func (e *TokenExecutionEngine) addBatchToHypergraph(batchKey [][]byte, batchValu
 	}
 }
 
-func (e *TokenExecutionEngine) hyperSync() {
+func (e *TokenExecutionEngine) hyperSync(totalCoins int) {
+	if !e.syncController.TryEstablishSyncSession() {
+		return
+	}
+	defer e.syncController.EndSyncSession()
+
 	peerId, err := e.pubSub.GetRandomPeer(
 		append([]byte{0x00}, e.intrinsicFilter...),
 	)
@@ -624,8 +665,9 @@ func (e *TokenExecutionEngine) hyperSync() {
 			append(append([]byte{}, key.L1[:]...), key.L2[:]...),
 			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
 			e.hypergraphStore,
-			set.GetTree(),
+			set,
 			e.syncController,
+			totalCoins,
 			false,
 		)
 		if err != nil {
@@ -645,7 +687,7 @@ func (e *TokenExecutionEngine) hyperSync() {
 	}
 }
 
-func (e *TokenExecutionEngine) rebuildHypergraph() {
+func (e *TokenExecutionEngine) rebuildHypergraph(totalRange int) {
 	e.logger.Info("rebuilding hypergraph")
 	e.hypergraph = hypergraph.NewHypergraph()
 	if e.engineConfig.RebuildStart == "" {
@@ -670,7 +712,9 @@ func (e *TokenExecutionEngine) rebuildHypergraph() {
 		panic(err)
 	}
 	var batchKey, batchValue [][]byte
+	processed := 0
 	for iter.First(); iter.Valid(); iter.Next() {
+		processed++
 		key := make([]byte, len(iter.Key()[2:]))
 		copy(key, iter.Key()[2:])
 		batchKey = append(batchKey, key)
@@ -694,6 +738,10 @@ func (e *TokenExecutionEngine) rebuildHypergraph() {
 
 		if len(batchKey) == runtime.NumCPU() {
 			e.addBatchToHypergraph(batchKey, batchValue)
+			e.logger.Info(
+				"processed batch",
+				zap.Float32("percentage", float32(processed)/float32(totalRange)),
+			)
 			batchKey = [][]byte{}
 			batchValue = [][]byte{}
 		}

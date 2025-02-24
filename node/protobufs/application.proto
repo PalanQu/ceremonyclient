@@ -82,6 +82,8 @@ message HypergraphComparisonResponse {
   // (For instance, if the node is a branch you may want to send the commitment
   // for each child.)
   repeated BranchChild children = 3;
+  // If set, indicates the response is for the root of the given set tree.
+  bool is_root = 4;
 }
 
 // Defines the child commitment.
