@@ -444,7 +444,9 @@ func NewTokenExecutionEngine(
 		}
 	}()
 
+	e.wg.Add(1)
 	go func() {
+		defer e.wg.Done()
 		for {
 			select {
 			case <-gotime.After(5 * gotime.Second):
@@ -818,6 +820,15 @@ func (e *TokenExecutionEngine) Start() <-chan error {
 
 // Stop implements ExecutionEngine
 func (e *TokenExecutionEngine) Stop(force bool) <-chan error {
+	wg := sync.WaitGroup{}
+	wg.Add(len(e.grpcServers))
+	for _, server := range e.grpcServers {
+		go func(server *grpc.Server) {
+			defer wg.Done()
+			server.GracefulStop()
+		}(server)
+	}
+	wg.Wait()
 	e.cancel()
 	e.wg.Wait()
 
