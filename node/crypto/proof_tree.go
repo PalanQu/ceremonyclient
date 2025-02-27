@@ -245,10 +245,10 @@ func (t *VectorCommitmentTree) Insert(
 	if len(key) == 0 {
 		return errors.New("empty key not allowed")
 	}
-	var insert func(node VectorCommitmentNode, depth int) VectorCommitmentNode
-	insert = func(node VectorCommitmentNode, depth int) VectorCommitmentNode {
+	var insert func(node VectorCommitmentNode, depth int) (int, VectorCommitmentNode)
+	insert = func(node VectorCommitmentNode, depth int) (int, VectorCommitmentNode) {
 		if node == nil {
-			return &VectorCommitmentLeafNode{
+			return 1, &VectorCommitmentLeafNode{
 				Key:        key,
 				Value:      value,
 				HashTarget: hashTarget,
@@ -263,7 +263,7 @@ func (t *VectorCommitmentTree) Insert(
 				n.HashTarget = hashTarget
 				n.Commitment = nil
 				n.Size = size
-				return n
+				return 0, n
 			}
 
 			// Get common prefix nibbles and divergence point
@@ -288,7 +288,7 @@ func (t *VectorCommitmentTree) Insert(
 				Size:       size,
 			}
 
-			return branch
+			return 1, branch
 
 		case *VectorCommitmentBranchNode:
 			if len(n.Prefix) > 0 {
@@ -312,19 +312,19 @@ func (t *VectorCommitmentTree) Insert(
 							HashTarget: hashTarget,
 							Size:       size,
 						}
-						return newBranch
+						return 1, newBranch
 					}
 				}
 
 				// Key matches prefix, continue with final nibble
 				finalNibble := getNextNibble(key, depth+len(n.Prefix)*BranchBits)
-				inserted := insert(
+				delta, inserted := insert(
 					n.Children[finalNibble],
 					depth+len(n.Prefix)*BranchBits+BranchBits,
 				)
 				n.Children[finalNibble] = inserted
 				n.Commitment = nil
-				n.LeafCount += 1
+				n.LeafCount += delta
 				switch i := inserted.(type) {
 				case *VectorCommitmentBranchNode:
 					if n.LongestBranch <= i.LongestBranch {
@@ -333,15 +333,17 @@ func (t *VectorCommitmentTree) Insert(
 				case *VectorCommitmentLeafNode:
 					n.LongestBranch = 1
 				}
-				n.Size = n.Size.Add(n.Size, size)
-				return n
+				if delta != 0 {
+					n.Size = n.Size.Add(n.Size, size)
+				}
+				return delta, n
 			} else {
 				// Simple branch without prefix
 				nibble := getNextNibble(key, depth)
-				inserted := insert(n.Children[nibble], depth+BranchBits)
+				delta, inserted := insert(n.Children[nibble], depth+BranchBits)
 				n.Children[nibble] = inserted
 				n.Commitment = nil
-				n.LeafCount += 1
+				n.LeafCount += delta
 				switch i := inserted.(type) {
 				case *VectorCommitmentBranchNode:
 					if n.LongestBranch <= i.LongestBranch {
@@ -350,15 +352,17 @@ func (t *VectorCommitmentTree) Insert(
 				case *VectorCommitmentLeafNode:
 					n.LongestBranch = 1
 				}
-				n.Size = n.Size.Add(n.Size, size)
-				return n
+				if delta != 0 {
+					n.Size = n.Size.Add(n.Size, size)
+				}
+				return delta, n
 			}
 		}
 
-		return nil
+		return 0, nil
 	}
 
-	t.Root = insert(t.Root, 0)
+	_, t.Root = insert(t.Root, 0)
 	return nil
 }
 

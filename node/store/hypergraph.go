@@ -297,12 +297,24 @@ func (p *PebbleHypergraphStore) SaveHypergraph(
 			err := os.WriteFile(
 				path.Join(
 					hypergraphDir,
-					hex.EncodeToString(hypergraphVertexAddsKey(shardKey)),
+					hex.EncodeToString(hypergraphVertexAddsKey(shardKey))+".tmp",
 				),
 				vertexAdds.ToBytes(),
 				os.FileMode(0644),
 			)
 			if err != nil {
+				return errors.Wrap(err, "save hypergraph")
+			}
+			if err = os.Rename(
+				path.Join(
+					hypergraphDir,
+					hex.EncodeToString(hypergraphVertexAddsKey(shardKey))+".tmp",
+				),
+				path.Join(
+					hypergraphDir,
+					hex.EncodeToString(hypergraphVertexAddsKey(shardKey)),
+				),
+			); err != nil {
 				return errors.Wrap(err, "save hypergraph")
 			}
 		}
@@ -313,12 +325,24 @@ func (p *PebbleHypergraphStore) SaveHypergraph(
 			err := os.WriteFile(
 				path.Join(
 					hypergraphDir,
-					hex.EncodeToString(hypergraphVertexRemovesKey(shardKey)),
+					hex.EncodeToString(hypergraphVertexRemovesKey(shardKey))+".tmp",
 				),
 				vertexRemoves.ToBytes(),
 				os.FileMode(0644),
 			)
 			if err != nil {
+				return errors.Wrap(err, "save hypergraph")
+			}
+			if err = os.Rename(
+				path.Join(
+					hypergraphDir,
+					hex.EncodeToString(hypergraphVertexRemovesKey(shardKey))+".tmp",
+				),
+				path.Join(
+					hypergraphDir,
+					hex.EncodeToString(hypergraphVertexRemovesKey(shardKey)),
+				),
+			); err != nil {
 				return errors.Wrap(err, "save hypergraph")
 			}
 		}
@@ -329,12 +353,24 @@ func (p *PebbleHypergraphStore) SaveHypergraph(
 			err := os.WriteFile(
 				path.Join(
 					hypergraphDir,
-					hex.EncodeToString(hypergraphHyperedgeAddsKey(shardKey)),
+					hex.EncodeToString(hypergraphHyperedgeAddsKey(shardKey))+".tmp",
 				),
 				hyperedgeAdds.ToBytes(),
 				os.FileMode(0644),
 			)
 			if err != nil {
+				return errors.Wrap(err, "save hypergraph")
+			}
+			if err = os.Rename(
+				path.Join(
+					hypergraphDir,
+					hex.EncodeToString(hypergraphHyperedgeAddsKey(shardKey))+".tmp",
+				),
+				path.Join(
+					hypergraphDir,
+					hex.EncodeToString(hypergraphHyperedgeAddsKey(shardKey)),
+				),
+			); err != nil {
 				return errors.Wrap(err, "save hypergraph")
 			}
 		}
@@ -345,12 +381,24 @@ func (p *PebbleHypergraphStore) SaveHypergraph(
 			err := os.WriteFile(
 				path.Join(
 					hypergraphDir,
-					hex.EncodeToString(hypergraphHyperedgeRemovesKey(shardKey)),
+					hex.EncodeToString(hypergraphHyperedgeRemovesKey(shardKey))+".tmp",
 				),
 				hyperedgeRemoves.ToBytes(),
 				os.FileMode(0644),
 			)
 			if err != nil {
+				return errors.Wrap(err, "save hypergraph")
+			}
+			if err = os.Rename(
+				path.Join(
+					hypergraphDir,
+					hex.EncodeToString(hypergraphHyperedgeRemovesKey(shardKey))+".tmp",
+				),
+				path.Join(
+					hypergraphDir,
+					hex.EncodeToString(hypergraphHyperedgeRemovesKey(shardKey)),
+				),
+			); err != nil {
 				return errors.Wrap(err, "save hypergraph")
 			}
 		}

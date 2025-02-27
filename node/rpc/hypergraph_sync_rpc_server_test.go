@@ -49,7 +49,6 @@ func TestHypergraphSyncServer(t *testing.T) {
 	for i := 0; i < numOperations; i++ {
 		b := make([]byte, 32)
 		rand.Read(b)
-
 		vertices[i] = application.NewVertex(
 			[32]byte{},
 			[32]byte(b),
@@ -109,7 +108,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 	}
 
 	txn, _ := serverHypergraphStore.NewTransaction(false)
-	for _, op := range operations1[:5000] {
+	for _, op := range operations1[:250] {
 		switch op.Type {
 		case "AddVertex":
 			id := op.Vertex.GetID()
@@ -138,7 +137,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 	}
 
 	txn, _ = clientHypergraphStore.NewTransaction(false)
-	for _, op := range operations1[5000:] {
+	for _, op := range operations1[250:] {
 		switch op.Type {
 		case "AddVertex":
 			id := op.Vertex.GetID()

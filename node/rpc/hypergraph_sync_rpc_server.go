@@ -2,10 +2,13 @@ package rpc
 
 import (
 	"bytes"
+	"context"
 	"encoding/gob"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -65,19 +68,13 @@ func NewHypergraphComparisonServer(
 // sendLeafData builds a LeafData message (with the full leaf data) for the
 // node at the given path in the local tree and sends it over the stream.
 func sendLeafData(
-	stream protobufs.HypergraphComparisonService_HyperStreamClient,
+	stream HyperStream,
 	hypergraphStore store.HypergraphStore,
-	sent map[string]struct{},
 	localTree *crypto.VectorCommitmentTree,
 	path []int32,
 	metadataOnly bool,
 ) error {
 	send := func(leaf *crypto.VectorCommitmentLeafNode) error {
-		if _, ok := sent[string(leaf.Key)]; ok {
-			return nil
-		}
-		sent[string(leaf.Key)] = struct{}{}
-
 		update := &protobufs.LeafData{
 			Key:        leaf.Key,
 			Value:      leaf.Value,
@@ -121,19 +118,6 @@ func sendLeafData(
 	}
 
 	return send(leaf)
-}
-
-// equalBytes compares two byte slices for equality.
-func equalBytes(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // getNodeAtPath traverses the tree along the provided nibble path. It returns
@@ -233,64 +217,409 @@ func isLeaf(info *protobufs.HypergraphComparisonResponse) bool {
 	return len(info.Children) == 0
 }
 
-// sendLeafDataServer builds a LeafData message from the local tree (for the
-// node at the given path) and sends it over the server-side stream.
-func sendLeafDataServer(
-	stream protobufs.HypergraphComparisonService_HyperStreamServer,
-	hypergraphStore store.HypergraphStore,
-	sent map[string]struct{},
-	localTree *crypto.VectorCommitmentTree,
+func queryNext(
+	ctx context.Context,
+	incomingResponses <-chan *protobufs.HypergraphComparisonResponse,
+	stream HyperStream,
 	path []int32,
-	metadataOnly bool,
-) error {
-	send := func(leaf *crypto.VectorCommitmentLeafNode) error {
-		if _, ok := sent[string(leaf.Key)]; ok {
-			return nil
-		}
-		sent[string(leaf.Key)] = struct{}{}
-		update := &protobufs.LeafData{
-			Key:        leaf.Key,
-			Value:      leaf.Value,
-			HashTarget: leaf.HashTarget,
-			Size:       leaf.Size.FillBytes(make([]byte, 32)),
-		}
-		if !metadataOnly {
-			tree, err := hypergraphStore.LoadVertexTree(leaf.Key)
-			if err == nil {
-				var buf bytes.Buffer
-				enc := gob.NewEncoder(&buf)
-				if err := enc.Encode(tree); err != nil {
-					return errors.Wrap(err, "send leaf data")
-				}
-				update.UnderlyingData = buf.Bytes()
-			}
-		}
-		msg := &protobufs.HypergraphComparison{
-			Payload: &protobufs.HypergraphComparison_LeafData{
-				LeafData: update,
+) (
+	*protobufs.HypergraphComparisonResponse,
+	error,
+) {
+	if err := stream.Send(&protobufs.HypergraphComparison{
+		Payload: &protobufs.HypergraphComparison_Query{
+			Query: &protobufs.HypergraphComparisonQuery{
+				Path:            path,
+				IncludeLeafData: false,
 			},
-		}
-		return stream.Send(msg)
+		},
+	}); err != nil {
+		return nil, err
 	}
 
-	node := getNodeAtPath(localTree.Root, path, 0)
-	leaf, ok := node.(*crypto.VectorCommitmentLeafNode)
-	if !ok {
-		children := crypto.GetAllLeaves(node)
-		for _, child := range children {
-			if child == nil {
-				continue
-			}
+	select {
+	case <-ctx.Done():
+		return nil, errors.Wrap(
+			errors.New("context canceled"),
+			"handle query",
+		)
+	case resp, ok := <-incomingResponses:
+		if !ok {
+			return nil, errors.Wrap(
+				errors.New("channel closed"),
+				"handle query",
+			)
+		}
+		return resp, nil
+	case <-time.After(5 * time.Second):
+		return nil, errors.Wrap(
+			errors.New("timed out"),
+			"handle query",
+		)
+	}
+}
 
-			if err := send(child); err != nil {
-				return err
-			}
+func handleQueryNext(
+	ctx context.Context,
+	incomingQueries <-chan *protobufs.HypergraphComparisonQuery,
+	stream HyperStream,
+	localTree *crypto.VectorCommitmentTree,
+	path []int32,
+) (
+	*protobufs.HypergraphComparisonResponse,
+	error,
+) {
+	select {
+	case <-ctx.Done():
+		return nil, errors.Wrap(
+			errors.New("context canceled"),
+			"handle query next",
+		)
+	case query, ok := <-incomingQueries:
+		if !ok {
+			return nil, errors.Wrap(
+				errors.New("channel closed"),
+				"handle query next",
+			)
 		}
 
+		if slices.Compare(query.Path, path) != 0 {
+			return nil, errors.Wrap(
+				errors.New("invalid query received"),
+				"handle query next",
+			)
+		}
+
+		branchInfo, err := getBranchInfoFromTree(localTree, path)
+		if err != nil {
+			return nil, errors.Wrap(err, "handle query next")
+		}
+
+		resp := &protobufs.HypergraphComparison{
+			Payload: &protobufs.HypergraphComparison_Response{
+				Response: branchInfo,
+			},
+		}
+
+		if err := stream.Send(resp); err != nil {
+			return nil, errors.Wrap(err, "handle query next")
+		}
+
+		return branchInfo, nil
+	case <-time.After(5 * time.Second):
+		return nil, errors.Wrap(
+			errors.New("timed out"),
+			"handle query next",
+		)
+	}
+}
+
+func descendIndex(
+	ctx context.Context,
+	incomingResponses <-chan *protobufs.HypergraphComparisonResponse,
+	stream HyperStream,
+	localTree *crypto.VectorCommitmentTree,
+	path []int32,
+) (
+	*protobufs.HypergraphComparisonResponse,
+	*protobufs.HypergraphComparisonResponse,
+	error,
+) {
+	branchInfo, err := getBranchInfoFromTree(localTree, path)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "descend index")
+	}
+
+	resp := &protobufs.HypergraphComparison{
+		Payload: &protobufs.HypergraphComparison_Response{
+			Response: branchInfo,
+		},
+	}
+
+	if err := stream.Send(resp); err != nil {
+		return nil, nil, errors.Wrap(err, "descend index")
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, nil, errors.Wrap(
+			errors.New("context canceled"),
+			"handle query next",
+		)
+	case resp, ok := <-incomingResponses:
+		if !ok {
+			return nil, nil, errors.Wrap(
+				errors.New("channel closed"),
+				"descend index",
+			)
+		}
+
+		if slices.Compare(branchInfo.Path, resp.Path) != 0 {
+			return nil, nil, errors.Wrap(
+				fmt.Errorf(
+					"invalid path received: %v, expected: %v",
+					resp.Path,
+					branchInfo.Path,
+				),
+				"descend index",
+			)
+		}
+
+		return branchInfo, resp, nil
+	case <-time.After(5 * time.Second):
+		return nil, nil, errors.Wrap(
+			errors.New("timed out"),
+			"descend index",
+		)
+	}
+}
+
+type HyperStream interface {
+	Send(*protobufs.HypergraphComparison) error
+	Recv() (*protobufs.HypergraphComparison, error)
+}
+
+func walk(
+	ctx context.Context,
+	logger *zap.Logger,
+	path []int32,
+	lnode, rnode *protobufs.HypergraphComparisonResponse,
+	incomingQueries <-chan *protobufs.HypergraphComparisonQuery,
+	incomingResponses <-chan *protobufs.HypergraphComparisonResponse,
+	stream HyperStream,
+	hypergraphStore store.HypergraphStore,
+	localTree *crypto.VectorCommitmentTree,
+	metadataOnly bool,
+) error {
+	select {
+	case <-ctx.Done():
+		return errors.New("context canceled")
+	default:
+	}
+
+	if isLeaf(lnode) && isLeaf(rnode) {
+		if !bytes.Equal(lnode.Commitment, rnode.Commitment) {
+			logger.Info("leaves mismatch commitments, sending")
+			sendLeafData(
+				stream,
+				hypergraphStore,
+				localTree,
+				path,
+				metadataOnly,
+			)
+		}
 		return nil
 	}
 
-	return send(leaf)
+	if isLeaf(rnode) || isLeaf(lnode) {
+		logger.Info("leaf/branch mismatch at path")
+		sendLeafData(
+			stream,
+			hypergraphStore,
+			localTree,
+			path,
+			metadataOnly,
+		)
+		return nil
+	}
+
+	lpref := lnode.Path
+	rpref := rnode.Path
+	if len(lpref) != len(rpref) {
+		logger.Info(
+			"prefix length mismatch",
+			zap.Int("local_prefix", len(lpref)),
+			zap.Int("remote_prefix", len(rpref)),
+		)
+		if len(lpref) > len(rpref) {
+			logger.Info("local prefix longer, traversing remote to path")
+			traverse := lpref[len(rpref)-1:]
+			rtrav := rnode
+			traversePath := append([]int32{}, rpref...)
+			for _, nibble := range traverse {
+				logger.Info("attempting remote traversal step")
+				for _, child := range rtrav.Children {
+					if child.Index == nibble {
+						logger.Info("sending query")
+						traversePath = append(traversePath, child.Index)
+						var err error
+						rtrav, err = queryNext(
+							ctx,
+							incomingResponses,
+							stream,
+							traversePath,
+						)
+						if err != nil {
+							logger.Error("query failed", zap.Error(err))
+							return errors.Wrap(err, "walk")
+						}
+
+						if rtrav == nil {
+							logger.Info("traversal could not reach path, sending leaf data")
+							sendLeafData(
+								stream,
+								hypergraphStore,
+								localTree,
+								path,
+								metadataOnly,
+							)
+							return nil
+						}
+					}
+				}
+			}
+			logger.Info("traversal completed, performing walk")
+			return walk(
+				ctx,
+				logger,
+				path,
+				lnode,
+				rtrav,
+				incomingQueries,
+				incomingResponses,
+				stream,
+				hypergraphStore,
+				localTree,
+				metadataOnly,
+			)
+		} else {
+			logger.Info("remote prefix longer, traversing local to path")
+			traverse := rpref[len(lpref)-1:]
+			ltrav := lnode
+			traversedPath := append([]int32{}, lnode.Path...)
+
+			for _, nibble := range traverse {
+				logger.Info("attempting local traversal step")
+				preTraversal := append([]int32{}, traversedPath...)
+				for _, child := range ltrav.Children {
+					if child.Index == nibble {
+						traversedPath = append(traversedPath, nibble)
+						var err error
+						logger.Info("expecting query")
+						ltrav, err = handleQueryNext(
+							ctx,
+							incomingQueries,
+							stream,
+							localTree,
+							traversedPath,
+						)
+						if err != nil {
+							logger.Error("expect failed", zap.Error(err))
+							return errors.Wrap(err, "walk")
+						}
+
+						if ltrav == nil {
+							logger.Info("traversal could not reach path, sending leaf data")
+							sendLeafData(
+								stream,
+								hypergraphStore,
+								localTree,
+								path,
+								metadataOnly,
+							)
+							return nil
+						}
+					} else {
+						logger.Info("sending leaves of known missing branch")
+						sendLeafData(
+							stream,
+							hypergraphStore,
+							localTree,
+							append(append([]int32{}, preTraversal...), child.Index),
+							metadataOnly,
+						)
+					}
+				}
+			}
+			logger.Info("traversal completed, performing walk")
+			return walk(
+				ctx,
+				logger,
+				path,
+				ltrav,
+				rnode,
+				incomingQueries,
+				incomingResponses,
+				stream,
+				hypergraphStore,
+				localTree,
+				metadataOnly,
+			)
+		}
+	} else {
+		logger.Info(
+			"prefix match length, compare",
+			zap.Int("local_prefix", len(lpref)),
+			zap.Int("remote_prefix", len(rpref)),
+		)
+		if slices.Compare(lpref, rpref) == 0 {
+			logger.Info("prefixes match, diffing children")
+			for i := int32(0); i < 64; i++ {
+				logger.Info("checking branch", zap.Int32("branch", i))
+				var lchild *protobufs.BranchChild = nil
+				for _, lc := range lnode.Children {
+					if lc.Index == i {
+						logger.Info("local instance found", zap.Int32("branch", i))
+
+						lchild = lc
+						break
+					}
+				}
+				var rchild *protobufs.BranchChild = nil
+				for _, rc := range rnode.Children {
+					if rc.Index == i {
+						logger.Info("remote instance found", zap.Int32("branch", i))
+
+						rchild = rc
+						break
+					}
+				}
+				if (lchild != nil && rchild == nil) ||
+					(lchild == nil && rchild != nil) {
+					logger.Info("branch divergence")
+					sendLeafData(stream, hypergraphStore, localTree, path, metadataOnly)
+				} else {
+					if lchild != nil {
+						nextPath := append(
+							append([]int32{}, lpref...),
+							lchild.Index,
+						)
+						lc, rc, err := descendIndex(
+							ctx,
+							incomingResponses,
+							stream,
+							localTree,
+							nextPath,
+						)
+						if err != nil {
+							return errors.Wrap(err, "walk")
+						}
+
+						if err = walk(
+							ctx,
+							logger,
+							nextPath,
+							lc,
+							rc,
+							incomingQueries,
+							incomingResponses,
+							stream,
+							hypergraphStore,
+							localTree,
+							metadataOnly,
+						); err != nil {
+							return errors.Wrap(err, "walk")
+						}
+					}
+				}
+			}
+		} else {
+			logger.Info("prefix mismatch on both sides")
+			sendLeafData(stream, hypergraphStore, localTree, path, metadataOnly)
+		}
+	}
+
+	return nil
 }
 
 // syncTreeBidirectionallyServer implements the diff and sync logic on the
@@ -312,13 +641,10 @@ func syncTreeBidirectionallyServer(
 	if query == nil {
 		return errors.New("client did not send valid initialization message")
 	}
-	logger.Info(
-		"received initialization message",
-		zap.String("shard_key", hex.EncodeToString(query.ShardKey)),
-		zap.Int("phase_set", int(query.PhaseSet)),
-	)
 
-	// Lookup our local phase set.
+	logger.Info("received initialization message")
+
+	// Get the appropriate phase set
 	var phaseSet map[hypergraph.ShardKey]*hypergraph.IdSet
 	switch query.PhaseSet {
 	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS:
@@ -339,272 +665,159 @@ func syncTreeBidirectionallyServer(
 		L1: [3]byte(query.ShardKey[:3]),
 		L2: [32]byte(query.ShardKey[3:]),
 	}
+
 	idSet, ok := phaseSet[shardKey]
 	if !ok {
 		return errors.New("server does not have phase set")
 	}
 
-	requested := map[string]struct{}{}
-	sent := map[string]struct{}{}
-	pendingIn, pendingOut := UnboundedChan[[]int32]("server pending")
-	pendingIn <- []int32{}
+	branchInfo, err := getBranchInfoFromTree(idSet.GetTree(), []int32{})
+	if err != nil {
+		return err
+	}
 
-	incomingIn, incomingOut := UnboundedChan[protobufs.HypergraphComparison](
-		"server incoming",
-	)
+	resp := &protobufs.HypergraphComparison{
+		Payload: &protobufs.HypergraphComparison_Response{
+			Response: branchInfo,
+		},
+	}
+
+	if err := stream.Send(resp); err != nil {
+		return err
+	}
+
+	msg, err = stream.Recv()
+	if err != nil {
+		return err
+	}
+	response := msg.GetResponse()
+	if response == nil {
+		return errors.New(
+			"client did not send valid initialization response message",
+		)
+	}
+
+	incomingQueriesIn, incomingQueriesOut :=
+		UnboundedChan[*protobufs.HypergraphComparisonQuery]("server incoming")
+	incomingResponsesIn, incomingResponsesOut :=
+		UnboundedChan[*protobufs.HypergraphComparisonResponse]("server incoming")
+	incomingLeavesIn, incomingLeavesOut :=
+		UnboundedChan[*protobufs.LeafData]("server incoming")
+
 	go func() {
 		for {
 			msg, err := stream.Recv()
 			if err == io.EOF {
-				close(incomingIn)
+				logger.Info("received disconnect")
+				close(incomingQueriesIn)
+				close(incomingResponsesIn)
+				close(incomingLeavesIn)
 				return
 			}
 			if err != nil {
-				close(incomingIn)
+				logger.Info("received error", zap.Error(err))
+				close(incomingQueriesIn)
+				close(incomingResponsesIn)
+				close(incomingLeavesIn)
 				return
 			}
 			if msg == nil {
 				continue
 			}
-
-			incomingIn <- *msg
+			switch m := msg.Payload.(type) {
+			case *protobufs.HypergraphComparison_LeafData:
+				incomingLeavesIn <- m.LeafData
+			case *protobufs.HypergraphComparison_Query:
+				incomingQueriesIn <- m.Query
+			case *protobufs.HypergraphComparison_Response:
+				incomingResponsesIn <- m.Response
+			}
 		}
 	}()
 
-	knownRemoteCommitment := []byte{}
-	previousKnownRemoteCommitment := []byte{}
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+		err := walk(
+			stream.Context(),
+			logger,
+			[]int32{},
+			branchInfo,
+			response,
+			incomingQueriesOut,
+			incomingResponsesOut,
+			stream,
+			localHypergraphStore,
+			idSet.GetTree(),
+			metadataOnly,
+		)
+		if err != nil {
+			logger.Error("error while syncing", zap.Error(err))
+		}
+	}()
+
+	lastReceived := time.Now()
 
 outer:
 	for {
 		select {
-		case path := <-pendingOut:
-			logger.Info(
-				"server sending comparison query",
-				zap.String("path", hex.EncodeToString(packNibbles(path))),
-			)
-			queryMsg := &protobufs.HypergraphComparison{
-				Payload: &protobufs.HypergraphComparison_Query{
-					Query: &protobufs.HypergraphComparisonQuery{
-						ShardKey:        query.ShardKey,
-						PhaseSet:        query.PhaseSet,
-						Path:            path,
-						IncludeLeafData: false,
-					},
-				},
-			}
-			if err := stream.Send(queryMsg); err != nil {
-				break outer
-			}
-
-		case msg, ok := <-incomingOut:
+		case remoteUpdate, ok := <-incomingLeavesOut:
 			if !ok {
 				break outer
 			}
-			switch payload := msg.Payload.(type) {
 
-			case *protobufs.HypergraphComparison_Response:
-				remoteInfo := payload.Response
-				logger.Info(
-					"server handling response",
-					zap.String("path", hex.EncodeToString(packNibbles(remoteInfo.Path))),
-				)
-				localInfo, err := getBranchInfoFromTree(
-					idSet.GetTree(),
-					remoteInfo.Path,
-				)
+			logger.Info(
+				"received leaf data",
+				zap.String("key", hex.EncodeToString(remoteUpdate.Key)),
+			)
 
-				if remoteInfo.IsRoot {
-					previousKnownRemoteCommitment = knownRemoteCommitment
-					knownRemoteCommitment = remoteInfo.Commitment
-				}
-
+			if len(remoteUpdate.UnderlyingData) != 0 {
+				txn, err := localHypergraphStore.NewTransaction(false)
 				if err != nil {
-					logger.Info(
-						"server requesting missing node",
-						zap.String(
-							"path",
-							hex.EncodeToString(packNibbles(remoteInfo.Path)),
-						),
-					)
-
-					if _, ok := requested[string(packNibbles(remoteInfo.Path))]; !ok {
-						requested[string(packNibbles(remoteInfo.Path))] = struct{}{}
-						missingQuery := &protobufs.HypergraphComparison{
-							Payload: &protobufs.HypergraphComparison_Query{
-								Query: &protobufs.HypergraphComparisonQuery{
-									ShardKey:        query.ShardKey,
-									PhaseSet:        query.PhaseSet,
-									Path:            remoteInfo.Path,
-									IncludeLeafData: true,
-								},
-							},
-						}
-						if err := stream.Send(missingQuery); err != nil {
-							break outer
-						}
-					}
-					// Do not queue children for a missing node.
-					continue
+					return err
 				}
 
-				if !equalBytes(localInfo.Commitment, remoteInfo.Commitment) {
-					logger.Info(
-						"server mismatching commitment at path",
-						zap.String(
-							"path",
-							hex.EncodeToString(packNibbles(remoteInfo.Path)),
-						),
-						zap.String("commitment", hex.EncodeToString(remoteInfo.Commitment)),
-					)
-					if isLeaf(remoteInfo) {
-						logger.Info(
-							"server sending leaf info",
-							zap.String(
-								"path",
-								hex.EncodeToString(packNibbles(remoteInfo.Path)),
-							),
-						)
-						if err := sendLeafDataServer(
-							stream,
-							localHypergraphStore,
-							sent,
-							idSet.GetTree(),
-							remoteInfo.Path,
-							metadataOnly,
-						); err != nil {
-							break outer
-						}
-					} else {
-						for _, remoteChild := range remoteInfo.Children {
-							var localChildCommit []byte
-							for _, localChild := range localInfo.Children {
-								if localChild.Index == remoteChild.Index {
-									localChildCommit = localChild.Commitment
-									break
-								}
-							}
-							if !equalBytes(localChildCommit, remoteChild.Commitment) {
-								logger.Info(
-									"found mismatching child commitment, enqueueing",
-									zap.String(
-										"path",
-										hex.EncodeToString(packNibbles(remoteInfo.Path)),
-									),
-									zap.Int32("child_index", remoteChild.Index),
-									zap.String(
-										"local_commitment",
-										hex.EncodeToString(localChildCommit),
-									),
-									zap.String(
-										"remote_commitment",
-										hex.EncodeToString(remoteChild.Commitment),
-									),
-								)
-								newPath := append(
-									append([]int32(nil), remoteInfo.Path...),
-									remoteChild.Index,
-								)
+				tree := &crypto.VectorCommitmentTree{}
+				var b bytes.Buffer
+				b.Write(remoteUpdate.UnderlyingData)
 
-								pendingIn <- newPath
-							}
-						}
-					}
-				}
-			case *protobufs.HypergraphComparison_Query:
-				queryPath := payload.Query.Path
-				logger.Info(
-					"server received query for leaves",
-					zap.String(
-						"path",
-						hex.EncodeToString(packNibbles(queryPath)),
-					),
-				)
-				if payload.Query.IncludeLeafData {
-					if err := sendLeafDataServer(
-						stream,
-						localHypergraphStore,
-						sent,
-						idSet.GetTree(),
-						queryPath,
-						metadataOnly,
-					); err != nil {
-						break outer
-					}
-				} else {
-					logger.Info(
-						"server received query for branches",
-						zap.String(
-							"path",
-							hex.EncodeToString(packNibbles(queryPath)),
-						),
-					)
-					branchInfo, err := getBranchInfoFromTree(idSet.GetTree(), queryPath)
-					if err != nil {
-						continue
-					}
-					resp := &protobufs.HypergraphComparison{
-						Payload: &protobufs.HypergraphComparison_Response{
-							Response: branchInfo,
-						},
-					}
-					if err := stream.Send(resp); err != nil {
-						break outer
-					}
-				}
-			case *protobufs.HypergraphComparison_LeafData:
-				remoteUpdate := payload.LeafData
-				logger.Info(
-					"received leaf data",
-					zap.String(
-						"key",
-						hex.EncodeToString(payload.LeafData.Key),
-					),
-				)
-				if len(remoteUpdate.UnderlyingData) != 0 {
-					txn, err := localHypergraphStore.NewTransaction(false)
-					if err != nil {
-						return err
-					}
-					tree := &crypto.VectorCommitmentTree{}
-					var b bytes.Buffer
-					b.Write(remoteUpdate.UnderlyingData)
-
-					dec := gob.NewDecoder(&b)
-					if err := dec.Decode(tree); err != nil {
-						txn.Abort()
-						return err
-					}
-					err = localHypergraphStore.SaveVertexTree(txn, remoteUpdate.Key, tree)
-					if err != nil {
-						txn.Abort()
-						return err
-					}
-
-					if err = txn.Commit(); err != nil {
-						txn.Abort()
-						return err
-					}
+				dec := gob.NewDecoder(&b)
+				if err := dec.Decode(tree); err != nil {
+					txn.Abort()
+					return err
 				}
 
-				idSet.Add(hypergraph.AtomFromBytes(remoteUpdate.Value))
+				err = localHypergraphStore.SaveVertexTree(txn, remoteUpdate.Key, tree)
+				if err != nil {
+					txn.Abort()
+					return err
+				}
+
+				if err = txn.Commit(); err != nil {
+					txn.Abort()
+					return err
+				}
 			}
+
+			idSet.Add(hypergraph.AtomFromBytes(remoteUpdate.Value))
+
+			lastReceived = time.Now()
 		case <-time.After(5 * time.Second):
-			commitment := idSet.GetTree().Commit(false)
-			if !bytes.Equal(commitment, knownRemoteCommitment) &&
-				!bytes.Equal(knownRemoteCommitment, previousKnownRemoteCommitment) &&
-				!bytes.Equal(knownRemoteCommitment, []byte{}) {
-				time.Sleep(1 * time.Second)
-				requested = map[string]struct{}{}
-				sent = map[string]struct{}{}
-				pendingIn <- []int32{}
-			} else {
+			if time.Since(lastReceived) > 5*time.Second {
 				break outer
 			}
 		}
 	}
 
+	wg.Wait()
+
 	total, _ := idSet.GetTree().GetMetadata()
-	logger.Info("current progress", zap.Float32("percentage", float32(total*100)/float32(debugTotalCoins)))
+	logger.Info(
+		"current progress",
+		zap.Float32("percentage", float32(total*100)/float32(debugTotalCoins)),
+	)
 	return nil
 }
 
@@ -647,6 +860,8 @@ func SyncTreeBidirectionally(
 		zap.String("shard_key", hex.EncodeToString(shardKey)),
 		zap.Int("phase_set", int(phaseSet)),
 	)
+
+	// Send initial query for root path
 	if err := stream.Send(&protobufs.HypergraphComparison{
 		Payload: &protobufs.HypergraphComparison_Query{
 			Query: &protobufs.HypergraphComparisonQuery{
@@ -661,253 +876,150 @@ func SyncTreeBidirectionally(
 		return err
 	}
 
-	requested := map[string]struct{}{}
-	sent := map[string]struct{}{}
-	pendingIn, pendingOut := UnboundedChan[[]int32]("client pending")
-	pendingIn <- []int32{}
+	msg, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	response := msg.GetResponse()
+	if response == nil {
+		return errors.New(
+			"server did not send valid initialization response message",
+		)
+	}
 
-	incomingIn, incomingOut := UnboundedChan[protobufs.HypergraphComparison](
-		"client incoming",
-	)
+	branchInfo, err := getBranchInfoFromTree(set.GetTree(), []int32{})
+	if err != nil {
+		return err
+	}
+
+	resp := &protobufs.HypergraphComparison{
+		Payload: &protobufs.HypergraphComparison_Response{
+			Response: branchInfo,
+		},
+	}
+
+	if err := stream.Send(resp); err != nil {
+		return err
+	}
+
+	incomingQueriesIn, incomingQueriesOut :=
+		UnboundedChan[*protobufs.HypergraphComparisonQuery]("server incoming")
+	incomingResponsesIn, incomingResponsesOut :=
+		UnboundedChan[*protobufs.HypergraphComparisonResponse]("server incoming")
+	incomingLeavesIn, incomingLeavesOut :=
+		UnboundedChan[*protobufs.LeafData]("server incoming")
+
 	go func() {
 		for {
 			msg, err := stream.Recv()
 			if err == io.EOF {
-				close(incomingIn)
+				close(incomingQueriesIn)
+				close(incomingResponsesIn)
+				close(incomingLeavesIn)
 				return
 			}
 			if err != nil {
-				close(incomingIn)
+				close(incomingQueriesIn)
+				close(incomingResponsesIn)
+				close(incomingLeavesIn)
 				return
 			}
 			if msg == nil {
 				continue
 			}
-			incomingIn <- *msg
+			switch m := msg.Payload.(type) {
+			case *protobufs.HypergraphComparison_LeafData:
+				incomingLeavesIn <- m.LeafData
+			case *protobufs.HypergraphComparison_Query:
+				incomingQueriesIn <- m.Query
+			case *protobufs.HypergraphComparison_Response:
+				incomingResponsesIn <- m.Response
+			}
 		}
 	}()
 
-	knownRemoteCommitment := []byte{}
-	previousKnownRemoteCommitment := []byte{}
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := walk(
+			stream.Context(),
+			logger,
+			[]int32{},
+			branchInfo,
+			response,
+			incomingQueriesOut,
+			incomingResponsesOut,
+			stream,
+			hypergraphStore,
+			set.GetTree(),
+			metadataOnly,
+		)
+		if err != nil {
+			logger.Error("error while syncing", zap.Error(err))
+		}
+	}()
+
+	lastReceived := time.Now()
 
 outer:
 	for {
 		select {
-		case path := <-pendingOut:
-			logger.Info(
-				"sending comparison query",
-				zap.String("path", hex.EncodeToString(packNibbles(path))),
-			)
-			queryMsg := &protobufs.HypergraphComparison{
-				Payload: &protobufs.HypergraphComparison_Query{
-					Query: &protobufs.HypergraphComparisonQuery{
-						Path:            path,
-						IncludeLeafData: false,
-					},
-				},
-			}
-			if err := stream.Send(queryMsg); err != nil {
-				break outer
-			}
-		case msg, ok := <-incomingOut:
+		case remoteUpdate, ok := <-incomingLeavesOut:
 			if !ok {
 				break outer
 			}
-			switch payload := msg.Payload.(type) {
-			case *protobufs.HypergraphComparison_Response:
-				remoteInfo := payload.Response
-				logger.Info(
-					"handling response",
-					zap.String("path", hex.EncodeToString(packNibbles(remoteInfo.Path))),
-				)
 
-				if remoteInfo.IsRoot {
-					previousKnownRemoteCommitment = knownRemoteCommitment
-					knownRemoteCommitment = remoteInfo.Commitment
-				}
+			logger.Info(
+				"received leaf data",
+				zap.String("key", hex.EncodeToString(remoteUpdate.Key)),
+			)
 
-				localInfo, err := getBranchInfoFromTree(set.GetTree(), remoteInfo.Path)
+			if len(remoteUpdate.UnderlyingData) != 0 {
+				txn, err := hypergraphStore.NewTransaction(false)
 				if err != nil {
-					logger.Info(
-						"requesting missing node",
-						zap.String(
-							"path",
-							hex.EncodeToString(packNibbles(remoteInfo.Path)),
-						),
-					)
-					if _, ok := requested[string(packNibbles(remoteInfo.Path))]; !ok {
-						requested[string(packNibbles(remoteInfo.Path))] = struct{}{}
-						missingQuery := &protobufs.HypergraphComparison{
-							Payload: &protobufs.HypergraphComparison_Query{
-								Query: &protobufs.HypergraphComparisonQuery{
-									Path:            remoteInfo.Path,
-									IncludeLeafData: true,
-								},
-							},
-						}
-						if err := stream.Send(missingQuery); err != nil {
-							break outer
-						}
-					}
-					continue
-				}
-				if !equalBytes(localInfo.Commitment, remoteInfo.Commitment) {
-					logger.Info(
-						"mismatching commitment at path",
-						zap.String(
-							"path",
-							hex.EncodeToString(packNibbles(remoteInfo.Path)),
-						),
-						zap.String("commitment", hex.EncodeToString(remoteInfo.Commitment)),
-					)
-					if isLeaf(remoteInfo) {
-						logger.Info(
-							"sending leaf info",
-							zap.String(
-								"path",
-								hex.EncodeToString(packNibbles(remoteInfo.Path)),
-							),
-						)
-						if err := sendLeafData(
-							stream,
-							hypergraphStore,
-							sent,
-							set.GetTree(),
-							remoteInfo.Path,
-							metadataOnly,
-						); err != nil {
-							break outer
-						}
-					} else {
-						for _, remoteChild := range remoteInfo.Children {
-							var localChildCommit []byte
-							for _, localChild := range localInfo.Children {
-								if localChild.Index == remoteChild.Index {
-									localChildCommit = localChild.Commitment
-									break
-								}
-							}
-							if !equalBytes(localChildCommit, remoteChild.Commitment) {
-								logger.Info(
-									"found mismatching child commitment, enqueueing",
-									zap.String(
-										"path",
-										hex.EncodeToString(packNibbles(remoteInfo.Path)),
-									),
-									zap.Int32("child_index", remoteChild.Index),
-									zap.String(
-										"local_commitment",
-										hex.EncodeToString(localChildCommit),
-									),
-									zap.String(
-										"remote_commitment",
-										hex.EncodeToString(remoteChild.Commitment),
-									),
-								)
-								newPath := append(
-									append([]int32(nil), remoteInfo.Path...),
-									remoteChild.Index,
-								)
-								pendingIn <- newPath
-							}
-						}
-					}
-				}
-			case *protobufs.HypergraphComparison_Query:
-				queryPath := payload.Query.Path
-				if payload.Query.IncludeLeafData {
-					logger.Info(
-						"received query for leaves",
-						zap.String(
-							"path",
-							hex.EncodeToString(packNibbles(queryPath)),
-						),
-					)
-					if err := sendLeafData(
-						stream,
-						hypergraphStore,
-						sent,
-						set.GetTree(),
-						queryPath,
-						metadataOnly,
-					); err != nil {
-						break outer
-					}
-				} else {
-					logger.Info(
-						"received query for branches",
-						zap.String(
-							"path",
-							hex.EncodeToString(packNibbles(queryPath)),
-						),
-					)
-					branchInfo, err := getBranchInfoFromTree(set.GetTree(), queryPath)
-					if err != nil {
-						continue
-					}
-					resp := &protobufs.HypergraphComparison{
-						Payload: &protobufs.HypergraphComparison_Response{
-							Response: branchInfo,
-						},
-					}
-					if err := stream.Send(resp); err != nil {
-						break outer
-					}
-				}
-			case *protobufs.HypergraphComparison_LeafData:
-				logger.Info(
-					"received leaf data",
-					zap.String(
-						"key",
-						hex.EncodeToString(payload.LeafData.Key),
-					),
-				)
-				remoteUpdate := payload.LeafData
-				if len(remoteUpdate.UnderlyingData) != 0 {
-					txn, err := hypergraphStore.NewTransaction(false)
-					if err != nil {
-						return err
-					}
-					tree := &crypto.VectorCommitmentTree{}
-					var b bytes.Buffer
-					b.Write(remoteUpdate.UnderlyingData)
-
-					dec := gob.NewDecoder(&b)
-					if err := dec.Decode(tree); err != nil {
-						txn.Abort()
-						return err
-					}
-					err = hypergraphStore.SaveVertexTree(txn, remoteUpdate.Key, tree)
-					if err != nil {
-						txn.Abort()
-						return err
-					}
-
-					if err = txn.Commit(); err != nil {
-						txn.Abort()
-						return err
-					}
+					return err
 				}
 
-				set.Add(hypergraph.AtomFromBytes(remoteUpdate.Value))
+				tree := &crypto.VectorCommitmentTree{}
+				var b bytes.Buffer
+				b.Write(remoteUpdate.UnderlyingData)
+
+				dec := gob.NewDecoder(&b)
+				if err := dec.Decode(tree); err != nil {
+					txn.Abort()
+					return err
+				}
+
+				err = hypergraphStore.SaveVertexTree(txn, remoteUpdate.Key, tree)
+				if err != nil {
+					txn.Abort()
+					return err
+				}
+
+				if err = txn.Commit(); err != nil {
+					txn.Abort()
+					return err
+				}
 			}
+
+			set.Add(hypergraph.AtomFromBytes(remoteUpdate.Value))
+
+			lastReceived = time.Now()
 		case <-time.After(5 * time.Second):
-			commitment := set.GetTree().Commit(false)
-			if !bytes.Equal(commitment, knownRemoteCommitment) &&
-				!bytes.Equal(knownRemoteCommitment, previousKnownRemoteCommitment) &&
-				!bytes.Equal(knownRemoteCommitment, []byte{}) {
-				time.Sleep(1 * time.Second)
-				requested = map[string]struct{}{}
-				sent = map[string]struct{}{}
-				pendingIn <- []int32{}
-			} else {
+			if time.Since(lastReceived) > 5*time.Second {
 				break outer
 			}
 		}
 	}
 
+	wg.Wait()
+
 	total, _ := set.GetTree().GetMetadata()
-	logger.Info("current progress", zap.Float32("percentage", float32(total*100)/float32(debugTotalCoins)))
+	logger.Info(
+		"current progress",
+		zap.Float32("percentage", float32(total*100)/float32(debugTotalCoins)),
+	)
 	return nil
 }
 
@@ -936,37 +1048,4 @@ func UnboundedChan[T any](purpose string) (chan<- T, <-chan T) {
 		}
 	}()
 	return in, out
-}
-
-func packNibbles(values []int32) []byte {
-	totalBits := len(values) * 6
-	out := make([]byte, (totalBits+7)/8)
-	bitOffset := 0
-
-	for _, v := range values {
-		bitsRemaining := 6
-		for bitsRemaining > 0 {
-			byteIndex := bitOffset / 8
-			bitPos := bitOffset % 8
-			bitsAvailable := 8 - bitPos
-			n := bitsRemaining
-			if n > bitsAvailable {
-				n = bitsAvailable
-			}
-
-			// From the current 6-bit value, take the top n bits that haven't been
-			// written.
-			shift := bitsRemaining - n
-			bitsToWrite := int((v >> shift) & ((1 << n) - 1))
-
-			// Place these bits in the current byte. Since we fill each byte from the
-			// most-significant bit down, shift them to the proper position.
-			shiftPos := bitsAvailable - n
-			out[byteIndex] |= byte(bitsToWrite << shiftPos)
-
-			bitOffset += n
-			bitsRemaining -= n
-		}
-	}
-	return out
 }
