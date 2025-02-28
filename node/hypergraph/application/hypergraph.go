@@ -366,14 +366,14 @@ func (set *IdSet) IsDirty() bool {
 	return set.dirty
 }
 
-func (set *IdSet) ToBytes() []byte {
+func (set *IdSet) ToBytes() ([]byte, error) {
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
 	if err := enc.Encode(set.tree); err != nil {
-		return nil
+		return nil, errors.Wrap(err, "to bytes")
 	}
 
-	return buf.Bytes()
+	return buf.Bytes(), nil
 }
 
 func (set *IdSet) Add(atom Atom) error {

@@ -379,6 +379,14 @@ type HyperStream interface {
 	Recv() (*protobufs.HypergraphComparison, error)
 }
 
+func packPath(path []int32) []byte {
+	b := []byte{}
+	for _, p := range path {
+		b = append(b, byte(p))
+	}
+	return b
+}
+
 func walk(
 	ctx context.Context,
 	logger *zap.Logger,
@@ -397,9 +405,16 @@ func walk(
 	default:
 	}
 
+	pathString := zap.String("path", hex.EncodeToString(packPath(path)))
+
+	if bytes.Equal(lnode.Commitment, rnode.Commitment) {
+		logger.Info("commitments match", pathString)
+		return nil
+	}
+
 	if isLeaf(lnode) && isLeaf(rnode) {
 		if !bytes.Equal(lnode.Commitment, rnode.Commitment) {
-			logger.Info("leaves mismatch commitments, sending")
+			logger.Info("leaves mismatch commitments, sending", pathString)
 			sendLeafData(
 				stream,
 				hypergraphStore,
@@ -412,7 +427,7 @@ func walk(
 	}
 
 	if isLeaf(rnode) || isLeaf(lnode) {
-		logger.Info("leaf/branch mismatch at path")
+		logger.Info("leaf/branch mismatch at path", pathString)
 		sendLeafData(
 			stream,
 			hypergraphStore,
@@ -430,9 +445,10 @@ func walk(
 			"prefix length mismatch",
 			zap.Int("local_prefix", len(lpref)),
 			zap.Int("remote_prefix", len(rpref)),
+			pathString,
 		)
 		if len(lpref) > len(rpref) {
-			logger.Info("local prefix longer, traversing remote to path")
+			logger.Info("local prefix longer, traversing remote to path", pathString)
 			traverse := lpref[len(rpref)-1:]
 			rtrav := rnode
 			traversePath := append([]int32{}, rpref...)
@@ -468,7 +484,7 @@ func walk(
 					}
 				}
 			}
-			logger.Info("traversal completed, performing walk")
+			logger.Info("traversal completed, performing walk", pathString)
 			return walk(
 				ctx,
 				logger,
@@ -483,7 +499,7 @@ func walk(
 				metadataOnly,
 			)
 		} else {
-			logger.Info("remote prefix longer, traversing local to path")
+			logger.Info("remote prefix longer, traversing local to path", pathString)
 			traverse := rpref[len(lpref)-1:]
 			ltrav := lnode
 			traversedPath := append([]int32{}, lnode.Path...)
@@ -520,7 +536,17 @@ func walk(
 							return nil
 						}
 					} else {
-						logger.Info("sending leaves of known missing branch")
+						logger.Info(
+							"sending leaves of known missing branch",
+							zap.String(
+								"path",
+								hex.EncodeToString(
+									packPath(
+										append(append([]int32{}, preTraversal...), child.Index),
+									),
+								),
+							),
+						)
 						sendLeafData(
 							stream,
 							hypergraphStore,
@@ -531,7 +557,7 @@ func walk(
 					}
 				}
 			}
-			logger.Info("traversal completed, performing walk")
+			logger.Info("traversal completed, performing walk", pathString)
 			return walk(
 				ctx,
 				logger,
@@ -547,19 +573,14 @@ func walk(
 			)
 		}
 	} else {
-		logger.Info(
-			"prefix match length, compare",
-			zap.Int("local_prefix", len(lpref)),
-			zap.Int("remote_prefix", len(rpref)),
-		)
 		if slices.Compare(lpref, rpref) == 0 {
-			logger.Info("prefixes match, diffing children")
+			logger.Debug("prefixes match, diffing children")
 			for i := int32(0); i < 64; i++ {
-				logger.Info("checking branch", zap.Int32("branch", i))
+				logger.Debug("checking branch", zap.Int32("branch", i))
 				var lchild *protobufs.BranchChild = nil
 				for _, lc := range lnode.Children {
 					if lc.Index == i {
-						logger.Info("local instance found", zap.Int32("branch", i))
+						logger.Debug("local instance found", zap.Int32("branch", i))
 
 						lchild = lc
 						break
@@ -568,7 +589,7 @@ func walk(
 				var rchild *protobufs.BranchChild = nil
 				for _, rc := range rnode.Children {
 					if rc.Index == i {
-						logger.Info("remote instance found", zap.Int32("branch", i))
+						logger.Debug("remote instance found", zap.Int32("branch", i))
 
 						rchild = rc
 						break
@@ -576,7 +597,7 @@ func walk(
 				}
 				if (lchild != nil && rchild == nil) ||
 					(lchild == nil && rchild != nil) {
-					logger.Info("branch divergence")
+					logger.Info("branch divergence", pathString)
 					sendLeafData(stream, hypergraphStore, localTree, path, metadataOnly)
 				} else {
 					if lchild != nil {
@@ -614,7 +635,7 @@ func walk(
 				}
 			}
 		} else {
-			logger.Info("prefix mismatch on both sides")
+			logger.Info("prefix mismatch on both sides", pathString)
 			sendLeafData(stream, hypergraphStore, localTree, path, metadataOnly)
 		}
 	}
