@@ -108,7 +108,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 	}
 
 	txn, _ := serverHypergraphStore.NewTransaction(false)
-	for _, op := range operations1[:250] {
+	for _, op := range operations1[:numOperations/2] {
 		switch op.Type {
 		case "AddVertex":
 			id := op.Vertex.GetID()
@@ -137,7 +137,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 	}
 
 	txn, _ = clientHypergraphStore.NewTransaction(false)
-	for _, op := range operations1[250:] {
+	for _, op := range operations1[numOperations/2:] {
 		switch op.Type {
 		case "AddVertex":
 			id := op.Vertex.GetID()
@@ -219,7 +219,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 	grpcServer := grpc.NewServer()
 	protobufs.RegisterHypergraphComparisonServiceServer(
 		grpcServer,
-		rpc.NewHypergraphComparisonServer(logger, serverHypergraphStore, crdts[0], rpc.NewSyncController(), 10000),
+		rpc.NewHypergraphComparisonServer(logger, serverHypergraphStore, crdts[0], rpc.NewSyncController(), numOperations),
 	)
 	log.Println("Server listening on :50051")
 	go func() {
@@ -239,7 +239,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 
 	syncController := rpc.NewSyncController()
 
-	err = rpc.SyncTreeBidirectionally(str, logger, append(append([]byte{}, shardKey.L1[:]...), shardKey.L2[:]...), protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, clientHypergraphStore, crdts[1].GetVertexAdds()[shardKey], syncController, 10000, false)
+	err = rpc.SyncTreeBidirectionally(str, logger, append(append([]byte{}, shardKey.L1[:]...), shardKey.L2[:]...), protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, clientHypergraphStore, crdts[1].GetVertexAdds()[shardKey], syncController, numOperations, false)
 	if err != nil {
 		log.Fatalf("Client: failed to sync 1: %v", err)
 	}
@@ -258,7 +258,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 		log.Fatalf("Client: failed to stream: %v", err)
 	}
 
-	err = rpc.SyncTreeBidirectionally(str, logger, append(append([]byte{}, shardKey.L1[:]...), shardKey.L2[:]...), protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, clientHypergraphStore, crdts[1].GetVertexAdds()[shardKey], syncController, 10000, false)
+	err = rpc.SyncTreeBidirectionally(str, logger, append(append([]byte{}, shardKey.L1[:]...), shardKey.L2[:]...), protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, clientHypergraphStore, crdts[1].GetVertexAdds()[shardKey], syncController, numOperations, false)
 	if err != nil {
 		log.Fatalf("Client: failed to sync 2: %v", err)
 	}

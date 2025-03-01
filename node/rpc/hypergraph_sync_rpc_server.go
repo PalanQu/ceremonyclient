@@ -470,18 +470,20 @@ func walk(
 							return errors.Wrap(err, "walk")
 						}
 
-						if rtrav == nil {
-							logger.Info("traversal could not reach path, sending leaf data")
-							sendLeafData(
-								stream,
-								hypergraphStore,
-								localTree,
-								path,
-								metadataOnly,
-							)
-							return nil
-						}
+						break
 					}
+				}
+
+				if rtrav == nil {
+					logger.Info("traversal could not reach path, sending leaf data")
+					sendLeafData(
+						stream,
+						hypergraphStore,
+						localTree,
+						path,
+						metadataOnly,
+					)
+					return nil
 				}
 			}
 			logger.Info("traversal completed, performing walk", pathString)
@@ -613,7 +615,15 @@ func walk(
 							nextPath,
 						)
 						if err != nil {
-							return errors.Wrap(err, "walk")
+							logger.Info("incomplete branch descension, sending leaves")
+							sendLeafData(
+								stream,
+								hypergraphStore,
+								localTree,
+								nextPath,
+								metadataOnly,
+							)
+							return nil
 						}
 
 						if err = walk(

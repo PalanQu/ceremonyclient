@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/gob"
 	"encoding/hex"
-	"fmt"
 	"io/fs"
 	"os"
 	"path"
@@ -238,7 +237,12 @@ func (p *PebbleHypergraphStore) LoadHypergraph() (
 					return nil
 				}
 
-				shardSet, err := hex.DecodeString(d.Name())
+				if len(strings.Split(d.Name(), ".")) != 2 ||
+					strings.Split(d.Name(), ".")[1] != "vct" {
+					return nil
+				}
+
+				shardSet, err := hex.DecodeString(strings.Split(d.Name(), ".")[0])
 				if err != nil {
 					return err
 				}
@@ -300,8 +304,6 @@ func (p *PebbleHypergraphStore) SaveHypergraph(
 				return errors.Wrap(err, "save hypergraph")
 			}
 
-			fmt.Println(len(data))
-
 			err = os.WriteFile(
 				path.Join(
 					hypergraphDir,
@@ -321,7 +323,7 @@ func (p *PebbleHypergraphStore) SaveHypergraph(
 				),
 				path.Join(
 					hypergraphDir,
-					hex.EncodeToString(hypergraphVertexAddsKey(shardKey)),
+					hex.EncodeToString(hypergraphVertexAddsKey(shardKey))+".vct",
 				),
 			); err != nil {
 				return errors.Wrap(err, "save hypergraph")
@@ -355,7 +357,7 @@ func (p *PebbleHypergraphStore) SaveHypergraph(
 				),
 				path.Join(
 					hypergraphDir,
-					hex.EncodeToString(hypergraphVertexRemovesKey(shardKey)),
+					hex.EncodeToString(hypergraphVertexRemovesKey(shardKey))+".vct",
 				),
 			); err != nil {
 				return errors.Wrap(err, "save hypergraph")
@@ -389,7 +391,7 @@ func (p *PebbleHypergraphStore) SaveHypergraph(
 				),
 				path.Join(
 					hypergraphDir,
-					hex.EncodeToString(hypergraphHyperedgeAddsKey(shardKey)),
+					hex.EncodeToString(hypergraphHyperedgeAddsKey(shardKey))+".vct",
 				),
 			); err != nil {
 				return errors.Wrap(err, "save hypergraph")
@@ -423,7 +425,7 @@ func (p *PebbleHypergraphStore) SaveHypergraph(
 				),
 				path.Join(
 					hypergraphDir,
-					hex.EncodeToString(hypergraphHyperedgeRemovesKey(shardKey)),
+					hex.EncodeToString(hypergraphHyperedgeRemovesKey(shardKey))+".vct",
 				),
 			); err != nil {
 				return errors.Wrap(err, "save hypergraph")

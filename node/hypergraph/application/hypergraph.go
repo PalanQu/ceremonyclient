@@ -347,19 +347,10 @@ func NewIdSet(atomType AtomType) *IdSet {
 }
 
 func (set *IdSet) FromBytes(treeData []byte) error {
-	set.tree = &crypto.VectorCommitmentTree{}
-	var b bytes.Buffer
-	b.Write(treeData)
-	dec := gob.NewDecoder(&b)
-	if err := dec.Decode(set.tree); err != nil {
-		return errors.Wrap(err, "load set")
-	}
+	var err error
+	set.tree, err = crypto.DeserializeTree(treeData)
 
-	for _, leaf := range crypto.GetAllLeaves(set.tree.Root) {
-		set.atoms[[64]byte(leaf.Key)] = AtomFromBytes(leaf.Value)
-	}
-
-	return nil
+	return errors.Wrap(err, "from bytes")
 }
 
 func (set *IdSet) IsDirty() bool {
@@ -367,13 +358,7 @@ func (set *IdSet) IsDirty() bool {
 }
 
 func (set *IdSet) ToBytes() ([]byte, error) {
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	if err := enc.Encode(set.tree); err != nil {
-		return nil, errors.Wrap(err, "to bytes")
-	}
-
-	return buf.Bytes(), nil
+	return crypto.SerializeTree(set.tree)
 }
 
 func (set *IdSet) Add(atom Atom) error {

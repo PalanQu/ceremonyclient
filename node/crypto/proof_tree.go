@@ -7,6 +7,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"sync"
 
@@ -20,9 +21,12 @@ func init() {
 }
 
 const (
-	BranchNodes = 64
-	BranchBits  = 6 // log2(64)
-	BranchMask  = BranchNodes - 1
+	BranchNodes      = 64
+	BranchBits       = 6 // log2(64)
+	BranchMask       = BranchNodes - 1
+	TypeNil     byte = 0
+	TypeLeaf    byte = 1
+	TypeBranch  byte = 2
 )
 
 type VectorCommitmentNode interface {
@@ -627,4 +631,276 @@ func DebugNode(node VectorCommitmentNode, depth int, prefix string) {
 			}
 		}
 	}
+}
+
+func SerializeTree(tree *VectorCommitmentTree) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := serializeNode(&buf, tree.Root); err != nil {
+		return nil, fmt.Errorf("failed to serialize tree: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+func DeserializeTree(data []byte) (*VectorCommitmentTree, error) {
+	buf := bytes.NewReader(data)
+	node, err := deserializeNode(buf)
+	if err != nil {
+		return nil, fmt.Errorf("failed to deserialize tree: %w", err)
+	}
+	return &VectorCommitmentTree{Root: node}, nil
+}
+
+func serializeNode(w io.Writer, node VectorCommitmentNode) error {
+	if node == nil {
+		if err := binary.Write(w, binary.BigEndian, TypeNil); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	switch n := node.(type) {
+	case *VectorCommitmentLeafNode:
+		if err := binary.Write(w, binary.BigEndian, TypeLeaf); err != nil {
+			return err
+		}
+		return serializeLeafNode(w, n)
+	case *VectorCommitmentBranchNode:
+		if err := binary.Write(w, binary.BigEndian, TypeBranch); err != nil {
+			return err
+		}
+		return serializeBranchNode(w, n)
+	default:
+		return fmt.Errorf("unknown node type: %T", node)
+	}
+}
+
+func serializeLeafNode(w io.Writer, node *VectorCommitmentLeafNode) error {
+	if err := serializeBytes(w, node.Key); err != nil {
+		return err
+	}
+
+	if err := serializeBytes(w, node.Value); err != nil {
+		return err
+	}
+
+	if err := serializeBytes(w, node.HashTarget); err != nil {
+		return err
+	}
+
+	if err := serializeBytes(w, node.Commitment); err != nil {
+		return err
+	}
+
+	return serializeBigInt(w, node.Size)
+}
+
+func serializeBranchNode(w io.Writer, node *VectorCommitmentBranchNode) error {
+	if err := serializeIntSlice(w, node.Prefix); err != nil {
+		return err
+	}
+
+	for i := 0; i < BranchNodes; i++ {
+		child := node.Children[i]
+		if err := serializeNode(w, child); err != nil {
+			return err
+		}
+	}
+
+	if err := serializeBytes(w, node.Commitment); err != nil {
+		return err
+	}
+
+	if err := serializeBigInt(w, node.Size); err != nil {
+		return err
+	}
+
+	if err := binary.Write(w, binary.BigEndian, int64(node.LeafCount)); err != nil {
+		return err
+	}
+
+	return binary.Write(w, binary.BigEndian, int32(node.LongestBranch))
+}
+
+func deserializeNode(r io.Reader) (VectorCommitmentNode, error) {
+	var nodeType byte
+	if err := binary.Read(r, binary.BigEndian, &nodeType); err != nil {
+		return nil, err
+	}
+
+	switch nodeType {
+	case TypeNil:
+		return nil, nil
+	case TypeLeaf:
+		return deserializeLeafNode(r)
+	case TypeBranch:
+		return deserializeBranchNode(r)
+	default:
+		return nil, fmt.Errorf("unknown node type marker: %d", nodeType)
+	}
+}
+
+func deserializeLeafNode(r io.Reader) (*VectorCommitmentLeafNode, error) {
+	node := &VectorCommitmentLeafNode{}
+
+	key, err := deserializeBytes(r)
+	if err != nil {
+		return nil, err
+	}
+	node.Key = key
+
+	value, err := deserializeBytes(r)
+	if err != nil {
+		return nil, err
+	}
+	node.Value = value
+
+	hashTarget, err := deserializeBytes(r)
+	if err != nil {
+		return nil, err
+	}
+	node.HashTarget = hashTarget
+
+	commitment, err := deserializeBytes(r)
+	if err != nil {
+		return nil, err
+	}
+	node.Commitment = commitment
+
+	size, err := deserializeBigInt(r)
+	if err != nil {
+		return nil, err
+	}
+	node.Size = size
+
+	return node, nil
+}
+
+func deserializeBranchNode(r io.Reader) (*VectorCommitmentBranchNode, error) {
+	node := &VectorCommitmentBranchNode{}
+
+	prefix, err := deserializeIntSlice(r)
+	if err != nil {
+		return nil, err
+	}
+	node.Prefix = prefix
+
+	node.Children = [BranchNodes]VectorCommitmentNode{}
+	for i := 0; i < BranchNodes; i++ {
+		child, err := deserializeNode(r)
+		if err != nil {
+			return nil, err
+		}
+		node.Children[i] = child
+	}
+
+	commitment, err := deserializeBytes(r)
+	if err != nil {
+		return nil, err
+	}
+	node.Commitment = commitment
+
+	size, err := deserializeBigInt(r)
+	if err != nil {
+		return nil, err
+	}
+	node.Size = size
+
+	var leafCount int64
+	if err := binary.Read(r, binary.BigEndian, &leafCount); err != nil {
+		return nil, err
+	}
+	node.LeafCount = int(leafCount)
+
+	var longestBranch int32
+	if err := binary.Read(r, binary.BigEndian, &longestBranch); err != nil {
+		return nil, err
+	}
+	node.LongestBranch = int(longestBranch)
+
+	return node, nil
+}
+
+func serializeBytes(w io.Writer, data []byte) error {
+	length := uint64(len(data))
+	if err := binary.Write(w, binary.BigEndian, length); err != nil {
+		return err
+	}
+
+	if length > 0 {
+		if _, err := w.Write(data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func deserializeBytes(r io.Reader) ([]byte, error) {
+	var length uint64
+	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
+		return nil, err
+	}
+
+	if length > 0 {
+		data := make([]byte, length)
+		if _, err := io.ReadFull(r, data); err != nil {
+			return nil, err
+		}
+		return data, nil
+	}
+	return []byte{}, nil
+}
+
+func serializeIntSlice(w io.Writer, ints []int) error {
+	length := uint32(len(ints))
+	if err := binary.Write(w, binary.BigEndian, length); err != nil {
+		return err
+	}
+
+	for _, v := range ints {
+		if err := binary.Write(w, binary.BigEndian, int32(v)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func deserializeIntSlice(r io.Reader) ([]int, error) {
+	var length uint32
+	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
+		return nil, err
+	}
+
+	ints := make([]int, length)
+	for i := range ints {
+		var v int32
+		if err := binary.Read(r, binary.BigEndian, &v); err != nil {
+			return nil, err
+		}
+		ints[i] = int(v)
+	}
+	return ints, nil
+}
+
+func serializeBigInt(w io.Writer, n *big.Int) error {
+	if n == nil {
+		return binary.Write(w, binary.BigEndian, uint32(0))
+	}
+
+	bytes := n.Bytes()
+
+	return serializeBytes(w, bytes)
+}
+
+func deserializeBigInt(r io.Reader) (*big.Int, error) {
+	bytes, err := deserializeBytes(r)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(bytes) == 0 {
+		return new(big.Int), nil
+	}
+
+	n := new(big.Int).SetBytes(bytes)
+	return n, nil
 }
