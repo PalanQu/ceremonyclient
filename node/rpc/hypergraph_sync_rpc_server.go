@@ -767,7 +767,6 @@ func syncTreeBidirectionallyServer(
 			msg, err := stream.Recv()
 			if err == io.EOF {
 				logger.Info("received disconnect")
-				close(backpressure)
 				close(incomingQueriesIn)
 				close(incomingResponsesIn)
 				close(incomingLeavesIn)
@@ -775,7 +774,6 @@ func syncTreeBidirectionallyServer(
 			}
 			if err != nil {
 				logger.Info("received error", zap.Error(err))
-				close(backpressure)
 				close(incomingQueriesIn)
 				close(incomingResponsesIn)
 				close(incomingLeavesIn)
@@ -976,14 +974,12 @@ func SyncTreeBidirectionally(
 		for {
 			msg, err := stream.Recv()
 			if err == io.EOF {
-				close(backpressure)
 				close(incomingQueriesIn)
 				close(incomingResponsesIn)
 				close(incomingLeavesIn)
 				return
 			}
 			if err != nil {
-				close(backpressure)
 				close(incomingQueriesIn)
 				close(incomingResponsesIn)
 				close(incomingLeavesIn)
