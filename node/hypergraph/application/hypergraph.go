@@ -349,6 +349,10 @@ func NewIdSet(atomType AtomType) *IdSet {
 func (set *IdSet) FromBytes(treeData []byte) error {
 	var err error
 	set.tree, err = crypto.DeserializeTree(treeData)
+	leaves := crypto.GetAllLeaves(set.tree.Root)
+	for _, leaf := range leaves {
+		set.atoms[[64]byte(leaf.Key)] = AtomFromBytes(leaf.Value)
+	}
 
 	return errors.Wrap(err, "from bytes")
 }

@@ -426,19 +426,24 @@ func NewTokenExecutionEngine(
 			e.rebuildHypergraph(specificRange)
 		}
 
-		vertices, ok := e.hypergraph.GetVertexAdds()[hypergraph.ShardKey{
-			L1: [3]byte(p2p.GetBloomFilterIndices(intrinsicFilter[:], 256, 3)),
-			L2: [32]byte(slices.Clone(intrinsicFilter[:])),
-		}]
+		if len(e.hypergraph.GetVertexAdds()) == 0 {
+			panic("hypergraph does not contain id set for application")
+		}
 
-		if !ok {
+		var vertices *hypergraph.IdSet
+		for _, set := range e.hypergraph.GetVertexAdds() {
+			vertices = set
+		}
+
+		if vertices == nil {
 			panic("hypergraph does not contain id set for application")
 		}
 
 		rebuildSet := [][]byte{}
 		for _, inc := range includeSet {
+
 			if !vertices.Has(
-				[64]byte(slices.Concat(intrinsicFilter, inc)),
+				[64]byte(slices.Concat(application.TOKEN_ADDRESS, inc)),
 			) {
 				rebuildSet = append(rebuildSet, inc)
 			}
