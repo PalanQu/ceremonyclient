@@ -706,7 +706,7 @@ func (e *TokenExecutionEngine) hyperSync(totalCoins int) {
 	if err != nil {
 		e.logger.Error("could not open stream", zap.Error(err))
 		e.syncController.SyncStatus[peer.ID(peerId).String()] = &rpc.SyncInfo{
-			Unreachable: false,
+			Unreachable: true,
 			LastSynced:  gotime.Now(),
 		}
 		return
@@ -728,9 +728,11 @@ func (e *TokenExecutionEngine) hyperSync(totalCoins int) {
 		)
 		if err != nil {
 			e.logger.Error("error while synchronizing", zap.Error(err))
-			e.syncController.SyncStatus[peer.ID(peerId).String()] = &rpc.SyncInfo{
-				Unreachable: false,
-				LastSynced:  gotime.Now(),
+			if !strings.Contains(err.Error(), "unavailable") {
+				e.syncController.SyncStatus[peer.ID(peerId).String()] = &rpc.SyncInfo{
+					Unreachable: false,
+					LastSynced:  gotime.Now(),
+				}
 			}
 			continue
 		}
