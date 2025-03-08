@@ -16,12 +16,14 @@ import (
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	hypergraph "source.quilibrium.com/quilibrium/monorepo/node/hypergraph/application"
+	"source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
 
 type SyncController struct {
-	isSyncing atomic.Bool
+	isSyncing  atomic.Bool
+	SyncStatus map[string]*SyncInfo
 }
 
 func (s *SyncController) TryEstablishSyncSession() bool {
@@ -32,9 +34,15 @@ func (s *SyncController) EndSyncSession() {
 	s.isSyncing.Store(false)
 }
 
+type SyncInfo struct {
+	Unreachable bool
+	LastSynced  time.Time
+}
+
 func NewSyncController() *SyncController {
 	return &SyncController{
-		isSyncing: atomic.Bool{},
+		isSyncing:  atomic.Bool{},
+		SyncStatus: map[string]*SyncInfo{},
 	}
 }
 
@@ -65,12 +73,18 @@ func NewHypergraphComparisonServer(
 	}
 }
 
+type streamManager struct {
+	ctx             context.Context
+	logger          *zap.Logger
+	stream          HyperStream
+	hypergraphStore store.HypergraphStore
+	localTree       *crypto.VectorCommitmentTree
+	lastSent        time.Time
+}
+
 // sendLeafData builds a LeafData message (with the full leaf data) for the
 // node at the given path in the local tree and sends it over the stream.
-func sendLeafData(
-	stream HyperStream,
-	hypergraphStore store.HypergraphStore,
-	localTree *crypto.VectorCommitmentTree,
+func (s *streamManager) sendLeafData(
 	path []int32,
 	metadataOnly bool,
 ) error {
@@ -82,7 +96,7 @@ func sendLeafData(
 			Size:       leaf.Size.FillBytes(make([]byte, 32)),
 		}
 		if !metadataOnly {
-			tree, err := hypergraphStore.LoadVertexTree(leaf.Key)
+			tree, err := s.hypergraphStore.LoadVertexTree(leaf.Key)
 			if err == nil {
 				var buf bytes.Buffer
 				enc := gob.NewEncoder(&buf)
@@ -97,10 +111,28 @@ func sendLeafData(
 				LeafData: update,
 			},
 		}
-		return stream.Send(msg)
+
+		s.logger.Info(
+			"sending leaf data",
+			zap.String("key", hex.EncodeToString(leaf.Key)),
+		)
+
+		select {
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		default:
+		}
+
+		err := s.stream.Send(msg)
+		if err != nil {
+			return errors.Wrap(err, "send leaf data")
+		}
+
+		s.lastSent = time.Now()
+		return nil
 	}
 
-	node := getNodeAtPath(localTree.Root, path, 0)
+	node := getNodeAtPath(s.localTree.Root, path, 0)
 	leaf, ok := node.(*crypto.VectorCommitmentLeafNode)
 	if !ok {
 		children := crypto.GetAllLeaves(node)
@@ -251,7 +283,7 @@ func queryNext(
 			)
 		}
 		return resp, nil
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		return nil, errors.Wrap(
 			errors.New("timed out"),
 			"handle query",
@@ -306,7 +338,7 @@ func handleQueryNext(
 		}
 
 		return branchInfo, nil
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		return nil, errors.Wrap(
 			errors.New("timed out"),
 			"handle query next",
@@ -366,7 +398,7 @@ func descendIndex(
 		}
 
 		return branchInfo, resp, nil
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		return nil, nil, errors.Wrap(
 			errors.New("timed out"),
 			"descend index",
@@ -387,38 +419,30 @@ func packPath(path []int32) []byte {
 	return b
 }
 
-func walk(
-	ctx context.Context,
-	logger *zap.Logger,
+func (s *streamManager) walk(
 	path []int32,
 	lnode, rnode *protobufs.HypergraphComparisonResponse,
 	incomingQueries <-chan *protobufs.HypergraphComparisonQuery,
 	incomingResponses <-chan *protobufs.HypergraphComparisonResponse,
-	stream HyperStream,
-	hypergraphStore store.HypergraphStore,
-	localTree *crypto.VectorCommitmentTree,
 	metadataOnly bool,
 ) error {
 	select {
-	case <-ctx.Done():
-		return errors.New("context canceled")
+	case <-s.ctx.Done():
+		return s.ctx.Err()
 	default:
 	}
 
 	pathString := zap.String("path", hex.EncodeToString(packPath(path)))
 
 	if bytes.Equal(lnode.Commitment, rnode.Commitment) {
-		logger.Info("commitments match", pathString)
+		s.logger.Info("commitments match", pathString)
 		return nil
 	}
 
 	if isLeaf(lnode) && isLeaf(rnode) {
 		if !bytes.Equal(lnode.Commitment, rnode.Commitment) {
-			logger.Info("leaves mismatch commitments, sending", pathString)
-			sendLeafData(
-				stream,
-				hypergraphStore,
-				localTree,
+			s.logger.Info("leaves mismatch commitments, sending", pathString)
+			s.sendLeafData(
 				path,
 				metadataOnly,
 			)
@@ -427,46 +451,43 @@ func walk(
 	}
 
 	if isLeaf(rnode) || isLeaf(lnode) {
-		logger.Info("leaf/branch mismatch at path", pathString)
-		sendLeafData(
-			stream,
-			hypergraphStore,
-			localTree,
+		s.logger.Info("leaf/branch mismatch at path", pathString)
+		err := s.sendLeafData(
 			path,
 			metadataOnly,
 		)
-		return nil
+		return errors.Wrap(err, "walk")
 	}
 
 	lpref := lnode.Path
 	rpref := rnode.Path
 	if len(lpref) != len(rpref) {
-		logger.Info(
+		s.logger.Info(
 			"prefix length mismatch",
 			zap.Int("local_prefix", len(lpref)),
 			zap.Int("remote_prefix", len(rpref)),
 			pathString,
 		)
 		if len(lpref) > len(rpref) {
-			logger.Info("local prefix longer, traversing remote to path", pathString)
+			s.logger.Info("local prefix longer, traversing remote to path", pathString)
 			traverse := lpref[len(rpref)-1:]
 			rtrav := rnode
 			traversePath := append([]int32{}, rpref...)
 			for _, nibble := range traverse {
-				logger.Info("attempting remote traversal step")
+				s.logger.Info("attempting remote traversal step")
 				for _, child := range rtrav.Children {
 					if child.Index == nibble {
-						logger.Info("sending query")
+						s.logger.Info("sending query")
 						traversePath = append(traversePath, child.Index)
 						var err error
 						rtrav, err = queryNext(
-							ctx,
+							s.ctx,
 							incomingResponses,
-							stream,
+							s.stream,
 							traversePath,
 						)
 						if err != nil {
-							logger.Error("query failed", zap.Error(err))
+							s.logger.Error("query failed", zap.Error(err))
 							return errors.Wrap(err, "walk")
 						}
 
@@ -475,70 +496,61 @@ func walk(
 				}
 
 				if rtrav == nil {
-					logger.Info("traversal could not reach path, sending leaf data")
-					sendLeafData(
-						stream,
-						hypergraphStore,
-						localTree,
+					s.logger.Info("traversal could not reach path, sending leaf data")
+					err := s.sendLeafData(
 						path,
 						metadataOnly,
 					)
-					return nil
+					return errors.Wrap(err, "walk")
 				}
 			}
-			logger.Info("traversal completed, performing walk", pathString)
-			return walk(
-				ctx,
-				logger,
+			s.logger.Info("traversal completed, performing walk", pathString)
+			return s.walk(
 				path,
 				lnode,
 				rtrav,
 				incomingQueries,
 				incomingResponses,
-				stream,
-				hypergraphStore,
-				localTree,
 				metadataOnly,
 			)
 		} else {
-			logger.Info("remote prefix longer, traversing local to path", pathString)
+			s.logger.Info("remote prefix longer, traversing local to path", pathString)
 			traverse := rpref[len(lpref)-1:]
 			ltrav := lnode
 			traversedPath := append([]int32{}, lnode.Path...)
 
 			for _, nibble := range traverse {
-				logger.Info("attempting local traversal step")
+				s.logger.Info("attempting local traversal step")
 				preTraversal := append([]int32{}, traversedPath...)
 				for _, child := range ltrav.Children {
 					if child.Index == nibble {
 						traversedPath = append(traversedPath, nibble)
 						var err error
-						logger.Info("expecting query")
+						s.logger.Info("expecting query")
 						ltrav, err = handleQueryNext(
-							ctx,
+							s.ctx,
 							incomingQueries,
-							stream,
-							localTree,
+							s.stream,
+							s.localTree,
 							traversedPath,
 						)
 						if err != nil {
-							logger.Error("expect failed", zap.Error(err))
+							s.logger.Error("expect failed", zap.Error(err))
 							return errors.Wrap(err, "walk")
 						}
 
 						if ltrav == nil {
-							logger.Info("traversal could not reach path, sending leaf data")
-							sendLeafData(
-								stream,
-								hypergraphStore,
-								localTree,
+							s.logger.Info("traversal could not reach path, sending leaf data")
+							if err := s.sendLeafData(
 								path,
 								metadataOnly,
-							)
+							); err != nil {
+								return errors.Wrap(err, "walk")
+							}
 							return nil
 						}
 					} else {
-						logger.Info(
+						s.logger.Info(
 							"sending leaves of known missing branch",
 							zap.String(
 								"path",
@@ -549,40 +561,34 @@ func walk(
 								),
 							),
 						)
-						sendLeafData(
-							stream,
-							hypergraphStore,
-							localTree,
+						if err := s.sendLeafData(
 							append(append([]int32{}, preTraversal...), child.Index),
 							metadataOnly,
-						)
+						); err != nil {
+							return errors.Wrap(err, "walk")
+						}
 					}
 				}
 			}
-			logger.Info("traversal completed, performing walk", pathString)
-			return walk(
-				ctx,
-				logger,
+			s.logger.Info("traversal completed, performing walk", pathString)
+			return s.walk(
 				path,
 				ltrav,
 				rnode,
 				incomingQueries,
 				incomingResponses,
-				stream,
-				hypergraphStore,
-				localTree,
 				metadataOnly,
 			)
 		}
 	} else {
 		if slices.Compare(lpref, rpref) == 0 {
-			logger.Debug("prefixes match, diffing children")
+			s.logger.Debug("prefixes match, diffing children")
 			for i := int32(0); i < 64; i++ {
-				logger.Debug("checking branch", zap.Int32("branch", i))
+				s.logger.Debug("checking branch", zap.Int32("branch", i))
 				var lchild *protobufs.BranchChild = nil
 				for _, lc := range lnode.Children {
 					if lc.Index == i {
-						logger.Debug("local instance found", zap.Int32("branch", i))
+						s.logger.Debug("local instance found", zap.Int32("branch", i))
 
 						lchild = lc
 						break
@@ -591,7 +597,7 @@ func walk(
 				var rchild *protobufs.BranchChild = nil
 				for _, rc := range rnode.Children {
 					if rc.Index == i {
-						logger.Debug("remote instance found", zap.Int32("branch", i))
+						s.logger.Debug("remote instance found", zap.Int32("branch", i))
 
 						rchild = rc
 						break
@@ -599,14 +605,13 @@ func walk(
 				}
 				if (lchild != nil && rchild == nil) ||
 					(lchild == nil && rchild != nil) {
-					logger.Info("branch divergence", pathString)
-					sendLeafData(
-						stream,
-						hypergraphStore,
-						localTree,
+					s.logger.Info("branch divergence", pathString)
+					if err := s.sendLeafData(
 						path,
 						metadataOnly,
-					)
+					); err != nil {
+						return errors.Wrap(err, "walk")
+					}
 				} else {
 					if lchild != nil {
 						nextPath := append(
@@ -614,35 +619,29 @@ func walk(
 							lchild.Index,
 						)
 						lc, rc, err := descendIndex(
-							ctx,
+							s.ctx,
 							incomingResponses,
-							stream,
-							localTree,
+							s.stream,
+							s.localTree,
 							nextPath,
 						)
 						if err != nil {
-							logger.Info("incomplete branch descension, sending leaves")
-							sendLeafData(
-								stream,
-								hypergraphStore,
-								localTree,
+							s.logger.Info("incomplete branch descension, sending leaves")
+							if err := s.sendLeafData(
 								nextPath,
 								metadataOnly,
-							)
+							); err != nil {
+								return errors.Wrap(err, "walk")
+							}
 							continue
 						}
 
-						if err = walk(
-							ctx,
-							logger,
+						if err = s.walk(
 							nextPath,
 							lc,
 							rc,
 							incomingQueries,
 							incomingResponses,
-							stream,
-							hypergraphStore,
-							localTree,
 							metadataOnly,
 						); err != nil {
 							return errors.Wrap(err, "walk")
@@ -651,14 +650,13 @@ func walk(
 				}
 			}
 		} else {
-			logger.Info("prefix mismatch on both sides", pathString)
-			sendLeafData(
-				stream,
-				hypergraphStore,
-				localTree,
+			s.logger.Info("prefix mismatch on both sides", pathString)
+			if err := s.sendLeafData(
 				path,
 				metadataOnly,
-			)
+			); err != nil {
+				return errors.Wrap(err, "walk")
+			}
 		}
 	}
 
@@ -781,19 +779,22 @@ func syncTreeBidirectionallyServer(
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 
+	manager := &streamManager{
+		ctx:             stream.Context(),
+		logger:          logger,
+		stream:          stream,
+		hypergraphStore: localHypergraphStore,
+		localTree:       idSet.GetTree(),
+		lastSent:        time.Now(),
+	}
 	go func() {
 		defer wg.Done()
-		err := walk(
-			stream.Context(),
-			logger,
+		err := manager.walk(
 			[]int32{},
 			branchInfo,
 			response,
 			incomingQueriesOut,
 			incomingResponsesOut,
-			stream,
-			localHypergraphStore,
-			idSet.GetTree(),
 			metadataOnly,
 		)
 		if err != nil {
@@ -802,6 +803,7 @@ func syncTreeBidirectionallyServer(
 	}()
 
 	lastReceived := time.Now()
+	leafUpdates := 0
 
 outer:
 	for {
@@ -846,15 +848,42 @@ outer:
 
 			idSet.Add(hypergraph.AtomFromBytes(remoteUpdate.Value))
 
+			leafUpdates++
 			lastReceived = time.Now()
-		case <-time.After(5 * time.Second):
-			if time.Since(lastReceived) > 5*time.Second {
-				break outer
+
+			if leafUpdates > 10000 {
+				roots := localHypergraph.Commit()
+				logger.Info(
+					"hypergraph root commit",
+					zap.String("root", hex.EncodeToString(roots[0])),
+				)
+
+				if err = localHypergraphStore.SaveHypergraph(localHypergraph); err != nil {
+					logger.Error("error while saving", zap.Error(err))
+				}
+
+				leafUpdates = 0
+			}
+		case <-time.After(30 * time.Second):
+			if time.Since(lastReceived) > 30*time.Second {
+				if time.Since(manager.lastSent) > 30*time.Second {
+					break outer
+				}
 			}
 		}
 	}
 
 	wg.Wait()
+
+	roots := localHypergraph.Commit()
+	logger.Info(
+		"hypergraph root commit",
+		zap.String("root", hex.EncodeToString(roots[0])),
+	)
+
+	if err = localHypergraphStore.SaveHypergraph(localHypergraph); err != nil {
+		logger.Error("error while saving", zap.Error(err))
+	}
 
 	total, _ := idSet.GetTree().GetMetadata()
 	logger.Info(
@@ -873,7 +902,17 @@ func (s *hypergraphComparisonServer) HyperStream(
 	}
 	defer s.syncController.EndSyncSession()
 
-	return syncTreeBidirectionallyServer(
+	peerId, ok := grpc.PeerIDFromContext(stream.Context())
+	if !ok {
+		return errors.New("could not identify peer")
+	}
+
+	status, ok := s.syncController.SyncStatus[peerId.String()]
+	if ok && time.Since(status.LastSynced) < 30*time.Minute {
+		return errors.New("peer too recently synced")
+	}
+
+	err := syncTreeBidirectionallyServer(
 		stream,
 		s.logger,
 		s.localHypergraphStore,
@@ -881,6 +920,12 @@ func (s *hypergraphComparisonServer) HyperStream(
 		false,
 		s.debugTotalCoins,
 	)
+	s.syncController.SyncStatus[peerId.String()] = &SyncInfo{
+		Unreachable: false,
+		LastSynced:  time.Now(),
+	}
+
+	return err
 }
 
 // SyncTreeBidirectionally performs the tree diff and synchronization.
@@ -893,6 +938,7 @@ func SyncTreeBidirectionally(
 	shardKey []byte,
 	phaseSet protobufs.HypergraphPhaseSet,
 	hypergraphStore store.HypergraphStore,
+	localHypergraph *hypergraph.Hypergraph,
 	set *hypergraph.IdSet,
 	syncController *SyncController,
 	debugTotalCoins int,
@@ -983,19 +1029,24 @@ func SyncTreeBidirectionally(
 
 	wg := sync.WaitGroup{}
 	wg.Add(1)
+
+	manager := &streamManager{
+		ctx:             stream.Context(),
+		logger:          logger,
+		stream:          stream,
+		hypergraphStore: hypergraphStore,
+		localTree:       set.GetTree(),
+		lastSent:        time.Now(),
+	}
+
 	go func() {
 		defer wg.Done()
-		err := walk(
-			stream.Context(),
-			logger,
+		err := manager.walk(
 			[]int32{},
 			branchInfo,
 			response,
 			incomingQueriesOut,
 			incomingResponsesOut,
-			stream,
-			hypergraphStore,
-			set.GetTree(),
 			metadataOnly,
 		)
 		if err != nil {
@@ -1003,6 +1054,7 @@ func SyncTreeBidirectionally(
 		}
 	}()
 
+	leafUpdates := 0
 	lastReceived := time.Now()
 
 outer:
@@ -1048,10 +1100,27 @@ outer:
 
 			set.Add(hypergraph.AtomFromBytes(remoteUpdate.Value))
 
+			leafUpdates++
 			lastReceived = time.Now()
-		case <-time.After(5 * time.Second):
-			if time.Since(lastReceived) > 5*time.Second {
-				break outer
+
+			if leafUpdates > 10000 {
+				roots := localHypergraph.Commit()
+				logger.Info(
+					"hypergraph root commit",
+					zap.String("root", hex.EncodeToString(roots[0])),
+				)
+
+				if err = hypergraphStore.SaveHypergraph(localHypergraph); err != nil {
+					logger.Error("error while saving", zap.Error(err))
+				}
+
+				leafUpdates = 0
+			}
+		case <-time.After(30 * time.Second):
+			if time.Since(lastReceived) > 30*time.Second {
+				if time.Since(manager.lastSent) > 30*time.Second {
+					break outer
+				}
 			}
 		}
 	}

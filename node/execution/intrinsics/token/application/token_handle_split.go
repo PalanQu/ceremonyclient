@@ -23,7 +23,7 @@ func (a *TokenApplication) handleSplit(
 	newCoins := []*protobufs.Coin{}
 	newAmounts := []*big.Int{}
 
-	coin, err := a.CoinStore.GetCoinByAddress(nil, t.OfCoin.Address)
+	_, coin, err := a.CoinStore.GetCoinByAddress(nil, t.OfCoin.Address)
 	if err != nil {
 		return nil, errors.Wrap(ErrInvalidStateTransition, "handle split")
 	}

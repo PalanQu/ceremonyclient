@@ -63,7 +63,7 @@ func (a *TokenApplication) handleMerge(
 	owner := &protobufs.AccountRef{}
 	deleted := []*protobufs.TokenOutput{}
 	for _, c := range t.Coins {
-		coin, err := a.CoinStore.GetCoinByAddress(nil, c.Address)
+		_, coin, err := a.CoinStore.GetCoinByAddress(nil, c.Address)
 		if err != nil {
 			return nil, errors.Wrap(ErrInvalidStateTransition, "handle merge")
 		}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"math/big"
@@ -268,7 +269,7 @@ func NewTokenExecutionEngine(
 		}
 
 		tries := []*tries.RollingFrecencyCritbitTrie{
-			&tries.RollingFrecencyCritbitTrie{},
+			{},
 		}
 		proverKeys = [][]byte{config.GetGenesis().Beacon}
 		for _, key := range proverKeys {
@@ -395,8 +396,13 @@ func NewTokenExecutionEngine(
 		panic(err)
 	}
 
+	includeSet := [][]byte{}
+
 	for iter.First(); iter.Valid(); iter.Next() {
 		if bytes.Compare(iter.Key()[2:], start) >= 0 && bytes.Compare(iter.Key()[2:], end) < 0 {
+			key := make([]byte, len(iter.Key())-2)
+			copy(key, iter.Key()[2:])
+			includeSet = append(includeSet, key)
 			specificRange++
 		}
 		totalCoins++
@@ -418,6 +424,28 @@ func NewTokenExecutionEngine(
 
 		if e.hypergraph == nil || len(e.hypergraph.GetVertexAdds()) == 0 {
 			e.rebuildHypergraph(specificRange)
+		}
+
+		vertices, ok := e.hypergraph.GetVertexAdds()[hypergraph.ShardKey{
+			L1: [3]byte(p2p.GetBloomFilterIndices(intrinsicFilter[:], 256, 3)),
+			L2: [32]byte(slices.Clone(intrinsicFilter[:])),
+		}]
+
+		if !ok {
+			panic("hypergraph does not contain id set for application")
+		}
+
+		rebuildSet := [][]byte{}
+		for _, inc := range includeSet {
+			if !vertices.Has(
+				[64]byte(slices.Concat(intrinsicFilter, inc)),
+			) {
+				rebuildSet = append(rebuildSet, inc)
+			}
+		}
+
+		if len(rebuildSet) != 0 {
+			e.rebuildMissingSetForHypergraph(rebuildSet)
 		}
 	}
 
@@ -622,12 +650,24 @@ func (e *TokenExecutionEngine) hyperSync(totalCoins int) {
 	}
 	defer e.syncController.EndSyncSession()
 
-	peerId, err := e.pubSub.GetRandomPeer(
-		append([]byte{0x00}, e.intrinsicFilter...),
-	)
-	if err != nil {
-		e.logger.Error("error getting peer", zap.Error(err))
-		return
+	var peerId []byte = nil
+	for peerId == nil {
+		var err error
+		peerId, err = e.pubSub.GetRandomPeer(
+			append([]byte{0x00}, e.intrinsicFilter...),
+		)
+		if err != nil {
+			e.logger.Error("error getting peer", zap.Error(err))
+			return
+		}
+
+		info, ok := e.syncController.SyncStatus[peer.ID(peerId).String()]
+		if ok {
+			if info.Unreachable || gotime.Since(info.LastSynced) < 30*gotime.Minute {
+				peerId = nil
+				continue
+			}
+		}
 	}
 
 	e.logger.Info(
@@ -643,6 +683,10 @@ func (e *TokenExecutionEngine) hyperSync(totalCoins int) {
 			"could not establish direct channel",
 			zap.Error(err),
 		)
+		e.syncController.SyncStatus[peer.ID(peerId).String()] = &rpc.SyncInfo{
+			Unreachable: true,
+			LastSynced:  gotime.Now(),
+		}
 		return
 	}
 	defer func() {
@@ -656,6 +700,10 @@ func (e *TokenExecutionEngine) hyperSync(totalCoins int) {
 	stream, err := client.HyperStream(e.ctx)
 	if err != nil {
 		e.logger.Error("could not open stream", zap.Error(err))
+		e.syncController.SyncStatus[peer.ID(peerId).String()] = &rpc.SyncInfo{
+			Unreachable: false,
+			LastSynced:  gotime.Now(),
+		}
 		return
 	}
 
@@ -667,6 +715,7 @@ func (e *TokenExecutionEngine) hyperSync(totalCoins int) {
 			append(append([]byte{}, key.L1[:]...), key.L2[:]...),
 			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
 			e.hypergraphStore,
+			e.hypergraph,
 			set,
 			e.syncController,
 			totalCoins,
@@ -674,7 +723,11 @@ func (e *TokenExecutionEngine) hyperSync(totalCoins int) {
 		)
 		if err != nil {
 			e.logger.Error("error while synchronizing", zap.Error(err))
-			return
+			e.syncController.SyncStatus[peer.ID(peerId).String()] = &rpc.SyncInfo{
+				Unreachable: false,
+				LastSynced:  gotime.Now(),
+			}
+			continue
 		}
 	}
 
@@ -686,6 +739,73 @@ func (e *TokenExecutionEngine) hyperSync(totalCoins int) {
 
 	if err = e.hypergraphStore.SaveHypergraph(e.hypergraph); err != nil {
 		e.logger.Error("error while saving", zap.Error(err))
+	}
+}
+
+func (e *TokenExecutionEngine) rebuildMissingSetForHypergraph(set [][]byte) {
+	e.logger.Info("rebuilding missing set entries")
+	var batchKey, batchValue [][]byte
+	processed := 0
+	totalRange := len(set)
+	for _, address := range set {
+		processed++
+		key := slices.Clone(address)
+		batchKey = append(batchKey, key)
+
+		frameNumber, coin, err := e.coinStore.GetCoinByAddress(nil, address)
+		if err != nil {
+			panic(err)
+		}
+
+		value := []byte{}
+		value = binary.BigEndian.AppendUint64(value, frameNumber)
+		value = append(value, coin.Amount...)
+		// implicit
+		value = append(value, 0x00)
+		value = append(value, coin.Owner.GetImplicitAccount().GetAddress()...)
+		// domain len
+		value = append(value, 0x00)
+		value = append(value, coin.Intersection...)
+		batchValue = append(batchValue, value)
+
+		if len(batchKey) == runtime.NumCPU() {
+			e.addBatchToHypergraph(batchKey, batchValue)
+			e.logger.Info(
+				"processed batch",
+				zap.Float32("percentage", float32(processed)/float32(totalRange)),
+			)
+			batchKey = [][]byte{}
+			batchValue = [][]byte{}
+		}
+	}
+
+	if len(batchKey) != 0 {
+		e.addBatchToHypergraph(batchKey, batchValue)
+	}
+
+	txn, err := e.clockStore.NewTransaction(false)
+	if err != nil {
+		panic(err)
+	}
+
+	e.logger.Info("committing hypergraph")
+
+	roots := e.hypergraph.Commit()
+
+	e.logger.Info(
+		"committed hypergraph state",
+		zap.String("root", fmt.Sprintf("%x", roots[0])),
+	)
+
+	err = e.hypergraphStore.SaveHypergraph(e.hypergraph)
+	if err != nil {
+		txn.Abort()
+		panic(err)
+	}
+
+	if err = txn.Commit(); err != nil {
+		txn.Abort()
+		panic(err)
 	}
 }
 
@@ -1023,7 +1143,7 @@ func (e *TokenExecutionEngine) ProcessFrame(
 				panic(err)
 			}
 		case *protobufs.TokenOutput_DeletedCoin:
-			coin, err := e.coinStore.GetCoinByAddress(nil, o.DeletedCoin.Address)
+			_, coin, err := e.coinStore.GetCoinByAddress(nil, o.DeletedCoin.Address)
 			if err != nil {
 				txn.Abort()
 				return nil, errors.Wrap(err, "process frame")

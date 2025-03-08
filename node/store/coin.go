@@ -21,7 +21,11 @@ type CoinStore interface {
 		[]*protobufs.PreCoinProof,
 		error,
 	)
-	GetCoinByAddress(txn Transaction, address []byte) (*protobufs.Coin, error)
+	GetCoinByAddress(txn Transaction, address []byte) (
+		uint64,
+		*protobufs.Coin,
+		error,
+	)
 	GetPreCoinProofByAddress(address []byte) (*protobufs.PreCoinProof, error)
 	RangeCoins(start []byte, end []byte) (Iterator, error)
 	RangePreCoinProofs() (Iterator, error)
@@ -197,6 +201,7 @@ func (p *PebbleCoinStore) GetPreCoinProofsForOwner(owner []byte) (
 }
 
 func (p *PebbleCoinStore) GetCoinByAddress(txn Transaction, address []byte) (
+	uint64,
 	*protobufs.Coin,
 	error,
 ) {
@@ -211,20 +216,22 @@ func (p *PebbleCoinStore) GetCoinByAddress(txn Transaction, address []byte) (
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
 			err = ErrNotFound
-			return nil, err
+			return 0, nil, err
 		}
 		err = errors.Wrap(err, "get coin by address")
-		return nil, err
+		return 0, nil, err
 	}
 	defer closer.Close()
 
 	coin := &protobufs.Coin{}
 	err = proto.Unmarshal(coinBytes[8:], coin)
 	if err != nil {
-		return nil, errors.Wrap(err, "get coin by address")
+		return 0, nil, errors.Wrap(err, "get coin by address")
 	}
 
-	return coin, nil
+	frameNumber := binary.BigEndian.Uint64(coinBytes[:8])
+
+	return frameNumber, coin, nil
 }
 
 func (p *PebbleCoinStore) GetPreCoinProofByAddress(address []byte) (

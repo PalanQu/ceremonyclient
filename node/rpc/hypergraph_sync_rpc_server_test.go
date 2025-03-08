@@ -12,6 +12,8 @@ import (
 	"testing"
 
 	"github.com/cloudflare/circl/sign/ed448"
+	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/stretchr/testify/assert"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -19,10 +21,20 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/node/hypergraph/application"
+	internal_grpc "source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/rpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
+
+type serverStream struct {
+	grpc.ServerStream
+	ctx context.Context
+}
+
+func (s *serverStream) Context() context.Context {
+	return s.ctx
+}
 
 type Operation struct {
 	Type      string // "AddVertex", "RemoveVertex", "AddHyperedge", "RemoveHyperedge"
@@ -216,7 +228,29 @@ func TestHypergraphSyncServer(t *testing.T) {
 		log.Fatalf("Server: failed to listen: %v", err)
 	}
 
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(
+		grpc.ChainStreamInterceptor(func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) (err error) {
+			_, priv, _ := ed448.GenerateKey(rand.Reader)
+			privKey, err := pcrypto.UnmarshalEd448PrivateKey(priv)
+			if err != nil {
+				t.FailNow()
+			}
+
+			pub := privKey.GetPublic()
+			peerId, err := peer.IDFromPublicKey(pub)
+			if err != nil {
+				t.FailNow()
+			}
+
+			return handler(srv, &serverStream{
+				ServerStream: ss,
+				ctx: internal_grpc.NewContextWithPeerID(
+					ss.Context(),
+					peerId,
+				),
+			})
+		}),
+	)
 	protobufs.RegisterHypergraphComparisonServiceServer(
 		grpcServer,
 		rpc.NewHypergraphComparisonServer(logger, serverHypergraphStore, crdts[0], rpc.NewSyncController(), numOperations),
@@ -227,6 +261,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 			log.Fatalf("Server: failed to serve: %v", err)
 		}
 	}()
+
 	conn, err := grpc.DialContext(context.TODO(), "localhost:50051", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatalf("Client: failed to listen: %v", err)
@@ -239,7 +274,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 
 	syncController := rpc.NewSyncController()
 
-	err = rpc.SyncTreeBidirectionally(str, logger, append(append([]byte{}, shardKey.L1[:]...), shardKey.L2[:]...), protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, clientHypergraphStore, crdts[1].GetVertexAdds()[shardKey], syncController, numOperations, false)
+	err = rpc.SyncTreeBidirectionally(str, logger, append(append([]byte{}, shardKey.L1[:]...), shardKey.L2[:]...), protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, clientHypergraphStore, crdts[1], crdts[1].GetVertexAdds()[shardKey], syncController, numOperations, false)
 	if err != nil {
 		log.Fatalf("Client: failed to sync 1: %v", err)
 	}
@@ -258,7 +293,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 		log.Fatalf("Client: failed to stream: %v", err)
 	}
 
-	err = rpc.SyncTreeBidirectionally(str, logger, append(append([]byte{}, shardKey.L1[:]...), shardKey.L2[:]...), protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, clientHypergraphStore, crdts[1].GetVertexAdds()[shardKey], syncController, numOperations, false)
+	err = rpc.SyncTreeBidirectionally(str, logger, append(append([]byte{}, shardKey.L1[:]...), shardKey.L2[:]...), protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS, clientHypergraphStore, crdts[1], crdts[1].GetVertexAdds()[shardKey], syncController, numOperations, false)
 	if err != nil {
 		log.Fatalf("Client: failed to sync 2: %v", err)
 	}
