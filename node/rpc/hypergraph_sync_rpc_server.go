@@ -441,11 +441,16 @@ func (s *streamManager) walk(
 
 	if isLeaf(lnode) && isLeaf(rnode) {
 		if !bytes.Equal(lnode.Commitment, rnode.Commitment) {
-			s.logger.Info("leaves mismatch commitments, sending", pathString)
-			s.sendLeafData(
-				path,
-				metadataOnly,
-			)
+			// conditional is a kludge, m5 only
+			if bytes.Compare(lnode.Commitment, rnode.Commitment) < 0 {
+				s.logger.Info("leaves mismatch commitments, sending", pathString)
+				s.sendLeafData(
+					path,
+					metadataOnly,
+				)
+			} else {
+				s.logger.Info("leaves mismatch commitments, receiving", pathString)
+			}
 		}
 		return nil
 	}
