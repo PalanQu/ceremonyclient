@@ -79,6 +79,7 @@ type streamManager struct {
 	stream          HyperStream
 	hypergraphStore store.HypergraphStore
 	localTree       *crypto.VectorCommitmentTree
+	leavesSent      int
 	lastSent        time.Time
 }
 
@@ -139,6 +140,10 @@ func (s *streamManager) sendLeafData(
 		for _, child := range children {
 			if child == nil {
 				continue
+			}
+			s.leavesSent++
+			if s.leavesSent > 50000 {
+				return nil
 			}
 
 			if err := send(child); err != nil {
@@ -426,6 +431,10 @@ func (s *streamManager) walk(
 	incomingResponses <-chan *protobufs.HypergraphComparisonResponse,
 	metadataOnly bool,
 ) error {
+	if s.leavesSent > 50000 {
+		return nil
+	}
+
 	select {
 	case <-s.ctx.Done():
 		return s.ctx.Err()
@@ -808,7 +817,7 @@ func syncTreeBidirectionallyServer(
 	}()
 
 	lastReceived := time.Now()
-	leafUpdates := 0
+	leavesReceived := 0
 
 outer:
 	for {
@@ -817,11 +826,26 @@ outer:
 			if !ok {
 				break outer
 			}
+			leavesReceived++
+			if leavesReceived > 50000 {
+				break outer
+			}
 
 			logger.Info(
 				"received leaf data",
 				zap.String("key", hex.EncodeToString(remoteUpdate.Key)),
 			)
+
+			theirs := hypergraph.AtomFromBytes(remoteUpdate.Value)
+
+			ours, _ := idSet.GetTree().Get(remoteUpdate.Key)
+			if ours != nil {
+				ourCommit := hypergraph.AtomFromBytes(ours).Commit()
+				theirCommit := theirs.Commit()
+				if bytes.Compare(ourCommit, theirCommit) < 0 {
+					continue
+				}
+			}
 
 			if len(remoteUpdate.UnderlyingData) != 0 {
 				txn, err := localHypergraphStore.NewTransaction(false)
@@ -851,29 +875,17 @@ outer:
 				}
 			}
 
-			idSet.Add(hypergraph.AtomFromBytes(remoteUpdate.Value))
-
-			leafUpdates++
-			lastReceived = time.Now()
-
-			if leafUpdates > 10000 {
-				roots := localHypergraph.Commit()
-				logger.Info(
-					"hypergraph root commit",
-					zap.String("root", hex.EncodeToString(roots[0])),
-				)
-
-				if err = localHypergraphStore.SaveHypergraph(localHypergraph); err != nil {
-					logger.Error("error while saving", zap.Error(err))
-				}
-
-				leafUpdates = 0
+			err := idSet.Add(theirs)
+			if err != nil {
+				logger.Error("error while saving", zap.Error(err))
+				break outer
 			}
+
+			lastReceived = time.Now()
 		case <-time.After(30 * time.Second):
-			if time.Since(lastReceived) > 30*time.Second {
-				if time.Since(manager.lastSent) > 30*time.Second {
-					break outer
-				}
+			if time.Since(lastReceived) > 30*time.Second &&
+				time.Since(manager.lastSent) > 30*time.Second {
+				break outer
 			}
 		}
 	}
@@ -1059,8 +1071,8 @@ func SyncTreeBidirectionally(
 		}
 	}()
 
-	leafUpdates := 0
 	lastReceived := time.Now()
+	leavesReceived := 0
 
 outer:
 	for {
@@ -1070,10 +1082,26 @@ outer:
 				break outer
 			}
 
+			leavesReceived++
+			if leavesReceived > 50000 {
+				break outer
+			}
+
 			logger.Info(
 				"received leaf data",
 				zap.String("key", hex.EncodeToString(remoteUpdate.Key)),
 			)
+
+			theirs := hypergraph.AtomFromBytes(remoteUpdate.Value)
+
+			ours, _ := set.GetTree().Get(remoteUpdate.Key)
+			if ours != nil {
+				ourCommit := hypergraph.AtomFromBytes(ours).Commit()
+				theirCommit := theirs.Commit()
+				if bytes.Compare(ourCommit, theirCommit) < 0 {
+					continue
+				}
+			}
 
 			if len(remoteUpdate.UnderlyingData) != 0 {
 				txn, err := hypergraphStore.NewTransaction(false)
@@ -1103,29 +1131,17 @@ outer:
 				}
 			}
 
-			set.Add(hypergraph.AtomFromBytes(remoteUpdate.Value))
-
-			leafUpdates++
-			lastReceived = time.Now()
-
-			if leafUpdates > 10000 {
-				roots := localHypergraph.Commit()
-				logger.Info(
-					"hypergraph root commit",
-					zap.String("root", hex.EncodeToString(roots[0])),
-				)
-
-				if err = hypergraphStore.SaveHypergraph(localHypergraph); err != nil {
-					logger.Error("error while saving", zap.Error(err))
-				}
-
-				leafUpdates = 0
+			err := set.Add(theirs)
+			if err != nil {
+				logger.Error("error while saving", zap.Error(err))
+				break outer
 			}
+
+			lastReceived = time.Now()
 		case <-time.After(30 * time.Second):
-			if time.Since(lastReceived) > 30*time.Second {
-				if time.Since(manager.lastSent) > 30*time.Second {
-					break outer
-				}
+			if time.Since(lastReceived) > 30*time.Second &&
+				time.Since(manager.lastSent) > 30*time.Second {
+				break outer
 			}
 		}
 	}
@@ -1155,6 +1171,7 @@ func UnboundedChan[T any](purpose string) (chan<- T, <-chan T) {
 			select {
 			case msg, ok := <-in:
 				if !ok {
+					close(out)
 					return
 				}
 

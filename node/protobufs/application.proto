@@ -51,6 +51,11 @@ enum HypergraphPhaseSet {
   HYPERGRAPH_PHASE_SET_HYPEREDGE_REMOVES = 3;
 }
 
+message HypersyncMetadata {
+  uint64 leaves = 1;
+  bytes root_commitment = 2;
+}
+
 // Defines the request for comparison of hypergraph data
 message HypergraphComparisonQuery {
   // The shard to compare.

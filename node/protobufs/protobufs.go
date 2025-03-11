@@ -27,6 +27,7 @@ const (
 	ExecutionContextType         = AppPrefix + "ExecutionContext"
 	MessageType                  = AppPrefix + "Message"
 	IntrinsicExecutionOutputType = AppPrefix + "IntrinsicExecutionOutput"
+	HypersyncMetadataType        = AppPrefix + "HypersyncMetadata"
 	P2PChannelEnvelopeType       = ChannelPrefix + "P2PChannelEnvelope"
 	MessageCiphertextType        = ChannelPrefix + "MessageCiphertext"
 	ProvingKeyAnnouncementType   = ChannelPrefix + "ProvingKeyAnnouncement"

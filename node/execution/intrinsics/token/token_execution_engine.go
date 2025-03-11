@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"runtime"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,6 +25,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 
+	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/data"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
@@ -88,34 +90,43 @@ func (p PeerSeniorityItem) Priority() uint64 {
 }
 
 type TokenExecutionEngine struct {
-	ctx                   context.Context
-	cancel                context.CancelFunc
-	wg                    sync.WaitGroup
-	logger                *zap.Logger
-	clock                 *data.DataClockConsensusEngine
-	clockStore            store.ClockStore
-	hypergraphStore       store.HypergraphStore
-	coinStore             store.CoinStore
-	keyStore              store.KeyStore
-	keyManager            keys.KeyManager
-	engineConfig          *config.EngineConfig
-	pubSub                p2p.PubSub
-	peerIdHash            []byte
-	provingKey            crypto.Signer
-	proverPublicKey       []byte
-	provingKeyAddress     []byte
-	inclusionProver       qcrypto.InclusionProver
-	participantMx         sync.Mutex
-	peerChannels          map[string]*p2p.PublicP2PChannel
-	activeClockFrame      *protobufs.ClockFrame
-	alreadyPublishedShare bool
-	intrinsicFilter       []byte
-	frameProver           qcrypto.FrameProver
-	peerSeniority         *PeerSeniority
-	hypergraph            *hypergraph.Hypergraph
-	mpcithVerEnc          *qcrypto.MPCitHVerifiableEncryptor
-	syncController        *rpc.SyncController
-	grpcServers           []*grpc.Server
+	ctx                        context.Context
+	cancel                     context.CancelFunc
+	wg                         sync.WaitGroup
+	logger                     *zap.Logger
+	clock                      *data.DataClockConsensusEngine
+	clockStore                 store.ClockStore
+	hypergraphStore            store.HypergraphStore
+	coinStore                  store.CoinStore
+	keyStore                   store.KeyStore
+	keyManager                 keys.KeyManager
+	engineConfig               *config.EngineConfig
+	pubSub                     p2p.PubSub
+	peerIdHash                 []byte
+	provingKey                 crypto.Signer
+	proverPublicKey            []byte
+	provingKeyAddress          []byte
+	inclusionProver            qcrypto.InclusionProver
+	participantMx              sync.Mutex
+	peerChannels               map[string]*p2p.PublicP2PChannel
+	activeClockFrame           *protobufs.ClockFrame
+	alreadyPublishedShare      bool
+	intrinsicFilter            []byte
+	frameProver                qcrypto.FrameProver
+	peerSeniority              *PeerSeniority
+	hypergraph                 *hypergraph.Hypergraph
+	mpcithVerEnc               *qcrypto.MPCitHVerifiableEncryptor
+	syncController             *rpc.SyncController
+	grpcServers                []*grpc.Server
+	metadataMessageProcessorCh chan *pb.Message
+	syncTargetMap              map[string]syncInfo
+	syncTargetMx               sync.Mutex
+}
+
+type syncInfo struct {
+	peerId     []byte
+	leaves     uint64
+	commitment []byte
 }
 
 func NewTokenExecutionEngine(
@@ -236,25 +247,27 @@ func NewTokenExecutionEngine(
 
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &TokenExecutionEngine{
-		ctx:                   ctx,
-		cancel:                cancel,
-		logger:                logger,
-		engineConfig:          cfg.Engine,
-		keyManager:            keyManager,
-		clockStore:            clockStore,
-		coinStore:             coinStore,
-		hypergraphStore:       hypergraphStore,
-		keyStore:              keyStore,
-		pubSub:                pubSub,
-		inclusionProver:       inclusionProver,
-		frameProver:           frameProver,
-		participantMx:         sync.Mutex{},
-		peerChannels:          map[string]*p2p.PublicP2PChannel{},
-		alreadyPublishedShare: false,
-		intrinsicFilter:       intrinsicFilter,
-		peerSeniority:         NewFromMap(peerSeniority),
-		mpcithVerEnc:          mpcithVerEnc,
-		syncController:        rpc.NewSyncController(),
+		ctx:                        ctx,
+		cancel:                     cancel,
+		logger:                     logger,
+		engineConfig:               cfg.Engine,
+		keyManager:                 keyManager,
+		clockStore:                 clockStore,
+		coinStore:                  coinStore,
+		hypergraphStore:            hypergraphStore,
+		keyStore:                   keyStore,
+		pubSub:                     pubSub,
+		inclusionProver:            inclusionProver,
+		frameProver:                frameProver,
+		participantMx:              sync.Mutex{},
+		peerChannels:               map[string]*p2p.PublicP2PChannel{},
+		alreadyPublishedShare:      false,
+		intrinsicFilter:            intrinsicFilter,
+		peerSeniority:              NewFromMap(peerSeniority),
+		mpcithVerEnc:               mpcithVerEnc,
+		syncController:             rpc.NewSyncController(),
+		metadataMessageProcessorCh: make(chan *pb.Message, 65536),
+		syncTargetMap:              make(map[string]syncInfo),
 	}
 
 	alwaysSend := false
@@ -466,6 +479,15 @@ func NewTokenExecutionEngine(
 		e.syncController,
 		totalCoins,
 	)
+
+	hypersyncMetadataFilter := slices.Concat(
+		[]byte{0x00, 0x00, 0x00, 0x00, 0x00},
+		intrinsicFilter,
+	)
+	e.pubSub.Subscribe(hypersyncMetadataFilter, e.handleMetadataMessage)
+	e.wg.Add(1)
+	go e.runMetadataMessageHandler()
+
 	protobufs.RegisterHypergraphComparisonServiceServer(syncServer, hyperSync)
 	go func() {
 		if err := e.pubSub.StartDirectChannelListener(
@@ -484,6 +506,19 @@ func NewTokenExecutionEngine(
 			select {
 			case <-gotime.After(5 * gotime.Second):
 				e.hyperSync(totalCoins)
+			case <-e.ctx.Done():
+				return
+			}
+		}
+	}()
+
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		for {
+			select {
+			case <-gotime.After(5 * gotime.Minute):
+				e.publishSyncInfo()
 			case <-e.ctx.Done():
 				return
 			}
@@ -553,6 +588,86 @@ func NewTokenExecutionEngine(
 }
 
 var _ execution.ExecutionEngine = (*TokenExecutionEngine)(nil)
+
+func (e *TokenExecutionEngine) handleMetadataMessage(
+	message *pb.Message,
+) error {
+	select {
+	case <-e.ctx.Done():
+		return e.ctx.Err()
+	case e.metadataMessageProcessorCh <- message:
+	default:
+		e.logger.Warn("dropping metadata message")
+	}
+	return nil
+}
+
+func (e *TokenExecutionEngine) runMetadataMessageHandler() {
+	defer e.wg.Done()
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case message := <-e.metadataMessageProcessorCh:
+			e.logger.Debug("handling metadata message")
+			msg := &protobufs.Message{}
+
+			if err := proto.Unmarshal(message.Data, msg); err != nil {
+				e.logger.Debug("could not unmarshal data", zap.Error(err))
+				continue
+			}
+
+			a := &anypb.Any{}
+			if err := proto.Unmarshal(msg.Payload, a); err != nil {
+				e.logger.Debug("could not unmarshal payload", zap.Error(err))
+				continue
+			}
+
+			switch a.TypeUrl {
+			case protobufs.HypersyncMetadataType:
+				if err := e.handleMetadata(
+					message.From,
+					msg.Address,
+					a,
+				); err != nil {
+					e.logger.Debug("could not handle metadata", zap.Error(err))
+				}
+			}
+		}
+	}
+}
+
+func (e *TokenExecutionEngine) handleMetadata(
+	peerID []byte,
+	address []byte,
+	a *anypb.Any,
+) error {
+	if bytes.Equal(peerID, e.pubSub.GetPeerID()) {
+		return nil
+	}
+
+	metadata := &protobufs.HypersyncMetadata{}
+	if err := a.UnmarshalTo(metadata); err != nil {
+		return errors.Wrap(err, "handle metadata")
+	}
+
+	e.logger.Info(
+		"received sync info from peer",
+		zap.String("peer_id", peer.ID(peerID).String()),
+		zap.Uint64("vertices", metadata.Leaves),
+		zap.Binary("root_commitment", metadata.RootCommitment),
+	)
+
+	e.syncTargetMx.Lock()
+	e.syncTargetMap[string(peerID)] = syncInfo{
+		peerId:     peerID,
+		leaves:     metadata.Leaves,
+		commitment: metadata.RootCommitment,
+	}
+	e.syncTargetMx.Unlock()
+
+	return nil
+}
 
 func (e *TokenExecutionEngine) addBatchToHypergraph(batchKey [][]byte, batchValue [][]byte) {
 	var wg sync.WaitGroup
@@ -649,72 +764,111 @@ func (e *TokenExecutionEngine) addBatchToHypergraph(batchKey [][]byte, batchValu
 	}
 }
 
+func (e *TokenExecutionEngine) publishSyncInfo() {
+	if !e.syncController.TryEstablishSyncSession() {
+		return
+	}
+	defer e.syncController.EndSyncSession()
+	for _, vertices := range e.hypergraph.GetVertexAdds() {
+		leaves, _ := vertices.GetTree().GetMetadata()
+		rootCommitment := vertices.GetTree().Commit(false)
+		metadataFilter := slices.Concat(
+			[]byte{0x00, 0x00, 0x00, 0x00, 0x00},
+			e.intrinsicFilter,
+		)
+		e.publishMessage(metadataFilter, &protobufs.HypersyncMetadata{
+			Leaves:         uint64(leaves),
+			RootCommitment: rootCommitment,
+		})
+		break
+	}
+}
+
 func (e *TokenExecutionEngine) hyperSync(totalCoins int) {
 	if !e.syncController.TryEstablishSyncSession() {
 		return
 	}
 	defer e.syncController.EndSyncSession()
 
-	var peerId []byte = nil
-	for peerId == nil {
-		var err error
-		peerId, err = e.pubSub.GetRandomPeer(
-			append([]byte{0x00}, e.intrinsicFilter...),
-		)
-		if err != nil {
-			e.logger.Error("error getting peer", zap.Error(err))
-			return
-		}
-
-		info, ok := e.syncController.SyncStatus[peer.ID(peerId).String()]
-		if ok {
-			if info.Unreachable || gotime.Since(info.LastSynced) < 30*gotime.Minute {
-				peerId = nil
-				continue
-			}
+	peers := []syncInfo{}
+	e.syncTargetMx.Lock()
+	for peerId, target := range e.syncTargetMap {
+		if !bytes.Equal([]byte(peerId), e.pubSub.GetPeerID()) {
+			peers = append(peers, target)
 		}
 	}
+	e.syncTargetMx.Unlock()
 
-	e.logger.Info(
-		"syncing hypergraph with peer",
-		zap.String("peer", peer.ID(peerId).String()),
-	)
-	syncTimeout := e.engineConfig.SyncTimeout
-	dialCtx, cancelDial := context.WithTimeout(e.ctx, syncTimeout)
-	defer cancelDial()
-	cc, err := e.pubSub.GetDirectChannel(dialCtx, peerId, "hypersync")
-	if err != nil {
-		e.logger.Info(
-			"could not establish direct channel",
-			zap.Error(err),
-		)
-		e.syncController.SyncStatus[peer.ID(peerId).String()] = &rpc.SyncInfo{
-			Unreachable: true,
-			LastSynced:  gotime.Now(),
-		}
-		return
-	}
-	defer func() {
-		if err := cc.Close(); err != nil {
-			e.logger.Error("error while closing connection", zap.Error(err))
-		}
-	}()
-
-	client := protobufs.NewHypergraphComparisonServiceClient(cc)
-
-	stream, err := client.HyperStream(e.ctx)
-	if err != nil {
-		e.logger.Error("could not open stream", zap.Error(err))
-		e.syncController.SyncStatus[peer.ID(peerId).String()] = &rpc.SyncInfo{
-			Unreachable: true,
-			LastSynced:  gotime.Now(),
-		}
-		return
-	}
+	sort.Slice(peers, func(i, j int) bool {
+		return peers[i].leaves < peers[j].leaves
+	})
 
 	sets := e.hypergraph.GetVertexAdds()
 	for key, set := range sets {
-		err := rpc.SyncTreeBidirectionally(
+		var peerId []byte = nil
+		for peerId == nil {
+			if len(peers) == 0 {
+				e.logger.Info("no available peers for sync")
+				return
+			}
+
+			metadataInfo := peers[0]
+
+			if bytes.Equal(metadataInfo.commitment, set.GetTree().Commit(false)) {
+				peers = peers[1:]
+				continue
+			}
+
+			peerId = metadataInfo.peerId
+
+			info, ok := e.syncController.SyncStatus[peer.ID(peerId).String()]
+			if ok {
+				if info.Unreachable || gotime.Since(info.LastSynced) < 30*gotime.Minute {
+					peers = peers[1:]
+					peerId = nil
+					continue
+				}
+			}
+		}
+
+		e.logger.Info(
+			"syncing hypergraph with peer",
+			zap.String("peer", peer.ID(peerId).String()),
+		)
+		syncTimeout := e.engineConfig.SyncTimeout
+		dialCtx, cancelDial := context.WithTimeout(e.ctx, syncTimeout)
+		defer cancelDial()
+		cc, err := e.pubSub.GetDirectChannel(dialCtx, peerId, "hypersync")
+		if err != nil {
+			e.logger.Info(
+				"could not establish direct channel",
+				zap.Error(err),
+			)
+			e.syncController.SyncStatus[peer.ID(peerId).String()] = &rpc.SyncInfo{
+				Unreachable: true,
+				LastSynced:  gotime.Now(),
+			}
+			return
+		}
+		defer func() {
+			if err := cc.Close(); err != nil {
+				e.logger.Error("error while closing connection", zap.Error(err))
+			}
+		}()
+
+		client := protobufs.NewHypergraphComparisonServiceClient(cc)
+
+		stream, err := client.HyperStream(e.ctx)
+		if err != nil {
+			e.logger.Error("could not open stream", zap.Error(err))
+			e.syncController.SyncStatus[peer.ID(peerId).String()] = &rpc.SyncInfo{
+				Unreachable: true,
+				LastSynced:  gotime.Now(),
+			}
+			return
+		}
+
+		err = rpc.SyncTreeBidirectionally(
 			stream,
 			e.logger,
 			append(append([]byte{}, key.L1[:]...), key.L2[:]...),
@@ -726,6 +880,18 @@ func (e *TokenExecutionEngine) hyperSync(totalCoins int) {
 			totalCoins,
 			false,
 		)
+
+		metadataFilter := slices.Concat(
+			[]byte{0x00, 0x00, 0x00, 0x00, 0x00},
+			e.intrinsicFilter,
+		)
+		rootCommitment := set.GetTree().Commit(false)
+		leaves, _ := set.GetTree().GetMetadata()
+		e.publishMessage(metadataFilter, &protobufs.HypersyncMetadata{
+			Leaves:         uint64(leaves),
+			RootCommitment: rootCommitment,
+		})
+
 		if err != nil {
 			e.logger.Error("error while synchronizing", zap.Error(err))
 			if !strings.Contains(err.Error(), "unavailable") {
@@ -734,8 +900,8 @@ func (e *TokenExecutionEngine) hyperSync(totalCoins int) {
 					LastSynced:  gotime.Now(),
 				}
 			}
-			continue
 		}
+		break
 	}
 
 	roots := e.hypergraph.Commit()
@@ -744,7 +910,7 @@ func (e *TokenExecutionEngine) hyperSync(totalCoins int) {
 		zap.String("root", hex.EncodeToString(roots[0])),
 	)
 
-	if err = e.hypergraphStore.SaveHypergraph(e.hypergraph); err != nil {
+	if err := e.hypergraphStore.SaveHypergraph(e.hypergraph); err != nil {
 		e.logger.Error("error while saving", zap.Error(err))
 	}
 }
