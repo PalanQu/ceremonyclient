@@ -142,6 +142,16 @@ var (
 		false,
 		"compacts the database and exits",
 	)
+	strictSyncServer = flag.String(
+		"strict-sync-server",
+		"",
+		"runs only a server to listen for hypersync requests, uses multiaddr format (e.g. /ip4/0.0.0.0/tcp/8339)",
+	)
+	strictSyncClient = flag.String(
+		"strict-sync-client",
+		"",
+		"runs only a client to connect to a server listening for hypersync requests, uses multiaddr format (e.g. /ip4/127.0.0.1/tcp/8339)",
+	)
 )
 
 func signatureCheckDefault() bool {
@@ -493,8 +503,27 @@ func main() {
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
 	var node *app.Node
-	if *debug {
+	if *debug && *strictSyncServer == "" && *strictSyncClient == "" {
 		node, err = app.NewDebugNode(nodeConfig, report)
+	} else if *strictSyncServer != "" {
+		fmt.Println("Running in strict sync server mode, will not connect to regular p2p network...")
+
+		node, err = app.NewStrictSyncNode(
+			nodeConfig,
+			report,
+			rpc.NewStandaloneHypersyncServer(
+				nodeConfig.DB,
+				*strictSyncServer,
+			),
+		)
+	} else if *strictSyncClient != "" {
+		fmt.Println("Running in strict sync client mode, will not connect to regular p2p network...")
+
+		node, err = app.NewStrictSyncNode(
+			nodeConfig,
+			report,
+			rpc.NewStandaloneHypersyncClient(nodeConfig.DB, *strictSyncClient, done),
+		)
 	} else {
 		node, err = app.NewNode(nodeConfig, report)
 	}
@@ -515,7 +544,8 @@ func main() {
 	node.Start()
 	defer node.Stop()
 
-	if nodeConfig.ListenGRPCMultiaddr != "" {
+	if nodeConfig.ListenGRPCMultiaddr != "" && *strictSyncServer == "" &&
+		*strictSyncClient == "" {
 		srv, err := rpc.NewRPCServer(
 			nodeConfig.ListenGRPCMultiaddr,
 			nodeConfig.ListenRestMultiaddr,

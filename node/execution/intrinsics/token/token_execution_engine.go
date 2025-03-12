@@ -478,6 +478,7 @@ func NewTokenExecutionEngine(
 		e.hypergraph,
 		e.syncController,
 		totalCoins,
+		false,
 	)
 
 	hypersyncMetadataFilter := slices.Concat(

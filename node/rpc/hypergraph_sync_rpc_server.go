@@ -7,19 +7,247 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multiaddr"
+	mn "github.com/multiformats/go-multiaddr/net"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	gogrpc "google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"source.quilibrium.com/quilibrium/monorepo/node/config"
 	"source.quilibrium.com/quilibrium/monorepo/node/crypto"
 	hypergraph "source.quilibrium.com/quilibrium/monorepo/node/hypergraph/application"
 	"source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
+
+type Synchronizer interface {
+	Start(*zap.Logger, store.KVDB)
+	Stop()
+}
+
+type StandaloneHypersyncServer struct {
+	listenAddr multiaddr.Multiaddr
+	dbConfig   *config.DBConfig
+	grpcServer *gogrpc.Server
+	quit       chan struct{}
+}
+
+type StandaloneHypersyncClient struct {
+	serverAddr multiaddr.Multiaddr
+	dbConfig   *config.DBConfig
+	done       chan os.Signal
+}
+
+func NewStandaloneHypersyncServer(
+	dbConfig *config.DBConfig,
+	strictSyncServer string,
+) Synchronizer {
+	listenAddr, err := multiaddr.NewMultiaddr(strictSyncServer)
+	if err != nil {
+		panic(err)
+	}
+
+	return &StandaloneHypersyncServer{
+		dbConfig:   dbConfig,
+		listenAddr: listenAddr,
+		quit:       make(chan struct{}),
+	}
+}
+
+func NewStandaloneHypersyncClient(
+	dbConfig *config.DBConfig,
+	strictSyncClient string,
+	done chan os.Signal,
+) Synchronizer {
+	serverAddr, err := multiaddr.NewMultiaddr(strictSyncClient)
+	if err != nil {
+		panic(err)
+	}
+
+	return &StandaloneHypersyncClient{
+		dbConfig:   dbConfig,
+		serverAddr: serverAddr,
+		done:       done,
+	}
+}
+
+func (s *StandaloneHypersyncServer) Start(
+	logger *zap.Logger,
+	db store.KVDB,
+) {
+	lis, err := mn.Listen(s.listenAddr)
+	if err != nil {
+		panic(err)
+	}
+
+	s.grpcServer = grpc.NewServer(
+		gogrpc.MaxRecvMsgSize(600*1024*1024),
+		gogrpc.MaxSendMsgSize(600*1024*1024),
+	)
+
+	hypergraphStore := store.NewPebbleHypergraphStore(s.dbConfig, db, logger)
+	hypergraph, err := hypergraphStore.LoadHypergraph()
+	if err != nil {
+		panic(err)
+	}
+
+	totalCoins := 0
+
+	coinStore := store.NewPebbleCoinStore(db, logger)
+
+	iter, err := coinStore.RangeCoins(
+		[]byte{0x00},
+		[]byte{0xff},
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		totalCoins++
+	}
+	iter.Close()
+
+	server := NewHypergraphComparisonServer(
+		logger,
+		hypergraphStore,
+		hypergraph,
+		NewSyncController(),
+		totalCoins,
+		true,
+	)
+	protobufs.RegisterHypergraphComparisonServiceServer(
+		s.grpcServer,
+		server,
+	)
+
+	go func() {
+		if err := s.grpcServer.Serve(mn.NetListener(lis)); err != nil {
+			logger.Error("serve error", zap.Error(err))
+		}
+	}()
+	<-s.quit
+}
+
+func (s *StandaloneHypersyncServer) Stop() {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.grpcServer.GracefulStop()
+	}()
+	wg.Wait()
+	s.quit <- struct{}{}
+}
+
+func (s *StandaloneHypersyncClient) Start(
+	logger *zap.Logger,
+	db store.KVDB,
+) {
+	hypergraphStore := store.NewPebbleHypergraphStore(s.dbConfig, db, logger)
+	hypergraph, err := hypergraphStore.LoadHypergraph()
+	if err != nil {
+		panic(err)
+	}
+
+	totalCoins := 0
+
+	coinStore := store.NewPebbleCoinStore(db, logger)
+
+	iter, err := coinStore.RangeCoins(
+		[]byte{0x00},
+		[]byte{0xff},
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	for iter.First(); iter.Valid(); iter.Next() {
+		totalCoins++
+	}
+	iter.Close()
+
+	sets := hypergraph.GetVertexAdds()
+	for key, set := range sets {
+		dialCtx, cancelDial := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelDial()
+
+		_, addr, err := mn.DialArgs(s.serverAddr)
+		if err != nil {
+			panic(err)
+		}
+		credentials := insecure.NewCredentials()
+
+		cc, err := gogrpc.DialContext(
+			dialCtx,
+			addr,
+			gogrpc.WithTransportCredentials(
+				credentials,
+			),
+			gogrpc.WithDefaultCallOptions(
+				gogrpc.MaxCallSendMsgSize(600*1024*1024),
+				gogrpc.MaxCallRecvMsgSize(600*1024*1024),
+			),
+		)
+		if err != nil {
+			panic(err)
+		}
+
+		client := protobufs.NewHypergraphComparisonServiceClient(cc)
+
+		stream, err := client.HyperStream(context.Background())
+		if err != nil {
+			logger.Error("could not open stream", zap.Error(err))
+			return
+		}
+
+		err = SyncTreeBidirectionally(
+			stream,
+			logger,
+			append(append([]byte{}, key.L1[:]...), key.L2[:]...),
+			protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS,
+			hypergraphStore,
+			hypergraph,
+			set,
+			NewSyncController(),
+			totalCoins,
+			false,
+		)
+
+		if err != nil {
+			logger.Error("error while synchronizing", zap.Error(err))
+		}
+		if err := cc.Close(); err != nil {
+			logger.Error("error while closing connection", zap.Error(err))
+		}
+		break
+	}
+
+	roots := hypergraph.Commit()
+	logger.Info(
+		"hypergraph root commit",
+		zap.String("root", hex.EncodeToString(roots[0])),
+	)
+
+	logger.Info("saving hypergraph")
+	if err := hypergraphStore.SaveHypergraph(hypergraph); err != nil {
+		logger.Error("error while saving", zap.Error(err))
+	}
+	logger.Info("hypergraph saved")
+	s.done <- syscall.SIGINT
+}
+
+func (s *StandaloneHypersyncClient) Stop() {
+}
 
 type SyncController struct {
 	isSyncing  atomic.Bool
@@ -49,7 +277,7 @@ func NewSyncController() *SyncController {
 // hypergraphComparisonServer implements the bidirectional sync service.
 type hypergraphComparisonServer struct {
 	protobufs.UnimplementedHypergraphComparisonServiceServer
-
+	isDetachedServer     bool
 	logger               *zap.Logger
 	localHypergraphStore store.HypergraphStore
 	localHypergraph      *hypergraph.Hypergraph
@@ -63,8 +291,10 @@ func NewHypergraphComparisonServer(
 	hypergraph *hypergraph.Hypergraph,
 	syncController *SyncController,
 	debugTotalCoins int,
+	isDetachedServer bool,
 ) *hypergraphComparisonServer {
 	return &hypergraphComparisonServer{
+		isDetachedServer:     isDetachedServer,
 		logger:               logger,
 		localHypergraphStore: hypergraphStore,
 		localHypergraph:      hypergraph,
@@ -75,6 +305,7 @@ func NewHypergraphComparisonServer(
 
 type streamManager struct {
 	ctx             context.Context
+	cancel          context.CancelFunc
 	logger          *zap.Logger
 	stream          HyperStream
 	hypergraphStore store.HypergraphStore
@@ -133,6 +364,12 @@ func (s *streamManager) sendLeafData(
 		return nil
 	}
 
+	select {
+	case <-s.ctx.Done():
+		return s.ctx.Err()
+	default:
+	}
+
 	node := getNodeAtPath(s.localTree.Root, path, 0)
 	leaf, ok := node.(*crypto.VectorCommitmentLeafNode)
 	if !ok {
@@ -142,7 +379,7 @@ func (s *streamManager) sendLeafData(
 				continue
 			}
 			s.leavesSent++
-			if s.leavesSent > 50000 {
+			if s.leavesSent > 100000 {
 				return nil
 			}
 
@@ -431,7 +668,7 @@ func (s *streamManager) walk(
 	incomingResponses <-chan *protobufs.HypergraphComparisonResponse,
 	metadataOnly bool,
 ) error {
-	if s.leavesSent > 50000 {
+	if s.leavesSent > 100000 {
 		return nil
 	}
 
@@ -752,18 +989,30 @@ func syncTreeBidirectionallyServer(
 		)
 	}
 
+	ctx, cancel := context.WithCancel(stream.Context())
+
 	incomingQueriesIn, incomingQueriesOut :=
-		UnboundedChan[*protobufs.HypergraphComparisonQuery]("server incoming")
+		UnboundedChan[*protobufs.HypergraphComparisonQuery](
+			cancel,
+			"server incoming",
+		)
 	incomingResponsesIn, incomingResponsesOut :=
-		UnboundedChan[*protobufs.HypergraphComparisonResponse]("server incoming")
+		UnboundedChan[*protobufs.HypergraphComparisonResponse](
+			cancel,
+			"server incoming",
+		)
 	incomingLeavesIn, incomingLeavesOut :=
-		UnboundedChan[*protobufs.LeafData]("server incoming")
+		UnboundedChan[*protobufs.LeafData](
+			cancel,
+			"server incoming",
+		)
 
 	go func() {
 		for {
 			msg, err := stream.Recv()
 			if err == io.EOF {
 				logger.Info("received disconnect")
+				cancel()
 				close(incomingQueriesIn)
 				close(incomingResponsesIn)
 				close(incomingLeavesIn)
@@ -771,6 +1020,7 @@ func syncTreeBidirectionallyServer(
 			}
 			if err != nil {
 				logger.Info("received error", zap.Error(err))
+				cancel()
 				close(incomingQueriesIn)
 				close(incomingResponsesIn)
 				close(incomingLeavesIn)
@@ -794,7 +1044,8 @@ func syncTreeBidirectionallyServer(
 	wg.Add(1)
 
 	manager := &streamManager{
-		ctx:             stream.Context(),
+		ctx:             ctx,
+		cancel:          cancel,
 		logger:          logger,
 		stream:          stream,
 		hypergraphStore: localHypergraphStore,
@@ -827,7 +1078,7 @@ outer:
 				break outer
 			}
 			leavesReceived++
-			if leavesReceived > 50000 {
+			if leavesReceived > 100000 {
 				break outer
 			}
 
@@ -898,13 +1149,15 @@ outer:
 		zap.String("root", hex.EncodeToString(roots[0])),
 	)
 
+	logger.Info("saving hypergraph")
 	if err = localHypergraphStore.SaveHypergraph(localHypergraph); err != nil {
 		logger.Error("error while saving", zap.Error(err))
 	}
+	logger.Info("hypergraph saved")
 
 	total, _ := idSet.GetTree().GetMetadata()
 	logger.Info(
-		"current progress",
+		"current progress, ready to resume connections",
 		zap.Float32("percentage", float32(total*100)/float32(debugTotalCoins)),
 	)
 	return nil
@@ -919,14 +1172,18 @@ func (s *hypergraphComparisonServer) HyperStream(
 	}
 	defer s.syncController.EndSyncSession()
 
-	peerId, ok := grpc.PeerIDFromContext(stream.Context())
-	if !ok {
-		return errors.New("could not identify peer")
-	}
+	var peerId peer.ID
+	var ok bool
+	if !s.isDetachedServer {
+		peerId, ok = grpc.PeerIDFromContext(stream.Context())
+		if !ok {
+			return errors.New("could not identify peer")
+		}
 
-	status, ok := s.syncController.SyncStatus[peerId.String()]
-	if ok && time.Since(status.LastSynced) < 30*time.Minute {
-		return errors.New("peer too recently synced")
+		status, ok := s.syncController.SyncStatus[peerId.String()]
+		if ok && time.Since(status.LastSynced) < 30*time.Minute {
+			return errors.New("peer too recently synced")
+		}
 	}
 
 	err := syncTreeBidirectionallyServer(
@@ -937,9 +1194,12 @@ func (s *hypergraphComparisonServer) HyperStream(
 		false,
 		s.debugTotalCoins,
 	)
-	s.syncController.SyncStatus[peerId.String()] = &SyncInfo{
-		Unreachable: false,
-		LastSynced:  time.Now(),
+
+	if !s.isDetachedServer {
+		s.syncController.SyncStatus[peerId.String()] = &SyncInfo{
+			Unreachable: false,
+			LastSynced:  time.Now(),
+		}
 	}
 
 	return err
@@ -1008,23 +1268,36 @@ func SyncTreeBidirectionally(
 		return err
 	}
 
+	ctx, cancel := context.WithCancel(stream.Context())
+
 	incomingQueriesIn, incomingQueriesOut :=
-		UnboundedChan[*protobufs.HypergraphComparisonQuery]("server incoming")
+		UnboundedChan[*protobufs.HypergraphComparisonQuery](
+			cancel,
+			"client incoming",
+		)
 	incomingResponsesIn, incomingResponsesOut :=
-		UnboundedChan[*protobufs.HypergraphComparisonResponse]("server incoming")
+		UnboundedChan[*protobufs.HypergraphComparisonResponse](
+			cancel,
+			"client incoming",
+		)
 	incomingLeavesIn, incomingLeavesOut :=
-		UnboundedChan[*protobufs.LeafData]("server incoming")
+		UnboundedChan[*protobufs.LeafData](
+			cancel,
+			"client incoming",
+		)
 
 	go func() {
 		for {
 			msg, err := stream.Recv()
 			if err == io.EOF {
+				cancel()
 				close(incomingQueriesIn)
 				close(incomingResponsesIn)
 				close(incomingLeavesIn)
 				return
 			}
 			if err != nil {
+				cancel()
 				close(incomingQueriesIn)
 				close(incomingResponsesIn)
 				close(incomingLeavesIn)
@@ -1048,7 +1321,8 @@ func SyncTreeBidirectionally(
 	wg.Add(1)
 
 	manager := &streamManager{
-		ctx:             stream.Context(),
+		ctx:             ctx,
+		cancel:          cancel,
 		logger:          logger,
 		stream:          stream,
 		hypergraphStore: hypergraphStore,
@@ -1083,7 +1357,7 @@ outer:
 			}
 
 			leavesReceived++
-			if leavesReceived > 50000 {
+			if leavesReceived > 100000 {
 				break outer
 			}
 
@@ -1156,7 +1430,10 @@ outer:
 	return nil
 }
 
-func UnboundedChan[T any](purpose string) (chan<- T, <-chan T) {
+func UnboundedChan[T any](
+	cancel context.CancelFunc,
+	purpose string,
+) (chan<- T, <-chan T) {
 	in := make(chan T)
 	out := make(chan T)
 	go func() {
@@ -1171,6 +1448,7 @@ func UnboundedChan[T any](purpose string) (chan<- T, <-chan T) {
 			select {
 			case msg, ok := <-in:
 				if !ok {
+					cancel()
 					close(out)
 					return
 				}

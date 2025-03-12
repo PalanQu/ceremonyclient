@@ -15,10 +15,19 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
+	"source.quilibrium.com/quilibrium/monorepo/node/rpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
 
+type NodeMode string
+
+const (
+	NormalNodeMode     = NodeMode("normal")
+	StrictSyncNodeMode = NodeMode("strict-sync")
+)
+
 type Node struct {
+	mode           NodeMode
 	logger         *zap.Logger
 	dataProofStore store.DataProofStore
 	clockStore     store.ClockStore
@@ -28,6 +37,7 @@ type Node struct {
 	execEngines    map[string]execution.ExecutionEngine
 	engine         consensus.ConsensusEngine
 	pebble         store.KVDB
+	synchronizer   rpc.Synchronizer
 }
 
 type DHTNode struct {
@@ -41,6 +51,27 @@ func newDHTNode(
 	return &DHTNode{
 		pubSub: pubSub,
 		quit:   make(chan struct{}),
+	}, nil
+}
+
+func newStrictSyncNode(
+	logger *zap.Logger,
+	dataProofStore store.DataProofStore,
+	clockStore store.ClockStore,
+	coinStore store.CoinStore,
+	keyManager keys.KeyManager,
+	pebble store.KVDB,
+	synchronizer rpc.Synchronizer,
+) (*Node, error) {
+	return &Node{
+		mode:           StrictSyncNodeMode,
+		logger:         logger,
+		dataProofStore: dataProofStore,
+		clockStore:     clockStore,
+		coinStore:      coinStore,
+		keyManager:     keyManager,
+		pebble:         pebble,
+		synchronizer:   synchronizer,
 	}, nil
 }
 
@@ -65,15 +96,17 @@ func newNode(
 	}
 
 	return &Node{
-		logger,
-		dataProofStore,
-		clockStore,
-		coinStore,
-		keyManager,
-		pubSub,
-		execEngines,
-		engine,
-		pebble,
+		mode:           NormalNodeMode,
+		logger:         logger,
+		dataProofStore: dataProofStore,
+		clockStore:     clockStore,
+		coinStore:      coinStore,
+		keyManager:     keyManager,
+		pubSub:         pubSub,
+		execEngines:    execEngines,
+		engine:         engine,
+		pebble:         pebble,
+		synchronizer:   nil,
 	}, nil
 }
 
@@ -157,29 +190,39 @@ func (d *DHTNode) Stop() {
 }
 
 func (n *Node) Start() {
-	err := <-n.engine.Start()
-	if err != nil {
-		panic(err)
-	}
+	switch n.mode {
+	case NormalNodeMode:
+		err := <-n.engine.Start()
+		if err != nil {
+			panic(err)
+		}
 
-	// TODO: add config mapping to engine name/frame registration
-	wg := sync.WaitGroup{}
-	for _, e := range n.execEngines {
-		wg.Add(1)
-		go func(e execution.ExecutionEngine) {
-			defer wg.Done()
-			if err := <-n.engine.RegisterExecutor(e, 0); err != nil {
-				panic(err)
-			}
-		}(e)
+		// TODO: add config mapping to engine name/frame registration
+		wg := sync.WaitGroup{}
+		for _, e := range n.execEngines {
+			wg.Add(1)
+			go func(e execution.ExecutionEngine) {
+				defer wg.Done()
+				if err := <-n.engine.RegisterExecutor(e, 0); err != nil {
+					panic(err)
+				}
+			}(e)
+		}
+		wg.Wait()
+	case StrictSyncNodeMode:
+		go n.synchronizer.Start(n.logger, n.pebble)
 	}
-	wg.Wait()
 }
 
 func (n *Node) Stop() {
-	err := <-n.engine.Stop(false)
-	if err != nil {
-		panic(err)
+	switch n.mode {
+	case NormalNodeMode:
+		err := <-n.engine.Stop(false)
+		if err != nil {
+			panic(err)
+		}
+	case StrictSyncNodeMode:
+		n.synchronizer.Stop()
 	}
 
 	n.pebble.Close()

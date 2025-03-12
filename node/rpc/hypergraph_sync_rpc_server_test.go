@@ -253,7 +253,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 	)
 	protobufs.RegisterHypergraphComparisonServiceServer(
 		grpcServer,
-		rpc.NewHypergraphComparisonServer(logger, serverHypergraphStore, crdts[0], rpc.NewSyncController(), numOperations),
+		rpc.NewHypergraphComparisonServer(logger, serverHypergraphStore, crdts[0], rpc.NewSyncController(), numOperations, false),
 	)
 	log.Println("Server listening on :50051")
 	go func() {

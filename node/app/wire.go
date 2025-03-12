@@ -15,6 +15,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/node/rpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
 )
 
@@ -110,6 +111,15 @@ func NewDebugNode(*config.Config, *protobufs.SelfTestReport) (*Node, error) {
 		engineSet,
 		consensusSet,
 		newNode,
+	))
+}
+
+func NewStrictSyncNode(*config.Config, *protobufs.SelfTestReport, rpc.Synchronizer) (*Node, error) {
+	panic(wire.Build(
+		loggerSet,
+		keyManagerSet,
+		storeSet,
+		newStrictSyncNode,
 	))
 }
 
