@@ -310,7 +310,6 @@ type streamManager struct {
 	stream          HyperStream
 	hypergraphStore store.HypergraphStore
 	localTree       *crypto.VectorCommitmentTree
-	leavesSent      int
 	lastSent        time.Time
 }
 
@@ -377,10 +376,6 @@ func (s *streamManager) sendLeafData(
 		for _, child := range children {
 			if child == nil {
 				continue
-			}
-			s.leavesSent++
-			if s.leavesSent > 100000 {
-				return nil
 			}
 
 			if err := send(child); err != nil {
@@ -668,10 +663,6 @@ func (s *streamManager) walk(
 	incomingResponses <-chan *protobufs.HypergraphComparisonResponse,
 	metadataOnly bool,
 ) error {
-	if s.leavesSent > 100000 {
-		return nil
-	}
-
 	select {
 	case <-s.ctx.Done():
 		return s.ctx.Err()
@@ -1068,17 +1059,12 @@ func syncTreeBidirectionallyServer(
 	}()
 
 	lastReceived := time.Now()
-	leavesReceived := 0
 
 outer:
 	for {
 		select {
 		case remoteUpdate, ok := <-incomingLeavesOut:
 			if !ok {
-				break outer
-			}
-			leavesReceived++
-			if leavesReceived > 100000 {
 				break outer
 			}
 
@@ -1088,15 +1074,6 @@ outer:
 			)
 
 			theirs := hypergraph.AtomFromBytes(remoteUpdate.Value)
-
-			ours, _ := idSet.GetTree().Get(remoteUpdate.Key)
-			if ours != nil {
-				ourCommit := hypergraph.AtomFromBytes(ours).Commit()
-				theirCommit := theirs.Commit()
-				if bytes.Compare(ourCommit, theirCommit) < 0 {
-					continue
-				}
-			}
 
 			if len(remoteUpdate.UnderlyingData) != 0 {
 				txn, err := localHypergraphStore.NewTransaction(false)
@@ -1346,7 +1323,6 @@ func SyncTreeBidirectionally(
 	}()
 
 	lastReceived := time.Now()
-	leavesReceived := 0
 
 outer:
 	for {
@@ -1356,26 +1332,12 @@ outer:
 				break outer
 			}
 
-			leavesReceived++
-			if leavesReceived > 100000 {
-				break outer
-			}
-
 			logger.Info(
 				"received leaf data",
 				zap.String("key", hex.EncodeToString(remoteUpdate.Key)),
 			)
 
 			theirs := hypergraph.AtomFromBytes(remoteUpdate.Value)
-
-			ours, _ := set.GetTree().Get(remoteUpdate.Key)
-			if ours != nil {
-				ourCommit := hypergraph.AtomFromBytes(ours).Commit()
-				theirCommit := theirs.Commit()
-				if bytes.Compare(ourCommit, theirCommit) < 0 {
-					continue
-				}
-			}
 
 			if len(remoteUpdate.UnderlyingData) != 0 {
 				txn, err := hypergraphStore.NewTransaction(false)
