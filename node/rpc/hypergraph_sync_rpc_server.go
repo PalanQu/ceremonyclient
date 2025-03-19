@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -238,11 +239,6 @@ func (s *StandaloneHypersyncClient) Start(
 		zap.String("root", hex.EncodeToString(roots[0])),
 	)
 
-	logger.Info("saving hypergraph")
-	if err := hypergraphStore.SaveHypergraph(hypergraph); err != nil {
-		logger.Error("error while saving", zap.Error(err))
-	}
-	logger.Info("hypergraph saved")
 	s.done <- syscall.SIGINT
 }
 
@@ -309,7 +305,7 @@ type streamManager struct {
 	logger          *zap.Logger
 	stream          HyperStream
 	hypergraphStore store.HypergraphStore
-	localTree       *crypto.VectorCommitmentTree
+	localTree       *crypto.LazyVectorCommitmentTree
 	lastSent        time.Time
 }
 
@@ -319,7 +315,7 @@ func (s *streamManager) sendLeafData(
 	path []int32,
 	metadataOnly bool,
 ) error {
-	send := func(leaf *crypto.VectorCommitmentLeafNode) error {
+	send := func(leaf *crypto.LazyVectorCommitmentLeafNode) error {
 		update := &protobufs.LeafData{
 			Key:        leaf.Key,
 			Value:      leaf.Value,
@@ -369,10 +365,22 @@ func (s *streamManager) sendLeafData(
 	default:
 	}
 
-	node := getNodeAtPath(s.localTree.Root, path, 0)
-	leaf, ok := node.(*crypto.VectorCommitmentLeafNode)
+	node := getNodeAtPath(
+		s.localTree.SetType,
+		s.localTree.PhaseType,
+		s.localTree.ShardKey,
+		s.localTree.Root,
+		path,
+		0,
+	)
+	leaf, ok := node.(*crypto.LazyVectorCommitmentLeafNode)
 	if !ok {
-		children := crypto.GetAllLeaves(node)
+		children := crypto.GetAllLeaves(
+			s.localTree.SetType,
+			s.localTree.PhaseType,
+			s.localTree.ShardKey,
+			node,
+		)
 		for _, child := range children {
 			if child == nil {
 				continue
@@ -393,10 +401,13 @@ func (s *streamManager) sendLeafData(
 // the node found (or nil if not found). The depth argument is used for internal
 // recursion.
 func getNodeAtPath(
-	node crypto.VectorCommitmentNode,
+	setType string,
+	phaseType string,
+	shardKey crypto.ShardKey,
+	node crypto.LazyVectorCommitmentNode,
 	path []int32,
 	depth int,
-) crypto.VectorCommitmentNode {
+) crypto.LazyVectorCommitmentNode {
 	if node == nil {
 		return nil
 	}
@@ -405,9 +416,9 @@ func getNodeAtPath(
 	}
 
 	switch n := node.(type) {
-	case *crypto.VectorCommitmentLeafNode:
+	case *crypto.LazyVectorCommitmentLeafNode:
 		return node
-	case *crypto.VectorCommitmentBranchNode:
+	case *crypto.LazyVectorCommitmentBranchNode:
 		// Check that the branch's prefix matches the beginning of the query path.
 		if len(path) < len(n.Prefix) {
 			return nil
@@ -431,12 +442,28 @@ func getNodeAtPath(
 			return nil
 		}
 
-		child := n.Children[childIndex]
+		child, err := n.Store.GetNodeByPath(
+			setType,
+			phaseType,
+			shardKey,
+			slices.Concat(n.FullPrefix, []int{int(childIndex)}),
+		)
+		if err != nil && !strings.Contains(err.Error(), "item not found") {
+			panic(err)
+		}
+
 		if child == nil {
 			return nil
 		}
 
-		return getNodeAtPath(child, remainder[1:], depth+len(n.Prefix)+1)
+		return getNodeAtPath(
+			setType,
+			phaseType,
+			shardKey,
+			child,
+			remainder[1:],
+			depth+len(n.Prefix)+1,
+		)
 	}
 	return nil
 }
@@ -444,29 +471,68 @@ func getNodeAtPath(
 // getBranchInfoFromTree looks up the node at the given path in the local tree,
 // computes its commitment, and (if it is a branch) collects its immediate
 // children's commitments.
-func getBranchInfoFromTree(tree *crypto.VectorCommitmentTree, path []int32) (
+func getBranchInfoFromTree(
+	tree *crypto.LazyVectorCommitmentTree,
+	path []int32,
+) (
 	*protobufs.HypergraphComparisonResponse,
 	error,
 ) {
-	node := getNodeAtPath(tree.Root, path, 0)
+	node := getNodeAtPath(
+		tree.SetType,
+		tree.PhaseType,
+		tree.ShardKey,
+		tree.Root,
+		path,
+		0,
+	)
 	if node == nil {
 		return nil, fmt.Errorf("node not found at path %v", path)
 	}
 
-	commitment := node.Commit(false)
+	intpath := []int{}
+	for _, p := range path {
+		intpath = append(intpath, int(p))
+	}
+	commitment := node.Commit(
+		tree.SetType,
+		tree.PhaseType,
+		tree.ShardKey,
+		intpath,
+		false,
+	)
 	branchInfo := &protobufs.HypergraphComparisonResponse{
 		Path:       path,
 		Commitment: commitment,
 		IsRoot:     len(path) == 0,
 	}
 
-	if branch, ok := node.(*crypto.VectorCommitmentBranchNode); ok {
+	if branch, ok := node.(*crypto.LazyVectorCommitmentBranchNode); ok {
 		for _, p := range branch.Prefix {
 			branchInfo.Path = append(branchInfo.Path, int32(p))
 		}
 		for i := 0; i < len(branch.Children); i++ {
-			if branch.Children[i] != nil {
-				childCommit := branch.Children[i].Commit(false)
+			child := branch.Children[i]
+			if child == nil {
+				var err error
+				child, err = branch.Store.GetNodeByPath(
+					tree.SetType,
+					tree.PhaseType,
+					tree.ShardKey,
+					slices.Concat(branch.FullPrefix, []int{i}),
+				)
+				if err != nil && !strings.Contains(err.Error(), "item not found") {
+					panic(err)
+				}
+			}
+			if child != nil {
+				childCommit := child.Commit(
+					tree.SetType,
+					tree.PhaseType,
+					tree.ShardKey,
+					slices.Concat(branch.FullPrefix, []int{i}),
+					false,
+				)
 				branchInfo.Children = append(
 					branchInfo.Children,
 					&protobufs.BranchChild{
@@ -532,7 +598,7 @@ func handleQueryNext(
 	ctx context.Context,
 	incomingQueries <-chan *protobufs.HypergraphComparisonQuery,
 	stream HyperStream,
-	localTree *crypto.VectorCommitmentTree,
+	localTree *crypto.LazyVectorCommitmentTree,
 	path []int32,
 ) (
 	*protobufs.HypergraphComparisonResponse,
@@ -587,7 +653,7 @@ func descendIndex(
 	ctx context.Context,
 	incomingResponses <-chan *protobufs.HypergraphComparisonResponse,
 	stream HyperStream,
-	localTree *crypto.VectorCommitmentTree,
+	localTree *crypto.LazyVectorCommitmentTree,
 	path []int32,
 ) (
 	*protobufs.HypergraphComparisonResponse,
@@ -928,7 +994,7 @@ func syncTreeBidirectionallyServer(
 	logger.Info("received initialization message")
 
 	// Get the appropriate phase set
-	var phaseSet map[hypergraph.ShardKey]*hypergraph.IdSet
+	var phaseSet map[crypto.ShardKey]*hypergraph.IdSet
 	switch query.PhaseSet {
 	case protobufs.HypergraphPhaseSet_HYPERGRAPH_PHASE_SET_VERTEX_ADDS:
 		phaseSet = localHypergraph.GetVertexAdds()
@@ -944,7 +1010,7 @@ func syncTreeBidirectionallyServer(
 		return errors.New("invalid shard key")
 	}
 
-	shardKey := hypergraph.ShardKey{
+	shardKey := crypto.ShardKey{
 		L1: [3]byte(query.ShardKey[:3]),
 		L2: [32]byte(query.ShardKey[3:]),
 	}
@@ -1125,12 +1191,6 @@ outer:
 		"hypergraph root commit",
 		zap.String("root", hex.EncodeToString(roots[0])),
 	)
-
-	logger.Info("saving hypergraph")
-	if err = localHypergraphStore.SaveHypergraph(localHypergraph); err != nil {
-		logger.Error("error while saving", zap.Error(err))
-	}
-	logger.Info("hypergraph saved")
 
 	total, _ := idSet.GetTree().GetMetadata()
 	logger.Info(

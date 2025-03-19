@@ -161,7 +161,7 @@ func NewTokenExecutionEngine(
 	var inclusionProof *qcrypto.InclusionAggregateProof
 	var proverKeys [][]byte
 	var peerSeniority map[string]uint64
-	hg := hypergraph.NewHypergraph()
+	hg := hypergraph.NewHypergraph(hypergraphStore)
 	mpcithVerEnc := qcrypto.NewMPCitHVerifiableEncryptor(
 		runtime.NumCPU(),
 	)
@@ -910,10 +910,6 @@ func (e *TokenExecutionEngine) hyperSync(totalCoins int) {
 		"hypergraph root commit",
 		zap.String("root", hex.EncodeToString(roots[0])),
 	)
-
-	if err := e.hypergraphStore.SaveHypergraph(e.hypergraph); err != nil {
-		e.logger.Error("error while saving", zap.Error(err))
-	}
 }
 
 func (e *TokenExecutionEngine) rebuildMissingSetForHypergraph(set [][]byte) {
@@ -971,12 +967,6 @@ func (e *TokenExecutionEngine) rebuildMissingSetForHypergraph(set [][]byte) {
 		zap.String("root", fmt.Sprintf("%x", roots[0])),
 	)
 
-	err = e.hypergraphStore.SaveHypergraph(e.hypergraph)
-	if err != nil {
-		txn.Abort()
-		panic(err)
-	}
-
 	if err = txn.Commit(); err != nil {
 		txn.Abort()
 		panic(err)
@@ -985,7 +975,7 @@ func (e *TokenExecutionEngine) rebuildMissingSetForHypergraph(set [][]byte) {
 
 func (e *TokenExecutionEngine) rebuildHypergraph(totalRange int) {
 	e.logger.Info("rebuilding hypergraph")
-	e.hypergraph = hypergraph.NewHypergraph()
+	e.hypergraph = hypergraph.NewHypergraph(e.hypergraphStore)
 	if e.engineConfig.RebuildStart == "" {
 		e.engineConfig.RebuildStart = "0000000000000000000000000000000000000000000000000000000000000000"
 	}
@@ -1061,12 +1051,6 @@ func (e *TokenExecutionEngine) rebuildHypergraph(totalRange int) {
 		"committed hypergraph state",
 		zap.String("root", fmt.Sprintf("%x", roots[0])),
 	)
-
-	err = e.hypergraphStore.SaveHypergraph(e.hypergraph)
-	if err != nil {
-		txn.Abort()
-		panic(err)
-	}
 
 	if err = txn.Commit(); err != nil {
 		txn.Abort()
@@ -1754,14 +1738,6 @@ func (e *TokenExecutionEngine) ProcessFrame(
 		"commited hypergraph",
 		zap.String("root", fmt.Sprintf("%x", roots[0])),
 	)
-
-	err = e.hypergraphStore.SaveHypergraph(
-		hg,
-	)
-	if err != nil {
-		txn.Abort()
-		return nil, errors.Wrap(err, "process frame")
-	}
 
 	e.hypergraph = hg
 

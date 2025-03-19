@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/gob"
 	"encoding/hex"
 	"io/fs"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/cockroachdb/pebble"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"source.quilibrium.com/quilibrium/monorepo/node/config"
@@ -41,6 +43,38 @@ type HypergraphStore interface {
 	SaveHypergraph(
 		hg *application.Hypergraph,
 	) error
+	GetNodeByKey(
+		setType string,
+		phaseType string,
+		shardKey crypto.ShardKey,
+		key []byte,
+	) (crypto.LazyVectorCommitmentNode, error)
+	GetNodeByPath(
+		setType string,
+		phaseType string,
+		shardKey crypto.ShardKey,
+		path []int,
+	) (crypto.LazyVectorCommitmentNode, error)
+	InsertNode(
+		setType string,
+		phaseType string,
+		shardKey crypto.ShardKey,
+		key []byte,
+		path []int,
+		node crypto.LazyVectorCommitmentNode,
+	) error
+	SaveRoot(
+		setType string,
+		phaseType string,
+		shardKey crypto.ShardKey,
+		node crypto.LazyVectorCommitmentNode,
+	) error
+	DeletePath(
+		setType string,
+		phaseType string,
+		shardKey crypto.ShardKey,
+		path []int,
+	) error
 }
 
 var _ HypergraphStore = (*PebbleHypergraphStore)(nil)
@@ -64,15 +98,27 @@ func NewPebbleHypergraphStore(
 }
 
 const (
-	HYPERGRAPH_SHARD  = 0x09
-	VERTEX_ADDS       = 0x00
-	VERTEX_REMOVES    = 0x10
-	VERTEX_DATA       = 0xF0
-	HYPEREDGE_ADDS    = 0x01
-	HYPEREDGE_REMOVES = 0x11
+	HYPERGRAPH_SHARD                    = 0x09
+	VERTEX_ADDS                         = 0x00
+	VERTEX_REMOVES                      = 0x10
+	VERTEX_DATA                         = 0xF0
+	HYPEREDGE_ADDS                      = 0x01
+	HYPEREDGE_REMOVES                   = 0x11
+	VERTEX_ADDS_TREE_NODE               = 0x02
+	VERTEX_REMOVES_TREE_NODE            = 0x12
+	HYPEREDGE_ADDS_TREE_NODE            = 0x03
+	HYPEREDGE_REMOVES_TREE_NODE         = 0x13
+	VERTEX_ADDS_TREE_NODE_BY_PATH       = 0x22
+	VERTEX_REMOVES_TREE_NODE_BY_PATH    = 0x32
+	HYPEREDGE_ADDS_TREE_NODE_BY_PATH    = 0x23
+	HYPEREDGE_REMOVES_TREE_NODE_BY_PATH = 0x33
+	VERTEX_ADDS_TREE_ROOT               = 0xFC
+	VERTEX_REMOVES_TREE_ROOT            = 0xFD
+	HYPEREDGE_ADDS_TREE_ROOT            = 0xFE
+	HYPEREDGE_REMOVES_TREE_ROOT         = 0xFF
 )
 
-func hypergraphVertexAddsKey(shardKey application.ShardKey) []byte {
+func hypergraphVertexAddsKey(shardKey crypto.ShardKey) []byte {
 	key := []byte{HYPERGRAPH_SHARD, VERTEX_ADDS}
 	key = append(key, shardKey.L1[:]...)
 	key = append(key, shardKey.L2[:]...)
@@ -85,29 +131,161 @@ func hypergraphVertexDataKey(id []byte) []byte {
 	return key
 }
 
-func hypergraphVertexRemovesKey(shardKey application.ShardKey) []byte {
+func hypergraphVertexRemovesKey(shardKey crypto.ShardKey) []byte {
 	key := []byte{HYPERGRAPH_SHARD, VERTEX_REMOVES}
 	key = append(key, shardKey.L1[:]...)
 	key = append(key, shardKey.L2[:]...)
 	return key
 }
 
-func hypergraphHyperedgeAddsKey(shardKey application.ShardKey) []byte {
+func hypergraphHyperedgeAddsKey(shardKey crypto.ShardKey) []byte {
 	key := []byte{HYPERGRAPH_SHARD, HYPEREDGE_ADDS}
 	key = append(key, shardKey.L1[:]...)
 	key = append(key, shardKey.L2[:]...)
 	return key
 }
 
-func hypergraphHyperedgeRemovesKey(shardKey application.ShardKey) []byte {
+func hypergraphHyperedgeRemovesKey(shardKey crypto.ShardKey) []byte {
 	key := []byte{HYPERGRAPH_SHARD, HYPEREDGE_REMOVES}
 	key = append(key, shardKey.L1[:]...)
 	key = append(key, shardKey.L2[:]...)
 	return key
 }
 
-func shardKeyFromKey(key []byte) application.ShardKey {
-	return application.ShardKey{
+func hypergraphVertexAddsTreeNodeKey(
+	shardKey crypto.ShardKey,
+	nodeKey []byte,
+) []byte {
+	key := []byte{HYPERGRAPH_SHARD, VERTEX_ADDS_TREE_NODE}
+	key = append(key, shardKey.L1[:]...)
+	key = append(key, shardKey.L2[:]...)
+	key = append(key, nodeKey...)
+	return key
+}
+
+func hypergraphVertexRemovesTreeNodeKey(
+	shardKey crypto.ShardKey,
+	nodeKey []byte,
+) []byte {
+	key := []byte{HYPERGRAPH_SHARD, VERTEX_REMOVES_TREE_NODE}
+	key = append(key, shardKey.L1[:]...)
+	key = append(key, shardKey.L2[:]...)
+	key = append(key, nodeKey...)
+	return key
+}
+
+func hypergraphHyperedgeAddsTreeNodeKey(
+	shardKey crypto.ShardKey,
+	nodeKey []byte,
+) []byte {
+	key := []byte{HYPERGRAPH_SHARD, HYPEREDGE_ADDS_TREE_NODE}
+	key = append(key, shardKey.L1[:]...)
+	key = append(key, shardKey.L2[:]...)
+	key = append(key, nodeKey...)
+	return key
+}
+
+func hypergraphHyperedgeRemovesTreeNodeKey(
+	shardKey crypto.ShardKey,
+	nodeKey []byte,
+) []byte {
+	key := []byte{HYPERGRAPH_SHARD, HYPEREDGE_REMOVES_TREE_NODE}
+	key = append(key, shardKey.L1[:]...)
+	key = append(key, shardKey.L2[:]...)
+	key = append(key, nodeKey...)
+	return key
+}
+
+func hypergraphVertexAddsTreeNodeByPathKey(
+	shardKey crypto.ShardKey,
+	path []int,
+) []byte {
+	key := []byte{HYPERGRAPH_SHARD, VERTEX_ADDS_TREE_NODE_BY_PATH}
+	key = append(key, shardKey.L1[:]...)
+	key = append(key, shardKey.L2[:]...)
+	for _, p := range path {
+		key = binary.BigEndian.AppendUint64(key, uint64(p))
+	}
+	return key
+}
+
+func hypergraphVertexRemovesTreeNodeByPathKey(
+	shardKey crypto.ShardKey,
+	path []int,
+) []byte {
+	key := []byte{HYPERGRAPH_SHARD, VERTEX_REMOVES_TREE_NODE_BY_PATH}
+	key = append(key, shardKey.L1[:]...)
+	key = append(key, shardKey.L2[:]...)
+	for _, p := range path {
+		key = binary.BigEndian.AppendUint64(key, uint64(p))
+	}
+	return key
+}
+
+func hypergraphHyperedgeAddsTreeNodeByPathKey(
+	shardKey crypto.ShardKey,
+	path []int,
+) []byte {
+	key := []byte{HYPERGRAPH_SHARD, HYPEREDGE_ADDS_TREE_NODE_BY_PATH}
+	key = append(key, shardKey.L1[:]...)
+	key = append(key, shardKey.L2[:]...)
+	for _, p := range path {
+		key = binary.BigEndian.AppendUint64(key, uint64(p))
+	}
+	return key
+}
+
+func hypergraphHyperedgeRemovesTreeNodeByPathKey(
+	shardKey crypto.ShardKey,
+	path []int,
+) []byte {
+	key := []byte{HYPERGRAPH_SHARD, HYPEREDGE_REMOVES_TREE_NODE_BY_PATH}
+	key = append(key, shardKey.L1[:]...)
+	key = append(key, shardKey.L2[:]...)
+	for _, p := range path {
+		key = binary.BigEndian.AppendUint64(key, uint64(p))
+	}
+	return key
+}
+
+func hypergraphVertexAddsTreeRootKey(
+	shardKey crypto.ShardKey,
+) []byte {
+	key := []byte{HYPERGRAPH_SHARD, VERTEX_ADDS_TREE_ROOT}
+	key = append(key, shardKey.L1[:]...)
+	key = append(key, shardKey.L2[:]...)
+	return key
+}
+
+func hypergraphVertexRemovesTreeRootKey(
+	shardKey crypto.ShardKey,
+) []byte {
+	key := []byte{HYPERGRAPH_SHARD, VERTEX_REMOVES_TREE_ROOT}
+	key = append(key, shardKey.L1[:]...)
+	key = append(key, shardKey.L2[:]...)
+	return key
+}
+
+func hypergraphHyperedgeAddsTreeRootKey(
+	shardKey crypto.ShardKey,
+) []byte {
+	key := []byte{HYPERGRAPH_SHARD, HYPEREDGE_ADDS_TREE_ROOT}
+	key = append(key, shardKey.L1[:]...)
+	key = append(key, shardKey.L2[:]...)
+	return key
+}
+
+func hypergraphHyperedgeRemovesTreeRootKey(
+	shardKey crypto.ShardKey,
+) []byte {
+	key := []byte{HYPERGRAPH_SHARD, HYPEREDGE_REMOVES_TREE_ROOT}
+	key = append(key, shardKey.L1[:]...)
+	key = append(key, shardKey.L2[:]...)
+	return key
+}
+
+func shardKeyFromKey(key []byte) crypto.ShardKey {
+	return crypto.ShardKey{
 		L1: [3]byte(key[2:5]),
 		L2: [32]byte(key[5:]),
 	}
@@ -160,7 +338,7 @@ func (p *PebbleHypergraphStore) LoadVertexData(id []byte) (
 	}
 
 	encData := []application.Encrypted{}
-	for _, d := range crypto.GetAllLeaves(tree) {
+	for _, d := range crypto.GetAllPreloadedLeaves(tree) {
 		verencData := crypto.MPCitHVerEncFromBytes(d.Value)
 		encData = append(encData, verencData)
 	}
@@ -209,8 +387,240 @@ func (p *PebbleHypergraphStore) LoadHypergraph() (
 	*application.Hypergraph,
 	error,
 ) {
-	hg := application.NewHypergraph()
+	hg := application.NewHypergraph(p)
 	hypergraphDir := path.Join(p.config.Path, "hypergraph")
+
+	vertexAddsIter, err := p.db.NewIter(
+		[]byte{HYPERGRAPH_SHARD, VERTEX_ADDS_TREE_ROOT},
+		[]byte{HYPERGRAPH_SHARD, VERTEX_REMOVES_TREE_ROOT},
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "load hypergraph")
+	}
+	defer vertexAddsIter.Close()
+
+	loadedFromDB := false
+	for vertexAddsIter.First(); vertexAddsIter.Valid(); vertexAddsIter.Next() {
+		loadedFromDB = true
+		shardKey := shardKeyFromKey(vertexAddsIter.Key())
+		data := vertexAddsIter.Value()
+
+		var node crypto.LazyVectorCommitmentNode
+		switch data[0] {
+		case crypto.TypeLeaf:
+			node, err = crypto.DeserializeLeafNode(p, bytes.NewReader(data[1:]))
+		case crypto.TypeBranch:
+			pathLength := binary.BigEndian.Uint32(data[1:5])
+
+			node, err = crypto.DeserializeBranchNode(
+				p,
+				bytes.NewReader(data[5+(pathLength*4):]),
+				false,
+			)
+
+			fullPrefix := []int{}
+			for i := range pathLength {
+				fullPrefix = append(
+					fullPrefix,
+					int(binary.BigEndian.Uint32(data[5+(i*4):5+((i+1)*4)])),
+				)
+			}
+			branch := node.(*crypto.LazyVectorCommitmentBranchNode)
+			branch.FullPrefix = fullPrefix
+		default:
+			err = ErrInvalidData
+		}
+
+		if err != nil {
+			return nil, errors.Wrap(err, "load hypergraph")
+		}
+
+		err = hg.ImportTree(
+			application.VertexAtomType,
+			application.AddsPhaseType,
+			shardKey,
+			node,
+			p,
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "load hypergraph")
+		}
+	}
+
+	vertexRemovesIter, err := p.db.NewIter(
+		[]byte{HYPERGRAPH_SHARD, VERTEX_REMOVES_TREE_ROOT},
+		[]byte{HYPERGRAPH_SHARD, HYPEREDGE_ADDS_TREE_ROOT},
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "load hypergraph")
+	}
+	defer vertexRemovesIter.Close()
+
+	for vertexRemovesIter.First(); vertexRemovesIter.Valid(); vertexRemovesIter.Next() {
+		loadedFromDB = true
+		shardKey := shardKeyFromKey(vertexRemovesIter.Key())
+		data := vertexRemovesIter.Value()
+
+		var node crypto.LazyVectorCommitmentNode
+		switch data[0] {
+		case crypto.TypeLeaf:
+			node, err = crypto.DeserializeLeafNode(p, bytes.NewReader(data[1:]))
+		case crypto.TypeBranch:
+			pathLength := binary.BigEndian.Uint32(data[1:5])
+
+			node, err = crypto.DeserializeBranchNode(
+				p,
+				bytes.NewReader(data[5+(pathLength*4):]),
+				false,
+			)
+
+			fullPrefix := []int{}
+			for i := range pathLength {
+				fullPrefix = append(
+					fullPrefix,
+					int(binary.BigEndian.Uint32(data[5+(i*4):5+((i+1)*4)])),
+				)
+			}
+			branch := node.(*crypto.LazyVectorCommitmentBranchNode)
+			branch.FullPrefix = fullPrefix
+		default:
+			err = ErrInvalidData
+		}
+
+		if err != nil {
+			return nil, errors.Wrap(err, "load hypergraph")
+		}
+
+		err = hg.ImportTree(
+			application.VertexAtomType,
+			application.RemovesPhaseType,
+			shardKey,
+			node,
+			p,
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "load hypergraph")
+		}
+	}
+
+	hyperedgeAddsIter, err := p.db.NewIter(
+		[]byte{HYPERGRAPH_SHARD, HYPEREDGE_ADDS_TREE_ROOT},
+		[]byte{HYPERGRAPH_SHARD, HYPEREDGE_REMOVES_TREE_ROOT},
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "load hypergraph")
+	}
+	defer hyperedgeAddsIter.Close()
+
+	for hyperedgeAddsIter.First(); hyperedgeAddsIter.Valid(); hyperedgeAddsIter.Next() {
+		loadedFromDB = true
+		shardKey := shardKeyFromKey(hyperedgeAddsIter.Key())
+		data := hyperedgeAddsIter.Value()
+
+		var node crypto.LazyVectorCommitmentNode
+		switch data[0] {
+		case crypto.TypeLeaf:
+			node, err = crypto.DeserializeLeafNode(
+				p,
+				bytes.NewReader(data[1:]),
+			)
+		case crypto.TypeBranch:
+			pathLength := binary.BigEndian.Uint32(data[1:5])
+
+			node, err = crypto.DeserializeBranchNode(
+				p,
+				bytes.NewReader(data[5+(pathLength*4):]),
+				false,
+			)
+
+			fullPrefix := []int{}
+			for i := range pathLength {
+				fullPrefix = append(
+					fullPrefix,
+					int(binary.BigEndian.Uint32(data[5+(i*4):5+((i+1)*4)])),
+				)
+			}
+			branch := node.(*crypto.LazyVectorCommitmentBranchNode)
+			branch.FullPrefix = fullPrefix
+		default:
+			err = ErrInvalidData
+		}
+
+		if err != nil {
+			return nil, errors.Wrap(err, "load hypergraph")
+		}
+
+		err = hg.ImportTree(
+			application.HyperedgeAtomType,
+			application.AddsPhaseType,
+			shardKey,
+			node,
+			p,
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "load hypergraph")
+		}
+	}
+
+	hyperedgeRemovesIter, err := p.db.NewIter(
+		[]byte{HYPERGRAPH_SHARD, HYPEREDGE_REMOVES_TREE_ROOT},
+		[]byte{(HYPERGRAPH_SHARD + 1), 0x00},
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "load hypergraph")
+	}
+	defer hyperedgeRemovesIter.Close()
+
+	for hyperedgeRemovesIter.First(); hyperedgeRemovesIter.Valid(); hyperedgeRemovesIter.Next() {
+		loadedFromDB = true
+		shardKey := shardKeyFromKey(hyperedgeRemovesIter.Key())
+		data := hyperedgeRemovesIter.Value()
+
+		var node crypto.LazyVectorCommitmentNode
+		switch data[0] {
+		case crypto.TypeLeaf:
+			node, err = crypto.DeserializeLeafNode(p, bytes.NewReader(data[1:]))
+		case crypto.TypeBranch:
+			pathLength := binary.BigEndian.Uint32(data[1:5])
+
+			node, err = crypto.DeserializeBranchNode(
+				p,
+				bytes.NewReader(data[5+(pathLength*4):]),
+				false,
+			)
+
+			fullPrefix := []int{}
+			for i := range pathLength {
+				fullPrefix = append(
+					fullPrefix,
+					int(binary.BigEndian.Uint32(data[5+(i*4):5+((i+1)*4)])),
+				)
+			}
+			branch := node.(*crypto.LazyVectorCommitmentBranchNode)
+			branch.FullPrefix = fullPrefix
+		default:
+			err = ErrInvalidData
+		}
+
+		if err != nil {
+			return nil, errors.Wrap(err, "load hypergraph")
+		}
+
+		err = hg.ImportTree(
+			application.HyperedgeAtomType,
+			application.RemovesPhaseType,
+			shardKey,
+			node,
+			p,
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "load hypergraph")
+		}
+	}
+
+	if loadedFromDB {
+		return hg, nil
+	}
 
 	vertexAddsPrefix := hex.EncodeToString(
 		[]byte{HYPERGRAPH_SHARD, VERTEX_ADDS},
@@ -225,10 +635,11 @@ func (p *PebbleHypergraphStore) LoadHypergraph() (
 		[]byte{HYPERGRAPH_SHARD, HYPEREDGE_REMOVES},
 	)
 
-	return hg, errors.Wrap(
+	p.logger.Info("converting hypergraph, this may take a moment")
+	err = errors.Wrap(
 		filepath.WalkDir(
 			hypergraphDir,
-			func(p string, d fs.DirEntry, err error) error {
+			func(pa string, d fs.DirEntry, err error) error {
 				if err != nil {
 					return err
 				}
@@ -264,19 +675,30 @@ func (p *PebbleHypergraphStore) LoadHypergraph() (
 					setType = application.RemovesPhaseType
 				}
 
-				fileBytes, err := os.ReadFile(p)
+				fileBytes, err := os.ReadFile(pa)
 				if err != nil {
 					return err
 				}
 
-				err = hg.ImportFromBytes(
+				set := application.NewIdSet(
 					atomType,
 					setType,
 					shardKeyFromKey(shardSet),
+					p,
+				)
+				atoms, err := set.FromBytes(
+					atomType,
+					setType,
+					shardKeyFromKey(shardSet),
+					p,
 					fileBytes,
 				)
 				if err != nil {
 					return err
+				}
+
+				for _, atom := range atoms {
+					hg.AddVertex(atom.(application.Vertex))
 				}
 
 				return nil
@@ -284,6 +706,11 @@ func (p *PebbleHypergraphStore) LoadHypergraph() (
 		),
 		"load hypergraph",
 	)
+	if err != nil {
+		return nil, err
+	}
+
+	return hg, nil
 }
 
 func (p *PebbleHypergraphStore) SaveHypergraph(
@@ -434,4 +861,317 @@ func (p *PebbleHypergraphStore) SaveHypergraph(
 	}
 
 	return nil
+}
+
+func (p *PebbleHypergraphStore) GetNodeByKey(
+	setType string,
+	phaseType string,
+	shardKey crypto.ShardKey,
+	key []byte,
+) (crypto.LazyVectorCommitmentNode, error) {
+	keyFn := hypergraphVertexAddsTreeNodeKey
+	switch application.AtomType(setType) {
+	case application.VertexAtomType:
+		switch application.PhaseType(phaseType) {
+		case application.AddsPhaseType:
+			keyFn = hypergraphVertexAddsTreeNodeKey
+		case application.RemovesPhaseType:
+			keyFn = hypergraphVertexRemovesTreeNodeKey
+		}
+	case application.HyperedgeAtomType:
+		switch application.PhaseType(phaseType) {
+		case application.AddsPhaseType:
+			keyFn = hypergraphHyperedgeAddsTreeNodeKey
+		case application.RemovesPhaseType:
+			keyFn = hypergraphHyperedgeRemovesTreeNodeKey
+		}
+	}
+	data, closer, err := p.db.Get(keyFn(shardKey, key))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			err = ErrNotFound
+			return nil, err
+		}
+	}
+	defer closer.Close()
+
+	var node crypto.LazyVectorCommitmentNode
+
+	switch data[0] {
+	case crypto.TypeLeaf:
+		node, err = crypto.DeserializeLeafNode(p, bytes.NewReader(data[1:]))
+	case crypto.TypeBranch:
+		pathLength := binary.BigEndian.Uint32(data[1:5])
+
+		node, err = crypto.DeserializeBranchNode(
+			p,
+			bytes.NewReader(data[5+(pathLength*4):]),
+			false,
+		)
+
+		fullPrefix := []int{}
+		for i := range pathLength {
+			fullPrefix = append(
+				fullPrefix,
+				int(binary.BigEndian.Uint32(data[5+(i*4):5+((i+1)*4)])),
+			)
+		}
+		branch := node.(*crypto.LazyVectorCommitmentBranchNode)
+		branch.FullPrefix = fullPrefix
+	default:
+		err = ErrInvalidData
+	}
+
+	return node, errors.Wrap(err, "get node by key")
+}
+
+func (p *PebbleHypergraphStore) GetNodeByPath(
+	setType string,
+	phaseType string,
+	shardKey crypto.ShardKey,
+	path []int,
+) (crypto.LazyVectorCommitmentNode, error) {
+	keyFn := hypergraphVertexAddsTreeNodeByPathKey
+	switch application.AtomType(setType) {
+	case application.VertexAtomType:
+		switch application.PhaseType(phaseType) {
+		case application.AddsPhaseType:
+			keyFn = hypergraphVertexAddsTreeNodeByPathKey
+		case application.RemovesPhaseType:
+			keyFn = hypergraphVertexRemovesTreeNodeByPathKey
+		}
+	case application.HyperedgeAtomType:
+		switch application.PhaseType(phaseType) {
+		case application.AddsPhaseType:
+			keyFn = hypergraphHyperedgeAddsTreeNodeByPathKey
+		case application.RemovesPhaseType:
+			keyFn = hypergraphHyperedgeRemovesTreeNodeByPathKey
+		}
+	}
+	pathKey := keyFn(shardKey, path)
+	data, closer, err := p.db.Get(pathKey)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			err = ErrNotFound
+			return nil, err
+		}
+	}
+	defer closer.Close()
+
+	nodeData, nodeCloser, err := p.db.Get(data)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			err = ErrNotFound
+			return nil, err
+		}
+	}
+	defer nodeCloser.Close()
+
+	var node crypto.LazyVectorCommitmentNode
+
+	switch nodeData[0] {
+	case crypto.TypeLeaf:
+		node, err = crypto.DeserializeLeafNode(
+			p,
+			bytes.NewReader(nodeData[1:]),
+		)
+	case crypto.TypeBranch:
+		pathLength := binary.BigEndian.Uint32(nodeData[1:5])
+
+		node, err = crypto.DeserializeBranchNode(
+			p,
+			bytes.NewReader(nodeData[5+(pathLength*4):]),
+			false,
+		)
+		fullPrefix := []int{}
+		for i := range pathLength {
+			fullPrefix = append(
+				fullPrefix,
+				int(binary.BigEndian.Uint32(nodeData[5+(i*4):5+((i+1)*4)])),
+			)
+		}
+		branch := node.(*crypto.LazyVectorCommitmentBranchNode)
+		branch.FullPrefix = fullPrefix
+	default:
+		err = ErrInvalidData
+	}
+
+	return node, errors.Wrap(err, "get node by path")
+}
+
+func generateSlices(fullpref, pref []int) [][]int {
+	result := [][]int{}
+	if len(pref) >= len(fullpref) {
+		return [][]int{fullpref}
+	}
+	for i := 0; i <= len(pref); i++ {
+		newLen := len(fullpref) - i
+		newSlice := make([]int, newLen)
+		copy(newSlice, fullpref[:newLen])
+		result = append(result, newSlice)
+	}
+
+	return result
+}
+
+func (p *PebbleHypergraphStore) InsertNode(
+	setType string,
+	phaseType string,
+	shardKey crypto.ShardKey,
+	key []byte,
+	path []int,
+	node crypto.LazyVectorCommitmentNode,
+) error {
+	keyFn := hypergraphVertexAddsTreeNodeKey
+	pathFn := hypergraphVertexAddsTreeNodeByPathKey
+	switch application.AtomType(setType) {
+	case application.VertexAtomType:
+		switch application.PhaseType(phaseType) {
+		case application.AddsPhaseType:
+			keyFn = hypergraphVertexAddsTreeNodeKey
+			pathFn = hypergraphVertexAddsTreeNodeByPathKey
+		case application.RemovesPhaseType:
+			keyFn = hypergraphVertexRemovesTreeNodeKey
+			pathFn = hypergraphVertexRemovesTreeNodeByPathKey
+		}
+	case application.HyperedgeAtomType:
+		switch application.PhaseType(phaseType) {
+		case application.AddsPhaseType:
+			keyFn = hypergraphHyperedgeAddsTreeNodeKey
+			pathFn = hypergraphHyperedgeAddsTreeNodeByPathKey
+		case application.RemovesPhaseType:
+			keyFn = hypergraphHyperedgeRemovesTreeNodeKey
+			pathFn = hypergraphHyperedgeRemovesTreeNodeByPathKey
+		}
+	}
+
+	var b bytes.Buffer
+	nodeKey := keyFn(shardKey, key)
+	switch n := node.(type) {
+	case *crypto.LazyVectorCommitmentBranchNode:
+		length := uint32(len(path))
+		pathBytes := []byte{}
+		pathBytes = binary.BigEndian.AppendUint32(pathBytes, length)
+		for i := range int(length) {
+			pathBytes = binary.BigEndian.AppendUint32(pathBytes, uint32(path[i]))
+		}
+		err := crypto.SerializeBranchNode(&b, n, false)
+		if err != nil {
+			return errors.Wrap(err, "insert node")
+		}
+		data := append([]byte{crypto.TypeBranch}, pathBytes...)
+		data = append(data, b.Bytes()...)
+		err = p.db.Set(nodeKey, data)
+		if err != nil {
+			return errors.Wrap(err, "insert node")
+		}
+		sets := generateSlices(n.FullPrefix, path)
+		for _, set := range sets {
+			pathKey := pathFn(shardKey, set)
+			err = p.db.Set(pathKey, nodeKey)
+			if err != nil {
+				return errors.Wrap(err, "insert node")
+			}
+		}
+		return nil
+	case *crypto.LazyVectorCommitmentLeafNode:
+		err := crypto.SerializeLeafNode(&b, n)
+		if err != nil {
+			return errors.Wrap(err, "insert node")
+		}
+		data := append([]byte{crypto.TypeLeaf}, b.Bytes()...)
+		pathKey := pathFn(shardKey, path)
+		err = p.db.Set(nodeKey, data)
+		if err != nil {
+			return errors.Wrap(err, "insert node")
+		}
+		return errors.Wrap(p.db.Set(pathKey, nodeKey), "insert node")
+	}
+
+	return nil
+}
+
+func (p *PebbleHypergraphStore) SaveRoot(
+	setType string,
+	phaseType string,
+	shardKey crypto.ShardKey,
+	node crypto.LazyVectorCommitmentNode,
+) error {
+	keyFn := hypergraphVertexAddsTreeRootKey
+	switch application.AtomType(setType) {
+	case application.VertexAtomType:
+		switch application.PhaseType(phaseType) {
+		case application.AddsPhaseType:
+			keyFn = hypergraphVertexAddsTreeRootKey
+		case application.RemovesPhaseType:
+			keyFn = hypergraphVertexRemovesTreeRootKey
+		}
+	case application.HyperedgeAtomType:
+		switch application.PhaseType(phaseType) {
+		case application.AddsPhaseType:
+			keyFn = hypergraphHyperedgeAddsTreeRootKey
+		case application.RemovesPhaseType:
+			keyFn = hypergraphHyperedgeRemovesTreeRootKey
+		}
+	}
+
+	var b bytes.Buffer
+	nodeKey := keyFn(shardKey)
+	switch n := node.(type) {
+	case *crypto.LazyVectorCommitmentBranchNode:
+		length := uint32(len(n.FullPrefix))
+		pathBytes := []byte{}
+		pathBytes = binary.BigEndian.AppendUint32(pathBytes, length)
+		for i := range int(length) {
+			pathBytes = binary.BigEndian.AppendUint32(
+				pathBytes,
+				uint32(n.FullPrefix[i]),
+			)
+		}
+		err := crypto.SerializeBranchNode(&b, n, false)
+		if err != nil {
+			return errors.Wrap(err, "insert node")
+		}
+		data := append([]byte{crypto.TypeBranch}, pathBytes...)
+		data = append(data, b.Bytes()...)
+		err = p.db.Set(nodeKey, data)
+		return errors.Wrap(err, "insert node")
+	case *crypto.LazyVectorCommitmentLeafNode:
+		err := crypto.SerializeLeafNode(&b, n)
+		if err != nil {
+			return errors.Wrap(err, "insert node")
+		}
+		data := append([]byte{crypto.TypeBranch}, b.Bytes()...)
+		err = p.db.Set(nodeKey, data)
+		return errors.Wrap(err, "insert node")
+	}
+
+	return nil
+}
+
+func (p *PebbleHypergraphStore) DeletePath(
+	setType string,
+	phaseType string,
+	shardKey crypto.ShardKey,
+	path []int,
+) error {
+	keyFn := hypergraphVertexAddsTreeNodeByPathKey
+	switch application.AtomType(setType) {
+	case application.VertexAtomType:
+		switch application.PhaseType(phaseType) {
+		case application.AddsPhaseType:
+			keyFn = hypergraphVertexAddsTreeNodeByPathKey
+		case application.RemovesPhaseType:
+			keyFn = hypergraphVertexRemovesTreeNodeByPathKey
+		}
+	case application.HyperedgeAtomType:
+		switch application.PhaseType(phaseType) {
+		case application.AddsPhaseType:
+			keyFn = hypergraphHyperedgeAddsTreeNodeByPathKey
+		case application.RemovesPhaseType:
+			keyFn = hypergraphHyperedgeRemovesTreeNodeByPathKey
+		}
+	}
+	pathKey := keyFn(shardKey, path)
+	return errors.Wrap(p.db.Delete(pathKey), "delete path")
 }

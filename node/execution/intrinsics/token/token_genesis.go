@@ -935,11 +935,6 @@ func CreateGenesisState(
 		}
 
 		intrinsicFilter := p2p.GetBloomFilter(application.TOKEN_ADDRESS, 256, 3)
-		err = hypergraphStore.SaveHypergraph(hg)
-		if err != nil {
-			txn.Abort()
-			panic(err)
-		}
 
 		if err = txn.Commit(); err != nil {
 			panic(err)
@@ -1100,11 +1095,6 @@ func CreateGenesisState(
 			}
 		}
 		intrinsicFilter := p2p.GetBloomFilter(application.TOKEN_ADDRESS, 256, 3)
-		err = hypergraphStore.SaveHypergraph(hg)
-		if err != nil {
-			txn.Abort()
-			panic(err)
-		}
 
 		if err := txn.Commit(); err != nil {
 			panic(err)

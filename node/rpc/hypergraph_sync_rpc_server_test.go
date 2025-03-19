@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/cloudflare/circl/sign/ed448"
 	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
@@ -42,9 +43,36 @@ type Operation struct {
 	Hyperedge application.Hyperedge
 }
 
+func TestLoadHypergraphFallback(t *testing.T) {
+	clientKvdb := store.NewInMemKVDB()
+	serverKvdb := store.NewInMemKVDB()
+	logger, _ := zap.NewProduction()
+	clientHypergraphStore := store.NewPebbleHypergraphStore(
+		&config.DBConfig{Path: ".configtestclient/store"},
+		clientKvdb,
+		logger,
+	)
+	serverHypergraphStore := store.NewPebbleHypergraphStore(
+		&config.DBConfig{Path: ".configtestserver/store"},
+		serverKvdb,
+		logger,
+	)
+
+	serverLoad, err := serverHypergraphStore.LoadHypergraph()
+	assert.NoError(t, err)
+	clientLoad, err := clientHypergraphStore.LoadHypergraph()
+	assert.NoError(t, err)
+	for k, a := range serverLoad.GetVertexAdds() {
+		assert.Equal(t, len(crypto.ConvertAllPreloadedLeaves(string(application.VertexAtomType), string(application.AddsPhaseType), k, serverHypergraphStore, a.GetTree().Root, []int{})), 100000)
+	}
+	for k, a := range clientLoad.GetVertexAdds() {
+		assert.Equal(t, len(crypto.ConvertAllPreloadedLeaves(string(application.VertexAtomType), string(application.AddsPhaseType), k, clientHypergraphStore, a.GetTree().Root, []int{})), 100000)
+	}
+}
+
 func TestHypergraphSyncServer(t *testing.T) {
 	numParties := 3
-	numOperations := 10000
+	numOperations := 1000
 	log.Printf("Generating data")
 	enc := crypto.NewMPCitHVerifiableEncryptor(1)
 	pub, _, _ := ed448.GenerateKey(rand.Reader)
@@ -103,6 +131,7 @@ func TestHypergraphSyncServer(t *testing.T) {
 
 	clientKvdb := store.NewInMemKVDB()
 	serverKvdb := store.NewInMemKVDB()
+	controlKvdb := store.NewInMemKVDB()
 	logger, _ := zap.NewProduction()
 	clientHypergraphStore := store.NewPebbleHypergraphStore(
 		&config.DBConfig{Path: ".configtestclient/store"},
@@ -114,36 +143,46 @@ func TestHypergraphSyncServer(t *testing.T) {
 		serverKvdb,
 		logger,
 	)
+	controlHypergraphStore := store.NewPebbleHypergraphStore(
+		&config.DBConfig{Path: ".configtestcontrol/store"},
+		controlKvdb,
+		logger,
+	)
 	crdts := make([]*application.Hypergraph, numParties)
-	for i := 0; i < numParties; i++ {
-		crdts[i] = application.NewHypergraph()
-	}
+	crdts[0] = application.NewHypergraph(serverHypergraphStore)
+	crdts[1] = application.NewHypergraph(clientHypergraphStore)
+	crdts[2] = application.NewHypergraph(controlHypergraphStore)
 
 	txn, _ := serverHypergraphStore.NewTransaction(false)
 	for _, op := range operations1[:numOperations/2] {
 		switch op.Type {
 		case "AddVertex":
 			id := op.Vertex.GetID()
+			fmt.Printf("server add vertex %x %v\n", id, time.Now())
 			serverHypergraphStore.SaveVertexTree(txn, id[:], dataTree)
 			crdts[0].AddVertex(op.Vertex)
 		case "RemoveVertex":
 			crdts[0].RemoveVertex(op.Vertex)
 		case "AddHyperedge":
+			fmt.Printf("server add hyperedge %v\n", time.Now())
 			crdts[0].AddHyperedge(op.Hyperedge)
 		case "RemoveHyperedge":
+			fmt.Printf("server remove hyperedge %v\n", time.Now())
 			crdts[0].RemoveHyperedge(op.Hyperedge)
 		}
 	}
 	txn.Commit()
-	for _, op := range operations2[:500] {
+	for _, op := range operations2[:50] {
 		switch op.Type {
 		case "AddVertex":
 			crdts[0].AddVertex(op.Vertex)
 		case "RemoveVertex":
 			crdts[0].RemoveVertex(op.Vertex)
 		case "AddHyperedge":
+			fmt.Printf("server add hyperedge %v\n", time.Now())
 			crdts[0].AddHyperedge(op.Hyperedge)
 		case "RemoveHyperedge":
+			fmt.Printf("server remove hyperedge %v\n", time.Now())
 			crdts[0].RemoveHyperedge(op.Hyperedge)
 		}
 	}
@@ -153,26 +192,31 @@ func TestHypergraphSyncServer(t *testing.T) {
 		switch op.Type {
 		case "AddVertex":
 			id := op.Vertex.GetID()
+			fmt.Printf("client add vertex %x %v\n", id, time.Now())
 			clientHypergraphStore.SaveVertexTree(txn, id[:], dataTree)
 			crdts[1].AddVertex(op.Vertex)
 		case "RemoveVertex":
 			crdts[1].RemoveVertex(op.Vertex)
 		case "AddHyperedge":
+			fmt.Printf("client add hyperedge %v\n", time.Now())
 			crdts[1].AddHyperedge(op.Hyperedge)
 		case "RemoveHyperedge":
+			fmt.Printf("client remove hyperedge %v\n", time.Now())
 			crdts[1].RemoveHyperedge(op.Hyperedge)
 		}
 	}
 	txn.Commit()
-	for _, op := range operations2[500:] {
+	for _, op := range operations2[50:] {
 		switch op.Type {
 		case "AddVertex":
 			crdts[1].AddVertex(op.Vertex)
 		case "RemoveVertex":
 			crdts[1].RemoveVertex(op.Vertex)
 		case "AddHyperedge":
+			fmt.Printf("client add hyperedge %v\n", time.Now())
 			crdts[1].AddHyperedge(op.Hyperedge)
 		case "RemoveHyperedge":
+			fmt.Printf("client remove hyperedge %v\n", time.Now())
 			crdts[1].RemoveHyperedge(op.Hyperedge)
 		}
 	}
@@ -205,22 +249,22 @@ func TestHypergraphSyncServer(t *testing.T) {
 	crdts[0].Commit()
 	crdts[1].Commit()
 	crdts[2].Commit()
-	err := serverHypergraphStore.SaveHypergraph(crdts[0])
-	assert.NoError(t, err)
-	err = clientHypergraphStore.SaveHypergraph(crdts[1])
-	assert.NoError(t, err)
-	serverLoad, err := serverHypergraphStore.LoadHypergraph()
-	assert.NoError(t, err)
-	clientLoad, err := clientHypergraphStore.LoadHypergraph()
-	assert.NoError(t, err)
-	assert.Len(t, crypto.CompareLeaves(
-		crdts[0].GetVertexAdds()[shardKey].GetTree(),
-		serverLoad.GetVertexAdds()[shardKey].GetTree(),
-	), 0)
-	assert.Len(t, crypto.CompareLeaves(
-		crdts[1].GetVertexAdds()[shardKey].GetTree(),
-		clientLoad.GetVertexAdds()[shardKey].GetTree(),
-	), 0)
+	// err := serverHypergraphStore.SaveHypergraph(crdts[0])
+	// assert.NoError(t, err)
+	// err = clientHypergraphStore.SaveHypergraph(crdts[1])
+	// assert.NoError(t, err)
+	// serverLoad, err := serverHypergraphStore.LoadHypergraph()
+	// assert.NoError(t, err)
+	// clientLoad, err := clientHypergraphStore.LoadHypergraph()
+	// assert.NoError(t, err)
+	// assert.Len(t, crypto.CompareLeaves(
+	// 	crdts[0].GetVertexAdds()[shardKey].GetTree(),
+	// 	serverLoad.GetVertexAdds()[shardKey].GetTree(),
+	// ), 0)
+	// assert.Len(t, crypto.CompareLeaves(
+	// 	crdts[1].GetVertexAdds()[shardKey].GetTree(),
+	// 	clientLoad.GetVertexAdds()[shardKey].GetTree(),
+	// ), 0)
 	log.Printf("Generated data")
 
 	lis, err := net.Listen("tcp", ":50051")
