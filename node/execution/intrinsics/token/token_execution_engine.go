@@ -751,17 +751,18 @@ func (e *TokenExecutionEngine) addBatchToHypergraph(batchKey [][]byte, batchValu
 		}
 	}
 
-	if err := txn.Commit(); err != nil {
-		txn.Abort()
-		panic(err)
-	}
-
 	for i := range batchKey {
 		if err := e.hypergraph.AddVertex(
+			txn,
 			batchCompressed[i],
 		); err != nil {
 			panic(err)
 		}
+	}
+
+	if err := txn.Commit(); err != nil {
+		txn.Abort()
+		panic(err)
 	}
 }
 
@@ -1290,6 +1291,7 @@ func (e *TokenExecutionEngine) ProcessFrame(
 			}
 
 			if err := hg.AddVertex(
+				txn,
 				hypergraph.NewVertex(
 					[32]byte(application.TOKEN_ADDRESS),
 					[32]byte(address),
@@ -1356,6 +1358,7 @@ func (e *TokenExecutionEngine) ProcessFrame(
 			}
 
 			if err := hg.RemoveVertex(
+				txn,
 				hypergraph.NewVertex(
 					[32]byte(application.TOKEN_ADDRESS),
 					[32]byte(o.DeletedCoin.Address),

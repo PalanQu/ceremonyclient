@@ -2,7 +2,7 @@ package application
 
 import (
 	"bytes"
-	"crypto/sha512"
+	"encoding/binary"
 	"encoding/gob"
 	"math/big"
 
@@ -91,11 +91,11 @@ type Atom interface {
 
 func EncryptedToVertexTree(encrypted []Encrypted) *crypto.VectorCommitmentTree {
 	dataTree := &crypto.VectorCommitmentTree{}
-	for _, d := range encrypted {
+	for i, d := range encrypted {
 		dataBytes := d.ToBytes()
-		id := sha512.Sum512(dataBytes)
+		id := binary.BigEndian.AppendUint64([]byte{}, uint64(i))
 		dataTree.Insert(
-			id[:],
+			id,
 			dataBytes,
 			d.GetStatement(),
 			big.NewInt(int64(len(encrypted)*54)),
@@ -391,7 +391,10 @@ func (set *IdSet) ToBytes() ([]byte, error) {
 	return crypto.SerializeTree(set.tree)
 }
 
-func (set *IdSet) Add(atom Atom) error {
+func (set *IdSet) Add(
+	txn crypto.TreeBackingStoreTransaction,
+	atom Atom,
+) error {
 	if atom.GetAtomType() != set.atomType {
 		return ErrInvalidAtomType
 	}
@@ -399,7 +402,13 @@ func (set *IdSet) Add(atom Atom) error {
 	id := atom.GetID()
 	set.atoms[id] = atom
 	set.dirty = true
-	return set.tree.Insert(id[:], atom.ToBytes(), atom.Commit(), atom.GetSize())
+	return set.tree.Insert(
+		txn,
+		id[:],
+		atom.ToBytes(),
+		atom.Commit(),
+		atom.GetSize(),
+	)
 }
 
 func (set *IdSet) GetSize() *big.Int {
@@ -547,7 +556,10 @@ func (hg *Hypergraph) getOrCreateIdSet(
 	return addMap[shardAddr], removeMap[shardAddr]
 }
 
-func (hg *Hypergraph) AddVertex(v Vertex) error {
+func (hg *Hypergraph) AddVertex(
+	txn crypto.TreeBackingStoreTransaction,
+	v Vertex,
+) error {
 	shardAddr := GetShardKey(v)
 	addSet, _ := hg.getOrCreateIdSet(
 		shardAddr,
@@ -557,10 +569,13 @@ func (hg *Hypergraph) AddVertex(v Vertex) error {
 		AddsPhaseType,
 	)
 	hg.size.Add(hg.size, v.GetSize())
-	return errors.Wrap(addSet.Add(v), "add vertex")
+	return errors.Wrap(addSet.Add(txn, v), "add vertex")
 }
 
-func (hg *Hypergraph) AddHyperedge(h Hyperedge) error {
+func (hg *Hypergraph) AddHyperedge(
+	txn crypto.TreeBackingStoreTransaction,
+	h Hyperedge,
+) error {
 	if !hg.LookupAtomSet(&h.(*hyperedge).extrinsics) {
 		return ErrMissingExtrinsics
 	}
@@ -575,12 +590,15 @@ func (hg *Hypergraph) AddHyperedge(h Hyperedge) error {
 	id := h.GetID()
 	if !removeSet.Has(id) {
 		hg.size.Add(hg.size, h.GetSize())
-		return errors.Wrap(addSet.Add(h), "add hyperedge")
+		return errors.Wrap(addSet.Add(txn, h), "add hyperedge")
 	}
 	return nil
 }
 
-func (hg *Hypergraph) RemoveVertex(v Vertex) error {
+func (hg *Hypergraph) RemoveVertex(
+	txn crypto.TreeBackingStoreTransaction,
+	v Vertex,
+) error {
 	shardKey := GetShardKey(v)
 	if !hg.LookupVertex(v.(*vertex)) {
 		addSet, removeSet := hg.getOrCreateIdSet(
@@ -590,10 +608,10 @@ func (hg *Hypergraph) RemoveVertex(v Vertex) error {
 			VertexAtomType,
 			AddsPhaseType,
 		)
-		if err := addSet.Add(v); err != nil {
+		if err := addSet.Add(txn, v); err != nil {
 			return errors.Wrap(err, "remove vertex")
 		}
-		return errors.Wrap(removeSet.Add(v), "remove vertex")
+		return errors.Wrap(removeSet.Add(txn, v), "remove vertex")
 	}
 
 	id := v.GetID()
@@ -615,11 +633,14 @@ func (hg *Hypergraph) RemoveVertex(v Vertex) error {
 		RemovesPhaseType,
 	)
 	hg.size.Sub(hg.size, v.GetSize())
-	err := removeSet.Add(v)
+	err := removeSet.Add(txn, v)
 	return err
 }
 
-func (hg *Hypergraph) RemoveHyperedge(h Hyperedge) error {
+func (hg *Hypergraph) RemoveHyperedge(
+	txn crypto.TreeBackingStoreTransaction,
+	h Hyperedge,
+) error {
 	shardKey := GetShardKey(h)
 	wasPresent := hg.LookupHyperedge(h.(*hyperedge))
 	if !wasPresent {
@@ -630,11 +651,11 @@ func (hg *Hypergraph) RemoveHyperedge(h Hyperedge) error {
 			HyperedgeAtomType,
 			AddsPhaseType,
 		)
-		if err := addSet.Add(h); err != nil {
+		if err := addSet.Add(txn, h); err != nil {
 			return errors.Wrap(err, "remove hyperedge")
 		}
 
-		return errors.Wrap(removeSet.Add(h), "remove hyperedge")
+		return errors.Wrap(removeSet.Add(txn, h), "remove hyperedge")
 	}
 
 	id := h.GetID()
@@ -655,7 +676,7 @@ func (hg *Hypergraph) RemoveHyperedge(h Hyperedge) error {
 		RemovesPhaseType,
 	)
 	hg.size.Sub(hg.size, h.GetSize())
-	err := removeSet.Add(h)
+	err := removeSet.Add(txn, h)
 	return err
 }
 

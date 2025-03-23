@@ -160,30 +160,30 @@ func TestHypergraphSyncServer(t *testing.T) {
 			id := op.Vertex.GetID()
 			fmt.Printf("server add vertex %x %v\n", id, time.Now())
 			serverHypergraphStore.SaveVertexTree(txn, id[:], dataTree)
-			crdts[0].AddVertex(op.Vertex)
+			crdts[0].AddVertex(nil, op.Vertex)
 		case "RemoveVertex":
-			crdts[0].RemoveVertex(op.Vertex)
+			crdts[0].RemoveVertex(nil, op.Vertex)
 		case "AddHyperedge":
 			fmt.Printf("server add hyperedge %v\n", time.Now())
-			crdts[0].AddHyperedge(op.Hyperedge)
+			crdts[0].AddHyperedge(nil, op.Hyperedge)
 		case "RemoveHyperedge":
 			fmt.Printf("server remove hyperedge %v\n", time.Now())
-			crdts[0].RemoveHyperedge(op.Hyperedge)
+			crdts[0].RemoveHyperedge(nil, op.Hyperedge)
 		}
 	}
 	txn.Commit()
 	for _, op := range operations2[:50] {
 		switch op.Type {
 		case "AddVertex":
-			crdts[0].AddVertex(op.Vertex)
+			crdts[0].AddVertex(nil, op.Vertex)
 		case "RemoveVertex":
-			crdts[0].RemoveVertex(op.Vertex)
+			crdts[0].RemoveVertex(nil, op.Vertex)
 		case "AddHyperedge":
 			fmt.Printf("server add hyperedge %v\n", time.Now())
-			crdts[0].AddHyperedge(op.Hyperedge)
+			crdts[0].AddHyperedge(nil, op.Hyperedge)
 		case "RemoveHyperedge":
 			fmt.Printf("server remove hyperedge %v\n", time.Now())
-			crdts[0].RemoveHyperedge(op.Hyperedge)
+			crdts[0].RemoveHyperedge(nil, op.Hyperedge)
 		}
 	}
 
@@ -194,55 +194,55 @@ func TestHypergraphSyncServer(t *testing.T) {
 			id := op.Vertex.GetID()
 			fmt.Printf("client add vertex %x %v\n", id, time.Now())
 			clientHypergraphStore.SaveVertexTree(txn, id[:], dataTree)
-			crdts[1].AddVertex(op.Vertex)
+			crdts[1].AddVertex(nil, op.Vertex)
 		case "RemoveVertex":
-			crdts[1].RemoveVertex(op.Vertex)
+			crdts[1].RemoveVertex(nil, op.Vertex)
 		case "AddHyperedge":
 			fmt.Printf("client add hyperedge %v\n", time.Now())
-			crdts[1].AddHyperedge(op.Hyperedge)
+			crdts[1].AddHyperedge(nil, op.Hyperedge)
 		case "RemoveHyperedge":
 			fmt.Printf("client remove hyperedge %v\n", time.Now())
-			crdts[1].RemoveHyperedge(op.Hyperedge)
+			crdts[1].RemoveHyperedge(nil, op.Hyperedge)
 		}
 	}
 	txn.Commit()
 	for _, op := range operations2[50:] {
 		switch op.Type {
 		case "AddVertex":
-			crdts[1].AddVertex(op.Vertex)
+			crdts[1].AddVertex(nil, op.Vertex)
 		case "RemoveVertex":
-			crdts[1].RemoveVertex(op.Vertex)
+			crdts[1].RemoveVertex(nil, op.Vertex)
 		case "AddHyperedge":
 			fmt.Printf("client add hyperedge %v\n", time.Now())
-			crdts[1].AddHyperedge(op.Hyperedge)
+			crdts[1].AddHyperedge(nil, op.Hyperedge)
 		case "RemoveHyperedge":
 			fmt.Printf("client remove hyperedge %v\n", time.Now())
-			crdts[1].RemoveHyperedge(op.Hyperedge)
+			crdts[1].RemoveHyperedge(nil, op.Hyperedge)
 		}
 	}
 
 	for _, op := range operations1 {
 		switch op.Type {
 		case "AddVertex":
-			crdts[2].AddVertex(op.Vertex)
+			crdts[2].AddVertex(nil, op.Vertex)
 		case "RemoveVertex":
-			crdts[2].RemoveVertex(op.Vertex)
+			crdts[2].RemoveVertex(nil, op.Vertex)
 		case "AddHyperedge":
-			crdts[2].AddHyperedge(op.Hyperedge)
+			crdts[2].AddHyperedge(nil, op.Hyperedge)
 		case "RemoveHyperedge":
-			crdts[2].RemoveHyperedge(op.Hyperedge)
+			crdts[2].RemoveHyperedge(nil, op.Hyperedge)
 		}
 	}
 	for _, op := range operations2 {
 		switch op.Type {
 		case "AddVertex":
-			crdts[2].AddVertex(op.Vertex)
+			crdts[2].AddVertex(nil, op.Vertex)
 		case "RemoveVertex":
-			crdts[2].RemoveVertex(op.Vertex)
+			crdts[2].RemoveVertex(nil, op.Vertex)
 		case "AddHyperedge":
-			crdts[2].AddHyperedge(op.Hyperedge)
+			crdts[2].AddHyperedge(nil, op.Hyperedge)
 		case "RemoveHyperedge":
-			crdts[2].RemoveHyperedge(op.Hyperedge)
+			crdts[2].RemoveHyperedge(nil, op.Hyperedge)
 		}
 	}
 

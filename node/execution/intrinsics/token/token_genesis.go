@@ -905,6 +905,7 @@ func CreateGenesisState(
 			}
 
 			if err := hg.AddVertex(
+				nil,
 				hypergraph.NewVertex(
 					[32]byte(application.TOKEN_ADDRESS),
 					[32]byte(address),
@@ -1083,6 +1084,7 @@ func CreateGenesisState(
 			}
 
 			if err := hg.AddVertex(
+				nil,
 				hypergraph.NewVertex(
 					[32]byte(application.TOKEN_ADDRESS),
 					[32]byte(address),

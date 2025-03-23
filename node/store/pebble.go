@@ -13,7 +13,14 @@ type PebbleDB struct {
 }
 
 func NewPebbleDB(config *config.DBConfig) *PebbleDB {
-	db, err := pebble.Open(config.Path, &pebble.Options{})
+	opts := &pebble.Options{
+		MemTableSize:          64 << 20,
+		MaxOpenFiles:          1000,
+		L0CompactionThreshold: 8,
+		L0StopWritesThreshold: 32,
+		LBaseMaxBytes:         64 << 20,
+	}
+	db, err := pebble.Open(config.Path, opts)
 	if err != nil {
 		panic(err)
 	}

@@ -495,6 +495,7 @@ func getBranchInfoFromTree(
 		intpath = append(intpath, int(p))
 	}
 	commitment := node.Commit(
+		nil,
 		tree.SetType,
 		tree.PhaseType,
 		tree.ShardKey,
@@ -527,6 +528,7 @@ func getBranchInfoFromTree(
 			}
 			if child != nil {
 				childCommit := child.Commit(
+					nil,
 					tree.SetType,
 					tree.PhaseType,
 					tree.ShardKey,
@@ -1169,7 +1171,7 @@ outer:
 				}
 			}
 
-			err := idSet.Add(theirs)
+			err := idSet.Add(nil, theirs)
 			if err != nil {
 				logger.Error("error while saving", zap.Error(err))
 				break outer
@@ -1427,7 +1429,7 @@ outer:
 				}
 			}
 
-			err := set.Add(theirs)
+			err := set.Add(nil, theirs)
 			if err != nil {
 				logger.Error("error while saving", zap.Error(err))
 				break outer

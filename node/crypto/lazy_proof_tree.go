@@ -24,6 +24,7 @@ type ShardKey struct {
 
 type LazyVectorCommitmentNode interface {
 	Commit(
+		txn TreeBackingStoreTransaction,
 		setType string,
 		phaseType string,
 		shardKey ShardKey,
@@ -55,6 +56,7 @@ type LazyVectorCommitmentBranchNode struct {
 }
 
 func (n *LazyVectorCommitmentLeafNode) Commit(
+	txn TreeBackingStoreTransaction,
 	setType string,
 	phaseType string,
 	shardKey ShardKey,
@@ -72,6 +74,7 @@ func (n *LazyVectorCommitmentLeafNode) Commit(
 		}
 		n.Commitment = h.Sum(nil)
 		if err := n.Store.InsertNode(
+			txn,
 			setType,
 			phaseType,
 			shardKey,
@@ -90,6 +93,7 @@ func (n *LazyVectorCommitmentLeafNode) GetSize() *big.Int {
 }
 
 func (n *LazyVectorCommitmentBranchNode) Commit(
+	txn TreeBackingStoreTransaction,
 	setType string,
 	phaseType string,
 	shardKey ShardKey,
@@ -121,6 +125,7 @@ func (n *LazyVectorCommitmentBranchNode) Commit(
 				}
 				if child != nil {
 					out := child.Commit(
+						txn,
 						setType,
 						phaseType,
 						shardKey,
@@ -152,6 +157,7 @@ func (n *LazyVectorCommitmentBranchNode) Commit(
 		}
 		n.Commitment = rbls48581.CommitRaw(data, 64)
 		if err := n.Store.InsertNode(
+			txn,
 			setType,
 			phaseType,
 			shardKey,
@@ -227,6 +233,15 @@ func (n *LazyVectorCommitmentBranchNode) Prove(index int) []byte {
 	return rbls48581.ProveRaw(data, uint64(index), 64)
 }
 
+type TreeBackingStoreTransaction interface {
+	Get(key []byte) ([]byte, io.Closer, error)
+	Set(key []byte, value []byte) error
+	Commit() error
+	Delete(key []byte) error
+	Abort() error
+	DeleteRange(lowerBound []byte, upperBound []byte) error
+}
+
 type TreeBackingStore interface {
 	GetNodeByKey(
 		setType string,
@@ -241,6 +256,7 @@ type TreeBackingStore interface {
 		path []int,
 	) (LazyVectorCommitmentNode, error)
 	InsertNode(
+		txn TreeBackingStoreTransaction,
 		setType string,
 		phaseType string,
 		shardKey ShardKey,
@@ -272,6 +288,7 @@ type LazyVectorCommitmentTree struct {
 
 // Insert adds or updates a key-value pair in the tree
 func (t *LazyVectorCommitmentTree) Insert(
+	txn TreeBackingStoreTransaction,
 	key, value, hashTarget []byte,
 	size *big.Int,
 ) error {
@@ -311,6 +328,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 			}
 
 			err := t.Store.InsertNode(
+				txn,
 				t.SetType,
 				t.PhaseType,
 				t.ShardKey,
@@ -351,6 +369,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 				n.Size = size
 
 				err := t.Store.InsertNode(
+					txn,
 					t.SetType,
 					t.PhaseType,
 					t.ShardKey,
@@ -392,6 +411,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 			}
 
 			err := t.Store.InsertNode(
+				txn,
 				t.SetType,
 				t.PhaseType,
 				t.ShardKey,
@@ -405,6 +425,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 			}
 
 			err = t.Store.InsertNode(
+				txn,
 				t.SetType,
 				t.PhaseType,
 				t.ShardKey,
@@ -418,6 +439,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 			}
 
 			err = t.Store.InsertNode(
+				txn,
 				t.SetType,
 				t.PhaseType,
 				t.ShardKey,
@@ -460,6 +482,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 						}
 
 						err := t.Store.InsertNode(
+							txn,
 							t.SetType,
 							t.PhaseType,
 							t.ShardKey,
@@ -478,6 +501,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 							[]int{expectedNibble},
 						)
 						err = t.Store.InsertNode(
+							txn,
 							t.SetType,
 							t.PhaseType,
 							t.ShardKey,
@@ -491,6 +515,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 						}
 
 						err = t.Store.InsertNode(
+							txn,
 							t.SetType,
 							t.PhaseType,
 							t.ShardKey,
@@ -535,6 +560,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 				}
 
 				err := t.Store.InsertNode(
+					txn,
 					t.SetType,
 					t.PhaseType,
 					t.ShardKey,
@@ -573,6 +599,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 				}
 
 				err := t.Store.InsertNode(
+					txn,
 					t.SetType,
 					t.PhaseType,
 					t.ShardKey,
@@ -753,6 +780,7 @@ func (t *LazyVectorCommitmentTree) Commit(recalculate bool) []byte {
 	}
 
 	commitment := t.Root.Commit(
+		nil,
 		t.SetType,
 		t.PhaseType,
 		t.ShardKey,

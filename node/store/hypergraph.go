@@ -56,6 +56,7 @@ type HypergraphStore interface {
 		path []int,
 	) (crypto.LazyVectorCommitmentNode, error)
 	InsertNode(
+		txn crypto.TreeBackingStoreTransaction,
 		setType string,
 		phaseType string,
 		shardKey crypto.ShardKey,
@@ -697,8 +698,26 @@ func (p *PebbleHypergraphStore) LoadHypergraph() (
 					return err
 				}
 
-				for _, atom := range atoms {
-					hg.AddVertex(atom.(application.Vertex))
+				txn, err := p.NewTransaction(false)
+				if err != nil {
+					return err
+				}
+				for i, atom := range atoms {
+					hg.AddVertex(txn, atom.(application.Vertex))
+
+					if i%100 == 99 {
+						if err := txn.Commit(); err != nil {
+							txn.Abort()
+							return err
+						}
+						txn = nil
+					}
+				}
+				if txn != nil {
+					if err := txn.Commit(); err != nil {
+						txn.Abort()
+						return err
+					}
 				}
 
 				return nil
@@ -1015,6 +1034,7 @@ func generateSlices(fullpref, pref []int) [][]int {
 }
 
 func (p *PebbleHypergraphStore) InsertNode(
+	txn crypto.TreeBackingStoreTransaction,
 	setType string,
 	phaseType string,
 	shardKey crypto.ShardKey,
@@ -1022,6 +1042,11 @@ func (p *PebbleHypergraphStore) InsertNode(
 	path []int,
 	node crypto.LazyVectorCommitmentNode,
 ) error {
+	setter := p.db.Set
+	if txn != nil {
+		setter = txn.Set
+	}
+
 	keyFn := hypergraphVertexAddsTreeNodeKey
 	pathFn := hypergraphVertexAddsTreeNodeByPathKey
 	switch application.AtomType(setType) {
@@ -1061,14 +1086,14 @@ func (p *PebbleHypergraphStore) InsertNode(
 		}
 		data := append([]byte{crypto.TypeBranch}, pathBytes...)
 		data = append(data, b.Bytes()...)
-		err = p.db.Set(nodeKey, data)
+		err = setter(nodeKey, data)
 		if err != nil {
 			return errors.Wrap(err, "insert node")
 		}
 		sets := generateSlices(n.FullPrefix, path)
 		for _, set := range sets {
 			pathKey := pathFn(shardKey, set)
-			err = p.db.Set(pathKey, nodeKey)
+			err = setter(pathKey, nodeKey)
 			if err != nil {
 				return errors.Wrap(err, "insert node")
 			}
@@ -1081,11 +1106,11 @@ func (p *PebbleHypergraphStore) InsertNode(
 		}
 		data := append([]byte{crypto.TypeLeaf}, b.Bytes()...)
 		pathKey := pathFn(shardKey, path)
-		err = p.db.Set(nodeKey, data)
+		err = setter(nodeKey, data)
 		if err != nil {
 			return errors.Wrap(err, "insert node")
 		}
-		return errors.Wrap(p.db.Set(pathKey, nodeKey), "insert node")
+		return errors.Wrap(setter(pathKey, nodeKey), "insert node")
 	}
 
 	return nil
