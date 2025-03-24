@@ -20,7 +20,17 @@ RUN apt-get update && apt-get install -y \
     autoconf \
     automake \
     libtool \
+    libssl-dev \
+    python3 \
+    python-is-python3 \
     && rm -rf /var/lib/apt/lists/*
+
+RUN wget https://raw.githubusercontent.com/emp-toolkit/emp-readme/master/scripts/install.py
+
+RUN python install.py --install --tool --ot
+
+RUN cd emp-tool && sed -i 's/add_library(${NAME} SHARED ${sources})/add_library(${NAME} STATIC ${sources})/g' CMakeLists.txt && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && cd .. && make && make install && cd ..
+RUN cd emp-ot && mkdir build && cd build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local && cd .. && make && make install && cd ..
 
 RUN apt update && apt install -y wget && \
     ARCH=$(dpkg --print-architecture) && \
@@ -68,6 +78,9 @@ WORKDIR /opt/ceremonyclient
 
 COPY . .
 
+WORKDIR /opt/ceremonyclient/ferret
+RUN ./generate.sh
+
 ## Generate Rust bindings for VDF
 WORKDIR /opt/ceremonyclient/vdf
 RUN ./generate.sh
@@ -91,10 +104,19 @@ WORKDIR /opt/ceremonyclient/client
 
 RUN ./build.sh -o qclient && cp qclient /usr/bin
 
+# Build and install QCL sidecar
+WORKDIR /opt/ceremonyclient/bedlam
+RUN ./build.sh -o sidecar apps/garbled && cp sidecar /usr/bin
+
 # Allows exporting single binary
 FROM scratch as qclient
 COPY --from=build /usr/bin/qclient /qclient
 ENTRYPOINT [ "/qclient" ]
+
+# Allows exporting single binary
+FROM scratch as sidecar
+COPY --from=build /usr/bin/sidecar /sidecar
+ENTRYPOINT [ "/sidecar" ]
 
 # Allows exporting single binary
 FROM scratch AS node

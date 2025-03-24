@@ -21,6 +21,7 @@ members = [
     "crates/ed448-rust",
     "crates/rpm",
     "crates/verenc",
+    "crates/ferret"
 ]
 
 [profile.release]
