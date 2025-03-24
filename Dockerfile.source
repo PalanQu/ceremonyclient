@@ -106,7 +106,7 @@ RUN ./build.sh -o qclient && cp qclient /usr/bin
 
 # Build and install QCL sidecar
 WORKDIR /opt/ceremonyclient/bedlam
-RUN ./build.sh -o sidecar apps/garbled && cp sidecar /usr/bin
+RUN ./build.sh -o sidecar ./apps/garbled && cp sidecar /usr/bin
 
 # Allows exporting single binary
 FROM scratch as qclient

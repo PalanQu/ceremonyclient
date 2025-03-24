@@ -26,7 +26,7 @@ case "$os_type" in
         fi
         ;;
     "Linux")
-        export CGO_LDFLAGS="-L/usr/local/lib -ldl -lm -L$BINARIES_DIR -lcrypto -lssl -static"
+        export CGO_LDFLAGS="-L/usr/local/lib -ldl -lm -L$BINARIES_DIR -lstdc++ -lcrypto -lssl -lferret -static"
 	go build -ldflags "-linkmode 'external'" "$@"
         ;;
     *)

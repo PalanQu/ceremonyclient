@@ -34,16 +34,19 @@ fn main() {
     cc::Build::new()
         .cpp(true)
         .flag_if_supported("-std=c++17")
+        .flag_if_supported("-march=armv8-a+crypto")
         .file("emp_bridge.cpp")
         .flag("-I/usr/local/include/emp-tool/")
         .flag("-I/usr/local/include/emp-ot/")
         .flag("-I/usr/include/openssl/")
+        .flag("-L/usr/local/lib/")
         .flag("-L/usr/local/lib/aarch64-linux-gnu/")
         .flag("-L/usr/lib/aarch64-linux-gnu/openssl/")
         .warnings(false)
         .compile("emp_bridge");
 
     println!("cargo:rustc-link-search=native=/usr/local/lib/aarch64-linux-gnu");
+    println!("cargo:rustc-link-search=native=/usr/local/lib/");
 
     println!("cargo:rustc-link-lib=static=emp-tool");
 
