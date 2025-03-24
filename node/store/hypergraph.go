@@ -710,7 +710,10 @@ func (p *PebbleHypergraphStore) LoadHypergraph() (
 							txn.Abort()
 							return err
 						}
-						txn = nil
+						txn, err = p.NewTransaction(false)
+						if err != nil {
+							return err
+						}
 					}
 				}
 				if txn != nil {
