@@ -162,7 +162,7 @@ func (n *LazyVectorCommitmentBranchNode) Commit(
 			phaseType,
 			shardKey,
 			generateKeyFromPath(n.FullPrefix),
-			n.FullPrefix,
+			path,
 			n,
 		); err != nil {
 			panic(err)
@@ -444,7 +444,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 				t.PhaseType,
 				t.ShardKey,
 				generateKeyFromPath(slices.Concat(path, sharedNibbles)),
-				slices.Concat(path, sharedNibbles),
+				path,
 				branch,
 			)
 			if err != nil {
@@ -499,13 +499,15 @@ func (t *LazyVectorCommitmentTree) Insert(
 							path,
 							newBranch.Prefix,
 							[]int{expectedNibble},
+							n.Prefix,
 						)
+
 						err = t.Store.InsertNode(
 							txn,
 							t.SetType,
 							t.PhaseType,
 							t.ShardKey,
-							generateKeyFromPath(slices.Concat(path, newBranch.Prefix, []int{expectedNibble})),
+							generateKeyFromPath(slices.Concat(path, newBranch.Prefix, []int{expectedNibble}, n.Prefix)),
 							slices.Concat(path, newBranch.Prefix, []int{expectedNibble}),
 							newBranch.Children[expectedNibble],
 						)
@@ -520,7 +522,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 							t.PhaseType,
 							t.ShardKey,
 							generateKeyFromPath(slices.Concat(path, newBranch.Prefix)),
-							slices.Concat(path, newBranch.Prefix),
+							path,
 							newBranch,
 						)
 						if err != nil {
@@ -534,11 +536,8 @@ func (t *LazyVectorCommitmentTree) Insert(
 
 				// Key matches prefix, continue with final nibble
 				finalNibble := getNextNibble(key, depth+len(n.Prefix)*BranchBits)
-				maybeBranch, ok := n.Children[finalNibble].(*LazyVectorCommitmentBranchNode)
 				newPath := slices.Concat(path, n.Prefix, []int{finalNibble})
-				if ok {
-					newPath = append(newPath, maybeBranch.Prefix...)
-				}
+
 				delta, inserted := insert(
 					n.Children[finalNibble],
 					depth+len(n.Prefix)*BranchBits+BranchBits,
@@ -577,11 +576,8 @@ func (t *LazyVectorCommitmentTree) Insert(
 			} else {
 				// Simple branch without prefix
 				nibble := getNextNibble(key, depth)
-				maybeBranch, ok := n.Children[nibble].(*LazyVectorCommitmentBranchNode)
 				newPath := slices.Concat(path, n.Prefix, []int{nibble})
-				if ok {
-					newPath = append(newPath, maybeBranch.Prefix...)
-				}
+
 				delta, inserted := insert(n.Children[nibble], depth+BranchBits, newPath)
 				n.Children[nibble] = inserted
 				n.Commitment = nil
@@ -619,13 +615,7 @@ func (t *LazyVectorCommitmentTree) Insert(
 		return 0, nil
 	}
 
-	prefix := []int{}
-	branch, ok := t.Root.(*LazyVectorCommitmentBranchNode)
-	if ok {
-		prefix = append(prefix, branch.Prefix...)
-	}
-
-	_, t.Root = insert(t.Root, 0, prefix)
+	_, t.Root = insert(t.Root, 0, []int{})
 	return errors.Wrap(t.Store.SaveRoot(
 		t.SetType,
 		t.PhaseType,

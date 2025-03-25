@@ -156,11 +156,12 @@ func (c *Compiler) stream(conn *p2p.Conn, oti ot.OT, source string,
 
 	out, bits, err := program.Stream(conn, oti, c.params, input, timing)
 	if err != nil {
+		fmt.Println(err)
 		return nil, nil, err
 	}
-	if false {
-		program.StreamDebug()
-	}
+	// if false {
+	program.StreamDebug()
+	// }
 	return out, bits, err
 }
 

@@ -10,7 +10,6 @@ import (
 	"math/big"
 	"net"
 	"testing"
-	"time"
 
 	"github.com/cloudflare/circl/sign/ed448"
 	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
@@ -158,17 +157,16 @@ func TestHypergraphSyncServer(t *testing.T) {
 		switch op.Type {
 		case "AddVertex":
 			id := op.Vertex.GetID()
-			fmt.Printf("server add vertex %x %v\n", id, time.Now())
 			serverHypergraphStore.SaveVertexTree(txn, id[:], dataTree)
 			crdts[0].AddVertex(nil, op.Vertex)
 		case "RemoveVertex":
 			crdts[0].RemoveVertex(nil, op.Vertex)
-		case "AddHyperedge":
-			fmt.Printf("server add hyperedge %v\n", time.Now())
-			crdts[0].AddHyperedge(nil, op.Hyperedge)
-		case "RemoveHyperedge":
-			fmt.Printf("server remove hyperedge %v\n", time.Now())
-			crdts[0].RemoveHyperedge(nil, op.Hyperedge)
+			// case "AddHyperedge":
+			// 	fmt.Printf("server add hyperedge %v\n", time.Now())
+			// 	crdts[0].AddHyperedge(nil, op.Hyperedge)
+			// case "RemoveHyperedge":
+			// 	fmt.Printf("server remove hyperedge %v\n", time.Now())
+			// 	crdts[0].RemoveHyperedge(nil, op.Hyperedge)
 		}
 	}
 	txn.Commit()
@@ -178,12 +176,12 @@ func TestHypergraphSyncServer(t *testing.T) {
 			crdts[0].AddVertex(nil, op.Vertex)
 		case "RemoveVertex":
 			crdts[0].RemoveVertex(nil, op.Vertex)
-		case "AddHyperedge":
-			fmt.Printf("server add hyperedge %v\n", time.Now())
-			crdts[0].AddHyperedge(nil, op.Hyperedge)
-		case "RemoveHyperedge":
-			fmt.Printf("server remove hyperedge %v\n", time.Now())
-			crdts[0].RemoveHyperedge(nil, op.Hyperedge)
+			// case "AddHyperedge":
+			// 	fmt.Printf("server add hyperedge %v\n", time.Now())
+			// 	crdts[0].AddHyperedge(nil, op.Hyperedge)
+			// case "RemoveHyperedge":
+			// 	fmt.Printf("server remove hyperedge %v\n", time.Now())
+			// 	crdts[0].RemoveHyperedge(nil, op.Hyperedge)
 		}
 	}
 
@@ -192,17 +190,16 @@ func TestHypergraphSyncServer(t *testing.T) {
 		switch op.Type {
 		case "AddVertex":
 			id := op.Vertex.GetID()
-			fmt.Printf("client add vertex %x %v\n", id, time.Now())
 			clientHypergraphStore.SaveVertexTree(txn, id[:], dataTree)
 			crdts[1].AddVertex(nil, op.Vertex)
 		case "RemoveVertex":
 			crdts[1].RemoveVertex(nil, op.Vertex)
-		case "AddHyperedge":
-			fmt.Printf("client add hyperedge %v\n", time.Now())
-			crdts[1].AddHyperedge(nil, op.Hyperedge)
-		case "RemoveHyperedge":
-			fmt.Printf("client remove hyperedge %v\n", time.Now())
-			crdts[1].RemoveHyperedge(nil, op.Hyperedge)
+			// case "AddHyperedge":
+			// 	fmt.Printf("client add hyperedge %v\n", time.Now())
+			// 	crdts[1].AddHyperedge(nil, op.Hyperedge)
+			// case "RemoveHyperedge":
+			// 	fmt.Printf("client remove hyperedge %v\n", time.Now())
+			// 	crdts[1].RemoveHyperedge(nil, op.Hyperedge)
 		}
 	}
 	txn.Commit()
@@ -212,12 +209,12 @@ func TestHypergraphSyncServer(t *testing.T) {
 			crdts[1].AddVertex(nil, op.Vertex)
 		case "RemoveVertex":
 			crdts[1].RemoveVertex(nil, op.Vertex)
-		case "AddHyperedge":
-			fmt.Printf("client add hyperedge %v\n", time.Now())
-			crdts[1].AddHyperedge(nil, op.Hyperedge)
-		case "RemoveHyperedge":
-			fmt.Printf("client remove hyperedge %v\n", time.Now())
-			crdts[1].RemoveHyperedge(nil, op.Hyperedge)
+			// case "AddHyperedge":
+			// 	fmt.Printf("client add hyperedge %v\n", time.Now())
+			// 	crdts[1].AddHyperedge(nil, op.Hyperedge)
+			// case "RemoveHyperedge":
+			// 	fmt.Printf("client remove hyperedge %v\n", time.Now())
+			// 	crdts[1].RemoveHyperedge(nil, op.Hyperedge)
 		}
 	}
 
@@ -227,10 +224,10 @@ func TestHypergraphSyncServer(t *testing.T) {
 			crdts[2].AddVertex(nil, op.Vertex)
 		case "RemoveVertex":
 			crdts[2].RemoveVertex(nil, op.Vertex)
-		case "AddHyperedge":
-			crdts[2].AddHyperedge(nil, op.Hyperedge)
-		case "RemoveHyperedge":
-			crdts[2].RemoveHyperedge(nil, op.Hyperedge)
+			// case "AddHyperedge":
+			// 	crdts[2].AddHyperedge(nil, op.Hyperedge)
+			// case "RemoveHyperedge":
+			// 	crdts[2].RemoveHyperedge(nil, op.Hyperedge)
 		}
 	}
 	for _, op := range operations2 {
@@ -239,32 +236,35 @@ func TestHypergraphSyncServer(t *testing.T) {
 			crdts[2].AddVertex(nil, op.Vertex)
 		case "RemoveVertex":
 			crdts[2].RemoveVertex(nil, op.Vertex)
-		case "AddHyperedge":
-			crdts[2].AddHyperedge(nil, op.Hyperedge)
-		case "RemoveHyperedge":
-			crdts[2].RemoveHyperedge(nil, op.Hyperedge)
+			// case "AddHyperedge":
+			// 	crdts[2].AddHyperedge(nil, op.Hyperedge)
+			// case "RemoveHyperedge":
+			// 	crdts[2].RemoveHyperedge(nil, op.Hyperedge)
 		}
 	}
 
-	crdts[0].Commit()
-	crdts[1].Commit()
-	crdts[2].Commit()
+	// crdts[0].Commit()
+	// crdts[1].Commit()
+	// crdts[2].Commit()
 	// err := serverHypergraphStore.SaveHypergraph(crdts[0])
 	// assert.NoError(t, err)
 	// err = clientHypergraphStore.SaveHypergraph(crdts[1])
 	// assert.NoError(t, err)
-	// serverLoad, err := serverHypergraphStore.LoadHypergraph()
-	// assert.NoError(t, err)
-	// clientLoad, err := clientHypergraphStore.LoadHypergraph()
-	// assert.NoError(t, err)
-	// assert.Len(t, crypto.CompareLeaves(
-	// 	crdts[0].GetVertexAdds()[shardKey].GetTree(),
-	// 	serverLoad.GetVertexAdds()[shardKey].GetTree(),
-	// ), 0)
-	// assert.Len(t, crypto.CompareLeaves(
-	// 	crdts[1].GetVertexAdds()[shardKey].GetTree(),
-	// 	clientLoad.GetVertexAdds()[shardKey].GetTree(),
-	// ), 0)
+	serverHypergraphStore.MarkHypergraphAsComplete()
+	clientHypergraphStore.MarkHypergraphAsComplete()
+	serverLoad, err := serverHypergraphStore.LoadHypergraph()
+	assert.NoError(t, err)
+	clientLoad, err := clientHypergraphStore.LoadHypergraph()
+	assert.NoError(t, err)
+	assert.Len(t, crypto.CompareLeaves(
+		crdts[0].GetVertexAdds()[shardKey].GetTree(),
+		serverLoad.GetVertexAdds()[shardKey].GetTree(),
+	), 0)
+	assert.Len(t, crypto.CompareLeaves(
+		crdts[1].GetVertexAdds()[shardKey].GetTree(),
+		clientLoad.GetVertexAdds()[shardKey].GetTree(),
+	), 0)
+	crypto.DebugNode(string(application.VertexAtomType), string(application.AddsPhaseType), shardKey, serverLoad.GetVertexAdds()[shardKey].GetTree().Root, 0, "")
 	log.Printf("Generated data")
 
 	lis, err := net.Listen("tcp", ":50051")

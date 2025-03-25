@@ -719,6 +719,9 @@ func (prog *Program) garble(conn *p2p.Conn, streaming *circuit.Streaming,
 	if err := conn.SendUint32(int(maxID + 1)); err != nil {
 		return err
 	}
+	if err := conn.Flush(); err != nil {
+		return err
+	}
 	tInit, tGarble, err := streaming.Garble(circ, in, out)
 	if err != nil {
 		return err

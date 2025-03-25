@@ -972,6 +972,7 @@ func (e *TokenExecutionEngine) rebuildMissingSetForHypergraph(set [][]byte) {
 		txn.Abort()
 		panic(err)
 	}
+	e.hypergraphStore.MarkHypergraphAsComplete()
 }
 
 func (e *TokenExecutionEngine) rebuildHypergraph(totalRange int) {
@@ -1057,6 +1058,7 @@ func (e *TokenExecutionEngine) rebuildHypergraph(totalRange int) {
 		txn.Abort()
 		panic(err)
 	}
+	e.hypergraphStore.MarkHypergraphAsComplete()
 }
 
 // GetName implements ExecutionEngine

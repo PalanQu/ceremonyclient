@@ -185,8 +185,6 @@ func CompareLeaves(tree1, tree2 *LazyVectorCommitmentTree) []LeafDifference {
 		tree2.ShardKey,
 		tree2.Root,
 	)
-	fmt.Println(len(leaves1))
-	fmt.Println(len(leaves2))
 
 	differences := make([]LeafDifference, 0)
 
@@ -323,6 +321,8 @@ func GetAllLeaves(
 		leaves = append(leaves, n)
 	case *LazyVectorCommitmentBranchNode:
 		for i, child := range n.Children {
+			child := child
+			i := i
 			var err error
 			if child == nil {
 				child, err = n.Store.GetNodeByPath(

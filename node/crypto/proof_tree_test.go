@@ -379,5 +379,5 @@ func TestVectorCommitmentTrees(t *testing.T) {
 		t.Errorf("incorrect longest branch count, %d, %d,", 4, longestBranch)
 	}
 
-	DebugNode(tree.Root, 0, "")
+	// DebugNode(tree.Root, 0, "")
 }

@@ -305,6 +305,10 @@ func NewInMemKVDB() *InMemKVDB {
 	}
 }
 
+func (d *InMemKVDB) GetRawStore() map[string][]byte {
+	return d.store
+}
+
 func (d *InMemKVDB) Get(key []byte) ([]byte, io.Closer, error) {
 	if !d.open {
 		return nil, nil, errors.New("inmem db closed")

@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"slices"
+	"strings"
 	"sync"
 
 	rbls48581 "source.quilibrium.com/quilibrium/monorepo/bls48581"
@@ -200,7 +202,7 @@ type VectorCommitmentTree struct {
 func getNextNibble(key []byte, pos int) int {
 	startByte := pos / 8
 	if startByte >= len(key) {
-		return 0
+		return -1
 	}
 
 	// Calculate how many bits we need from the current byte
@@ -232,7 +234,7 @@ func getNibblesUntilDiverge(key1, key2 []byte, startDepth int) ([]int, int) {
 	for {
 		n1 := getNextNibble(key1, depth)
 		n2 := getNextNibble(key2, depth)
-		if n1 != n2 {
+		if n1 == -1 || n2 == -1 || n1 != n2 {
 			return nibbles, depth
 		}
 		nibbles = append(nibbles, n1)
@@ -613,20 +615,32 @@ func (t *VectorCommitmentTree) GetSize() *big.Int {
 	return t.Root.GetSize()
 }
 
-func DebugNode(node VectorCommitmentNode, depth int, prefix string) {
+func DebugNode(setType, phaseType string, shardKey ShardKey, node LazyVectorCommitmentNode, depth int, prefix string) {
 	if node == nil {
 		return
 	}
 
 	switch n := node.(type) {
-	case *VectorCommitmentLeafNode:
+	case *LazyVectorCommitmentLeafNode:
 		fmt.Printf("%sLeaf: key=%x value=%x\n", prefix, n.Key, n.Value)
-	case *VectorCommitmentBranchNode:
+	case *LazyVectorCommitmentBranchNode:
 		fmt.Printf("%sBranch %v:\n", prefix, n.Prefix)
 		for i, child := range n.Children {
+			if child == nil {
+				var err error
+				child, err = n.Store.GetNodeByPath(
+					setType,
+					phaseType,
+					shardKey,
+					slices.Concat(n.FullPrefix, []int{i}),
+				)
+				if err != nil && !strings.Contains(err.Error(), "not found") {
+					panic(err)
+				}
+			}
 			if child != nil {
 				fmt.Printf("%s  [%d]:\n", prefix, i)
-				DebugNode(child, depth+1, prefix+"    ")
+				DebugNode(setType, phaseType, shardKey, child, depth+1, prefix+"    ")
 			}
 		}
 	}
