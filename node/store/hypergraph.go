@@ -779,7 +779,7 @@ func (p *PebbleHypergraphStore) LoadHypergraph() (
 					}
 					id := vert.GetID()
 					if existingTree != nil {
-						if v, _ := existingTree.Get(id[:]); v == nil {
+						if v, _ := existingTree.Get(id[:]); v != nil {
 							continue
 						}
 					}
