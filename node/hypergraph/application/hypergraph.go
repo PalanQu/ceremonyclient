@@ -467,16 +467,32 @@ func (hg *Hypergraph) GetHyperedgeRemoves() map[crypto.ShardKey]*IdSet {
 func (hg *Hypergraph) Commit() [][]byte {
 	commits := [][]byte{}
 	for _, vertexAdds := range hg.vertexAdds {
-		commits = append(commits, vertexAdds.tree.Commit(false))
+		root := vertexAdds.tree.Commit(false)
+		if bytes.Equal(root, []byte{}) {
+			root = vertexAdds.tree.Commit(true)
+		}
+		commits = append(commits, root)
 	}
 	for _, vertexRemoves := range hg.vertexRemoves {
-		commits = append(commits, vertexRemoves.tree.Commit(false))
+		root := vertexRemoves.tree.Commit(false)
+		if bytes.Equal(root, []byte{}) {
+			root = vertexRemoves.tree.Commit(true)
+		}
+		commits = append(commits, root)
 	}
 	for _, hyperedgeAdds := range hg.hyperedgeAdds {
-		commits = append(commits, hyperedgeAdds.tree.Commit(false))
+		root := hyperedgeAdds.tree.Commit(false)
+		if bytes.Equal(root, []byte{}) {
+			root = hyperedgeAdds.tree.Commit(true)
+		}
+		commits = append(commits, root)
 	}
 	for _, hyperedgeRemoves := range hg.hyperedgeRemoves {
-		commits = append(commits, hyperedgeRemoves.tree.Commit(false))
+		root := hyperedgeRemoves.tree.Commit(false)
+		if bytes.Equal(root, []byte{}) {
+			root = hyperedgeRemoves.tree.Commit(true)
+		}
+		commits = append(commits, root)
 	}
 	return commits
 }

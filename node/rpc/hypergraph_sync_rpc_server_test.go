@@ -61,6 +61,7 @@ func TestLoadHypergraphFallback(t *testing.T) {
 	assert.NoError(t, err)
 	clientLoad, err := clientHypergraphStore.LoadHypergraph()
 	assert.NoError(t, err)
+	fmt.Printf("%x\n", serverLoad.Commit()[0])
 	for k, a := range serverLoad.GetVertexAdds() {
 		assert.Equal(t, len(crypto.ConvertAllPreloadedLeaves(string(application.VertexAtomType), string(application.AddsPhaseType), k, serverHypergraphStore, a.GetTree().Root, []int{})), 100000)
 	}
@@ -243,8 +244,8 @@ func TestHypergraphSyncServer(t *testing.T) {
 		}
 	}
 
-	// crdts[0].Commit()
-	// crdts[1].Commit()
+	crdts[0].Commit()
+	crdts[1].Commit()
 	// crdts[2].Commit()
 	// err := serverHypergraphStore.SaveHypergraph(crdts[0])
 	// assert.NoError(t, err)
@@ -256,6 +257,8 @@ func TestHypergraphSyncServer(t *testing.T) {
 	assert.NoError(t, err)
 	clientLoad, err := clientHypergraphStore.LoadHypergraph()
 	assert.NoError(t, err)
+	fmt.Printf("%x\n", crdts[0].Commit()[0])
+	fmt.Printf("%x\n", serverLoad.Commit()[0])
 	assert.Len(t, crypto.CompareLeaves(
 		crdts[0].GetVertexAdds()[shardKey].GetTree(),
 		serverLoad.GetVertexAdds()[shardKey].GetTree(),

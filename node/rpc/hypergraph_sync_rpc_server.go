@@ -365,7 +365,6 @@ func (s *streamManager) sendLeafData(
 	default:
 	}
 
-	fmt.Printf("send leaf data %v\n", path)
 	node := getNodeAtPath(
 		s.localTree.SetType,
 		s.localTree.PhaseType,
@@ -414,7 +413,6 @@ func getNodeAtPath(
 		return nil
 	}
 	if len(path) == 0 {
-		fmt.Println("path is zero, returning")
 		return node
 	}
 
@@ -422,7 +420,6 @@ func getNodeAtPath(
 	case *crypto.LazyVectorCommitmentLeafNode:
 		return node
 	case *crypto.LazyVectorCommitmentBranchNode:
-		fmt.Printf("path %v\nprefix %v\n", path, n.Prefix)
 		// Check that the branch's prefix matches the beginning of the query path.
 		if len(path) < len(n.Prefix) {
 			return nil
@@ -430,7 +427,6 @@ func getNodeAtPath(
 
 		for i, nib := range n.Prefix {
 			if int32(nib) != path[i] {
-				fmt.Println("no viable prefix")
 				return nil
 			}
 		}
@@ -438,18 +434,15 @@ func getNodeAtPath(
 		// Remove the prefix portion from the path.
 		remainder := path[len(n.Prefix):]
 		if len(remainder) == 0 {
-			fmt.Println("remainder 0, return node")
 			return node
 		}
 
 		// The first element of the remainder selects the child.
 		childIndex := remainder[0]
 		if int(childIndex) < 0 || int(childIndex) >= len(n.Children) {
-			fmt.Println("invalid child index")
 			return nil
 		}
 
-		fmt.Printf("get node at path %v\n", slices.Concat(n.FullPrefix, []int{int(childIndex)}))
 		child, err := n.Store.GetNodeByPath(
 			setType,
 			phaseType,
@@ -464,7 +457,6 @@ func getNodeAtPath(
 			return nil
 		}
 
-		fmt.Println("recurse")
 		return getNodeAtPath(
 			setType,
 			phaseType,
