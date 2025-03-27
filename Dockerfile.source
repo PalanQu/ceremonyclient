@@ -106,7 +106,7 @@ RUN ./build.sh -o qclient && cp qclient /usr/bin
 
 # Build and install sidecar
 WORKDIR /opt/ceremonyclient/sidecar
-RUN ./build.sh -o sidecar ./... && cp sidecar /usr/bin
+RUN ./build.sh -o sidecar && cp sidecar /usr/bin
 
 # Allows exporting single binary
 FROM scratch as qclient

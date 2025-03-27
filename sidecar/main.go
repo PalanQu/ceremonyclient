@@ -243,6 +243,10 @@ func handleClockFrame(
 		panic(err)
 	}
 
+	if head == nil {
+		return nil
+	}
+
 	if frame.FrameNumber > head.FrameNumber {
 		if _, err := dataTimeReel.Insert(ctx, frame); err != nil {
 			logger.Debug("could not insert frame", zap.Error(err))
