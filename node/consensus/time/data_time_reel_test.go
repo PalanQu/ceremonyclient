@@ -189,7 +189,6 @@ func TestDataTimeReel(t *testing.T) {
 		},
 		pubKeys,
 		true,
-		func() []*tries.RollingFrecencyCritbitTrie { return []*tries.RollingFrecencyCritbitTrie{} },
 	)
 
 	err = d.Start()
@@ -388,12 +387,12 @@ func TestDataTimeReel(t *testing.T) {
 	})
 
 	// todo: restore with prover rings
-	// for i := 99; i >= 0; i-- {
-	// 	err := d.Insert(conflictFrames[i], false)
-	// 	// force linear ordering
-	// 	gotime.Sleep(1 * gotime.Second)
-	// 	assert.NoError(t, err)
-	// }
+	for i := 99; i >= 0; i-- {
+		_, err := d.Insert(ctx, conflictFrames[i])
+		// force linear ordering
+		gotime.Sleep(1 * gotime.Second)
+		assert.NoError(t, err)
+	}
 
 	// Someone is honest, but running backwards:
 	for i := 99; i >= 0; i-- {

@@ -275,47 +275,6 @@ func NewTokenExecutionEngine(
 		alwaysSend = true
 	}
 
-	restore := func() []*tries.RollingFrecencyCritbitTrie {
-		frame, _, err := clockStore.GetLatestDataClockFrame(intrinsicFilter)
-		if err != nil && !errors.Is(err, store.ErrNotFound) {
-			panic(err)
-		}
-
-		tries := []*tries.RollingFrecencyCritbitTrie{
-			{},
-		}
-		proverKeys = [][]byte{config.GetGenesis().Beacon}
-		for _, key := range proverKeys {
-			addr, _ := poseidon.HashBytes(key)
-			tries[0].Add(addr.FillBytes(make([]byte, 32)), 0)
-			if err = clockStore.SetProverTriesForFrame(frame, tries); err != nil {
-				panic(err)
-			}
-		}
-		peerSeniority, err = RebuildPeerSeniority(uint(cfg.P2P.Network))
-		if err != nil {
-			panic(err)
-		}
-
-		txn, err := clockStore.NewTransaction(false)
-		if err != nil {
-			panic(err)
-		}
-
-		err = clockStore.PutPeerSeniorityMap(txn, intrinsicFilter, peerSeniority)
-		if err != nil {
-			txn.Abort()
-			panic(err)
-		}
-
-		if err = txn.Commit(); err != nil {
-			txn.Abort()
-			panic(err)
-		}
-
-		return tries
-	}
-
 	dataTimeReel := time.NewDataTimeReel(
 		intrinsicFilter,
 		logger,
@@ -346,7 +305,6 @@ func NewTokenExecutionEngine(
 		inclusionProof,
 		proverKeys,
 		alwaysSend,
-		restore,
 	)
 
 	e.clock = data.NewDataClockConsensusEngine(

@@ -40,10 +40,12 @@ tasks:
       - node/build.sh -o build/arm64_macos/node
 
   build_sidecar_arm64_macos:
-    desc: Build the Quilibrium QCL sidecar binary for MacOS ARM. Assumes it's ran from the same platform. Outputs to node/build.
+    desc: Build the Quilibrium sidecar binary for MacOS ARM. Assumes it's ran from the same platform. Outputs to node/build.
     cmds:
-      - ferret/generate.sh
-      - bedlam/build.sh -o build/arm64_macos/sidecar ./bedlam/apps/garbled
+      - vdf/generate.sh
+      - bls48581/generate.sh
+      - verenc/generate.sh
+      - sidecar/build.sh -o build/arm64_macos/node
 
   build_qclient_arm64_macos:
     desc: Build the QClient node binary for MacOS ARM. Outputs to client/build
@@ -58,7 +60,7 @@ tasks:
       - docker build --platform linux/arm64 -f Dockerfile.source --output node/build/arm64_linux --target=node .
 
   build_sidecar_arm64_linux:
-    desc: Build the Quilibrium QCL sidecar binary for ARM64 Linux. Outputs to node/build.
+    desc: Build the Quilibrium sidecar binary for ARM64 Linux. Outputs to node/build.
     cmds:
       - docker build --platform linux/arm64 -f Dockerfile.source --output node/build/arm64_linux --target=sidecar .
 
@@ -73,7 +75,7 @@ tasks:
       - docker build --platform linux/amd64 -f Dockerfile.source --output node/build/amd64_linux --target=node .
 
   build_sidecar_amd64_linux:
-    desc: Build the Quilibrium QCL sidecar binary for AMD64 Linux. Outputs to node/build.
+    desc: Build the Quilibrium sidecar binary for AMD64 Linux. Outputs to node/build.
     cmds:
       - docker build --platform linux/amd64 -f Dockerfile.source --output node/build/amd64_linux --target=sidecar .
 
