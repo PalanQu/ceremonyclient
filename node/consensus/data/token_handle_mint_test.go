@@ -147,9 +147,9 @@ func TestHandlePreMidnightMint(t *testing.T) {
 		preMidnightMint:                 map[string]struct{}{},
 	}
 
-	d.dataTimeReel.SetHead(&protobufs.ClockFrame{
-		FrameNumber: 0,
-	})
+	// d.dataTimeReel.SetHead(&protobufs.ClockFrame{
+	// 	FrameNumber: 0,
+	// })
 
 	d.pubSub = pubsub{
 		privkey: bprivKey,

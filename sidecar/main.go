@@ -59,7 +59,6 @@ var frameProver qcrypto.FrameProver
 var inclusionProver qcrypto.InclusionProver
 var keyManager keys.KeyManager
 var lastProven uint64
-var proverTrie *tries.RollingFrecencyCritbitTrie
 
 func main() {
 	flag.Parse()
@@ -71,7 +70,7 @@ func main() {
 	done := make(chan os.Signal, 1)
 	signal.Notify(done, syscall.SIGINT, syscall.SIGTERM)
 	recentlyProcessedFrames, _ = lru.New[string, struct{}](25)
-	logger, _ = zap.NewDevelopment()
+	logger, _ = zap.NewProduction()
 	var privKey crypto.PrivKey
 	keyManager,
 		_,

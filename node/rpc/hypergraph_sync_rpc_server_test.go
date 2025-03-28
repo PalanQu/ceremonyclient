@@ -66,6 +66,7 @@ func TestLoadHypergraphFallback(t *testing.T) {
 		assert.Equal(t, len(crypto.ConvertAllPreloadedLeaves(string(application.VertexAtomType), string(application.AddsPhaseType), k, serverHypergraphStore, a.GetTree().Root, []int{})), 100000)
 	}
 	for k, a := range clientLoad.GetVertexAdds() {
+		fmt.Printf("%x\n", a.GetTree().Commit(true))
 		assert.Equal(t, len(crypto.ConvertAllPreloadedLeaves(string(application.VertexAtomType), string(application.AddsPhaseType), k, clientHypergraphStore, a.GetTree().Root, []int{})), 100000)
 	}
 
