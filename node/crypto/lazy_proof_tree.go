@@ -104,10 +104,10 @@ func (n *LazyVectorCommitmentBranchNode) Commit(
 		vector := make([][]byte, len(n.Children))
 		wg := sync.WaitGroup{}
 		workers := 1
-		if n.LongestBranch <= 3 {
+		if n.LongestBranch <= 4 {
 			workers = runtime.WorkerCount(0, false)
 		}
-		if n.LongestBranch > 3 {
+		if n.LongestBranch > 4 {
 			fmt.Printf("DEBUG: Performing commit under %v path, leaves: %d\n", path, n.LeafCount)
 		}
 		throttle := make(chan struct{}, workers)

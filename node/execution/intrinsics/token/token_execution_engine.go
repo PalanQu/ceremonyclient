@@ -446,6 +446,12 @@ func NewTokenExecutionEngine(
 	e.pubSub.Subscribe(hypersyncMetadataFilter, e.handleMetadataMessage)
 	e.wg.Add(1)
 	go e.runMetadataMessageHandler()
+	for _, h := range e.hypergraph.Commit() {
+		e.logger.Info(
+			"current hypergraph commit",
+			zap.String("root_commitment", hex.EncodeToString(h)),
+		)
+	}
 
 	protobufs.RegisterHypergraphComparisonServiceServer(syncServer, hyperSync)
 	go func() {

@@ -473,30 +473,18 @@ func (hg *Hypergraph) Commit() [][]byte {
 	commits := [][]byte{}
 	for _, vertexAdds := range hg.vertexAdds {
 		root := vertexAdds.tree.Commit(false)
-		if bytes.Equal(root, []byte{}) {
-			root = vertexAdds.tree.Commit(true)
-		}
 		commits = append(commits, root)
 	}
 	for _, vertexRemoves := range hg.vertexRemoves {
 		root := vertexRemoves.tree.Commit(false)
-		if bytes.Equal(root, []byte{}) {
-			root = vertexRemoves.tree.Commit(true)
-		}
 		commits = append(commits, root)
 	}
 	for _, hyperedgeAdds := range hg.hyperedgeAdds {
 		root := hyperedgeAdds.tree.Commit(false)
-		if bytes.Equal(root, []byte{}) {
-			root = hyperedgeAdds.tree.Commit(true)
-		}
 		commits = append(commits, root)
 	}
 	for _, hyperedgeRemoves := range hg.hyperedgeRemoves {
 		root := hyperedgeRemoves.tree.Commit(false)
-		if bytes.Equal(root, []byte{}) {
-			root = hyperedgeRemoves.tree.Commit(true)
-		}
 		commits = append(commits, root)
 	}
 	return commits
