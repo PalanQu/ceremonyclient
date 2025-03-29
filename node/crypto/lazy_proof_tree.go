@@ -63,7 +63,7 @@ func (n *LazyVectorCommitmentLeafNode) Commit(
 	path []int,
 	recalculate bool,
 ) []byte {
-	if n.Commitment == nil || recalculate {
+	if len(n.Commitment) == 0 || recalculate {
 		h := sha512.New()
 		h.Write([]byte{0})
 		h.Write(n.Key)
@@ -100,88 +100,161 @@ func (n *LazyVectorCommitmentBranchNode) Commit(
 	path []int,
 	recalculate bool,
 ) []byte {
-	if n.Commitment == nil || recalculate {
-		vector := make([][]byte, len(n.Children))
-		wg := sync.WaitGroup{}
-		workers := 1
-		if n.LongestBranch <= 4 {
-			workers = runtime.WorkerCount(0, false)
-		}
-		if n.LongestBranch > 4 {
-			fmt.Printf("DEBUG: Performing commit under %v path, leaves: %d\n", path, n.LeafCount)
-		}
-		throttle := make(chan struct{}, workers)
-		for i, child := range n.Children {
-			throttle <- struct{}{}
-			wg.Add(1)
-			go func(i int, child LazyVectorCommitmentNode) {
-				defer func() { <-throttle }()
-				defer wg.Done()
+	if len(n.Commitment) != 0 && !recalculate {
+		return n.Commitment
+	}
 
+	workers := runtime.WorkerCount(0, false)
+	throttle := make(chan struct{}, workers)
+
+	return commitNode(
+		n,
+		txn,
+		setType,
+		phaseType,
+		shardKey,
+		n.FullPrefix,
+		recalculate,
+		throttle,
+	)
+}
+
+func commitNode(
+	n LazyVectorCommitmentNode,
+	txn TreeBackingStoreTransaction,
+	setType string,
+	phaseType string,
+	shardKey ShardKey,
+	path []int,
+	recalculate bool,
+	throttle chan struct{},
+) []byte {
+	switch node := n.(type) {
+	case *LazyVectorCommitmentBranchNode:
+		if len(node.Commitment) != 0 && !recalculate {
+			return node.Commitment
+		}
+
+		vector := make([][]byte, len(node.Children))
+		var wg sync.WaitGroup
+
+		for i, child := range node.Children {
+			childPath := slices.Concat(node.FullPrefix, []int{i})
+			wg.Add(1)
+
+			select {
+			case throttle <- struct{}{}:
+				go func(i int, child LazyVectorCommitmentNode, childPath []int) {
+					defer wg.Done()
+					defer func() { <-throttle }()
+
+					if child == nil {
+						var err error
+						child, err = node.Store.GetNodeByPath(
+							setType,
+							phaseType,
+							shardKey,
+							childPath,
+						)
+						if err != nil && !strings.Contains(err.Error(), "item not found") {
+							panic(err)
+						}
+					}
+					if child != nil {
+						commit := commitNode(
+							child,
+							txn,
+							setType,
+							phaseType,
+							shardKey,
+							childPath,
+							recalculate,
+							throttle,
+						)
+						if branchChild, ok := child.(*LazyVectorCommitmentBranchNode); ok {
+							h := sha512.New()
+							h.Write([]byte{1})
+							for _, p := range branchChild.Prefix {
+								h.Write(binary.BigEndian.AppendUint32([]byte{}, uint32(p)))
+							}
+							h.Write(commit)
+							commit = h.Sum(nil)
+						}
+						vector[i] = commit
+					} else {
+						vector[i] = make([]byte, 64)
+					}
+				}(i, child, childPath)
+			default:
 				if child == nil {
 					var err error
-					child, err = n.Store.GetNodeByPath(
+					child, err = node.Store.GetNodeByPath(
 						setType,
 						phaseType,
 						shardKey,
-						slices.Concat(n.FullPrefix, []int{i}),
+						childPath,
 					)
 					if err != nil && !strings.Contains(err.Error(), "item not found") {
 						panic(err)
 					}
 				}
 				if child != nil {
-					out := child.Commit(
+					commit := commitNode(
+						child,
 						txn,
 						setType,
 						phaseType,
 						shardKey,
-						slices.Concat(n.FullPrefix, []int{i}),
+						childPath,
 						recalculate,
+						throttle,
 					)
-					switch c := child.(type) {
-					case *LazyVectorCommitmentBranchNode:
+					if branchChild, ok := child.(*LazyVectorCommitmentBranchNode); ok {
 						h := sha512.New()
 						h.Write([]byte{1})
-						for _, p := range c.Prefix {
+						for _, p := range branchChild.Prefix {
 							h.Write(binary.BigEndian.AppendUint32([]byte{}, uint32(p)))
 						}
-						h.Write(out)
-						out = h.Sum(nil)
-					case *LazyVectorCommitmentLeafNode:
-						// do nothing
+						h.Write(commit)
+						commit = h.Sum(nil)
 					}
-					vector[i] = out
+					vector[i] = commit
 				} else {
 					vector[i] = make([]byte, 64)
 				}
-			}(i, child)
+				wg.Done()
+			}
 		}
 		wg.Wait()
+
 		data := []byte{}
 		for _, vec := range vector {
 			data = append(data, vec...)
 		}
-		n.Commitment = rbls48581.CommitRaw(data, 64)
-		if err := n.Store.InsertNode(
+		node.Commitment = rbls48581.CommitRaw(data, 64)
+
+		if err := node.Store.InsertNode(
 			txn,
 			setType,
 			phaseType,
 			shardKey,
-			generateKeyFromPath(n.FullPrefix),
+			generateKeyFromPath(node.FullPrefix),
 			path,
-			n,
+			node,
 		); err != nil {
 			panic(err)
 		}
+		return node.Commitment
+	case *LazyVectorCommitmentLeafNode:
+		return node.Commit(txn, setType, phaseType, shardKey, path, recalculate)
+	default:
+		return nil
 	}
-
-	return n.Commitment
 }
 
 func (n *LazyVectorCommitmentBranchNode) Verify(index int, proof []byte) bool {
 	data := []byte{}
-	if n.Commitment == nil {
+	if len(n.Commitment) == 0 {
 		panic("verify cannot be run on nil commitments")
 	} else {
 		child := n.Children[index]

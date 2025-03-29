@@ -101,6 +101,14 @@ func (s *StandaloneHypersyncServer) Start(
 		panic(err)
 	}
 
+	logger.Info("calculating existing hypergraph root commit")
+
+	roots := hypergraph.Commit()
+	logger.Info(
+		"existing hypergraph root commit",
+		zap.String("root", hex.EncodeToString(roots[0])),
+	)
+
 	totalCoins := 0
 
 	coinStore := store.NewPebbleCoinStore(db, logger)
@@ -159,6 +167,14 @@ func (s *StandaloneHypersyncClient) Start(
 	if err != nil {
 		panic(err)
 	}
+
+	logger.Info("calculating existing hypergraph root commit")
+
+	roots := hypergraph.Commit()
+	logger.Info(
+		"existing hypergraph root commit",
+		zap.String("root", hex.EncodeToString(roots[0])),
+	)
 
 	totalCoins := 0
 
@@ -233,7 +249,7 @@ func (s *StandaloneHypersyncClient) Start(
 		break
 	}
 
-	roots := hypergraph.Commit()
+	roots = hypergraph.Commit()
 	logger.Info(
 		"hypergraph root commit",
 		zap.String("root", hex.EncodeToString(roots[0])),
