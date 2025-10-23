@@ -2,17 +2,28 @@ package worker
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multiaddr"
+	mn "github.com/multiformats/go-multiaddr/net"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/config"
+	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
+	"source.quilibrium.com/quilibrium/monorepo/protobufs"
+	"source.quilibrium.com/quilibrium/monorepo/types/channel"
 	typesStore "source.quilibrium.com/quilibrium/monorepo/types/store"
 	typesWorker "source.quilibrium.com/quilibrium/monorepo/types/worker"
 )
@@ -25,10 +36,21 @@ type WorkerManager struct {
 	mu          sync.RWMutex
 	started     bool
 	config      *config.Config
-	proposeFunc func(coreId uint, filter []byte) error
+	proposeFunc func(
+		coreIds []uint,
+		filters [][]byte,
+		serviceClients map[uint]*grpc.ClientConn,
+	) error
+	decideFunc func(
+		reject [][]byte,
+		confirm [][]byte,
+	) error
 
 	// When automatic, hold reference to the workers
 	dataWorkers []*exec.Cmd
+
+	// IPC service clients
+	serviceClients map[uint]*grpc.ClientConn
 
 	// In-memory cache for quick lookups
 	workersByFilter  map[string]uint // filter hash -> worker id
@@ -42,7 +64,15 @@ func NewWorkerManager(
 	store typesStore.WorkerStore,
 	logger *zap.Logger,
 	config *config.Config,
-	proposeFunc func(coreId uint, filter []byte) error,
+	proposeFunc func(
+		coreIds []uint,
+		filters [][]byte,
+		serviceClients map[uint]*grpc.ClientConn,
+	) error,
+	decideFunc func(
+		reject [][]byte,
+		confirm [][]byte,
+	) error,
 ) typesWorker.WorkerManager {
 	return &WorkerManager{
 		store:            store,
@@ -50,8 +80,10 @@ func NewWorkerManager(
 		workersByFilter:  make(map[string]uint),
 		filtersByWorker:  make(map[uint][]byte),
 		allocatedWorkers: make(map[uint]bool),
+		serviceClients:   make(map[uint]*grpc.ClientConn),
 		config:           config,
 		proposeFunc:      proposeFunc,
+		decideFunc:       decideFunc,
 	}
 }
 
@@ -67,15 +99,16 @@ func (w *WorkerManager) Start(ctx context.Context) error {
 
 	w.ctx, w.cancel = context.WithCancel(ctx)
 
+	w.started = true
+
+	go w.spawnDataWorkers()
+
 	// Load existing workers from the store
 	if err := w.loadWorkersFromStore(); err != nil {
 		w.logger.Error("failed to load workers from store", zap.Error(err))
 		return errors.Wrap(err, "start")
 	}
 
-	go w.spawnDataWorkers()
-
-	w.started = true
 	w.logger.Info("worker manager started successfully")
 	return nil
 }
@@ -121,6 +154,10 @@ func (w *WorkerManager) RegisterWorker(info *typesStore.WorkerInfo) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	return w.registerWorker(info)
+}
+
+func (w *WorkerManager) registerWorker(info *typesStore.WorkerInfo) error {
 	if !w.started {
 		workerOperationsTotal.WithLabelValues("register", "error").Inc()
 		return errors.New("worker manager not started")
@@ -132,13 +169,6 @@ func (w *WorkerManager) RegisterWorker(info *typesStore.WorkerInfo) error {
 		zap.Uint("total_storage", info.TotalStorage),
 		zap.Bool("automatic", info.Automatic),
 	)
-
-	// Check if worker already exists
-	existingWorker, err := w.store.GetWorker(info.CoreId)
-	if err == nil && existingWorker != nil {
-		workerOperationsTotal.WithLabelValues("register", "error").Inc()
-		return errors.New("worker already registered")
-	}
 
 	// Save to store
 	txn, err := w.store.NewTransaction(false)
@@ -174,6 +204,7 @@ func (w *WorkerManager) RegisterWorker(info *typesStore.WorkerInfo) error {
 		"worker registered successfully",
 		zap.Uint("core_id", info.CoreId),
 	)
+
 	return nil
 }
 
@@ -253,6 +284,22 @@ func (w *WorkerManager) AllocateWorker(coreId uint, filter []byte) error {
 		filterKey := string(worker.Filter)
 		w.workersByFilter[filterKey] = coreId
 	}
+
+	// Refresh worker
+	svc, err := w.getIPCOfWorker(coreId)
+	if err != nil {
+		w.logger.Error("could not get ipc of worker", zap.Error(err))
+		return errors.Wrap(err, "allocate worker")
+	}
+
+	_, err = svc.Respawn(w.ctx, &protobufs.RespawnRequest{
+		Filter: worker.Filter,
+	})
+	if err != nil {
+		w.logger.Error("could not respawn worker", zap.Error(err))
+		return errors.Wrap(err, "allocate worker")
+	}
+
 	w.filtersByWorker[coreId] = worker.Filter
 	w.allocatedWorkers[coreId] = true
 
@@ -321,6 +368,21 @@ func (w *WorkerManager) DeallocateWorker(coreId uint) error {
 	if err := txn.Commit(); err != nil {
 		workerOperationsTotal.WithLabelValues("deallocate", "error").Inc()
 		return errors.Wrap(err, "deallocate worker")
+	}
+
+	// Refresh worker
+	svc, err := w.getIPCOfWorker(coreId)
+	if err != nil {
+		w.logger.Error("could not get ipc of worker", zap.Error(err))
+		return errors.Wrap(err, "allocate worker")
+	}
+
+	_, err = svc.Respawn(w.ctx, &protobufs.RespawnRequest{
+		Filter: []byte{},
+	})
+	if err != nil {
+		w.logger.Error("could not respawn worker", zap.Error(err))
+		return errors.Wrap(err, "allocate worker")
 	}
 
 	// Mark as deallocated in cache
@@ -418,10 +480,29 @@ func (w *WorkerManager) RangeWorkers() ([]*typesStore.WorkerInfo, error) {
 	return w.store.RangeWorkers()
 }
 
-// ProposeAllocation invokes a proposal function set by the parent of the
+// ProposeAllocations invokes a proposal function set by the parent of the
 // manager.
-func (w *WorkerManager) ProposeAllocation(coreId uint, filter []byte) error {
-	return w.proposeFunc(coreId, filter)
+func (w *WorkerManager) ProposeAllocations(
+	coreIds []uint,
+	filters [][]byte,
+) error {
+	for _, coreId := range coreIds {
+		_, err := w.getIPCOfWorker(coreId)
+		if err != nil {
+			w.logger.Error("could not get ipc of worker", zap.Error(err))
+			return errors.Wrap(err, "allocate worker")
+		}
+	}
+	return w.proposeFunc(coreIds, filters, w.serviceClients)
+}
+
+// DecideAllocations invokes a deciding function set by the parent of the
+// manager.
+func (w *WorkerManager) DecideAllocations(
+	reject [][]byte,
+	confirm [][]byte,
+) error {
+	return w.decideFunc(reject, confirm)
 }
 
 // loadWorkersFromStore loads all workers from persistent storage into memory
@@ -429,6 +510,16 @@ func (w *WorkerManager) loadWorkersFromStore() error {
 	workers, err := w.store.RangeWorkers()
 	if err != nil {
 		return errors.Wrap(err, "load workers from store")
+	}
+
+	if len(workers) != w.config.Engine.DataWorkerCount {
+		for i := range w.config.Engine.DataWorkerCount {
+			_, err := w.getIPCOfWorker(uint(i + 1))
+			if err != nil {
+				w.logger.Error("could not obtain IPC for worker", zap.Error(err))
+				continue
+			}
+		}
 	}
 
 	var totalStorage uint64
@@ -445,6 +536,19 @@ func (w *WorkerManager) loadWorkersFromStore() error {
 			allocatedCount++
 		}
 		totalStorage += uint64(worker.TotalStorage)
+		svc, err := w.getIPCOfWorker(worker.CoreId)
+		if err != nil {
+			w.logger.Error("could not obtain IPC for worker", zap.Error(err))
+			continue
+		}
+
+		_, err = svc.Respawn(w.ctx, &protobufs.RespawnRequest{
+			Filter: worker.Filter,
+		})
+		if err != nil {
+			w.logger.Error("could not respawn worker", zap.Error(err))
+			continue
+		}
 	}
 
 	// Update metrics
@@ -456,8 +560,133 @@ func (w *WorkerManager) loadWorkersFromStore() error {
 	return nil
 }
 
-func (w *WorkerManager) spawnDataWorkers() {
+func (w *WorkerManager) getMultiaddrOfWorker(coreId uint) (
+	multiaddr.Multiaddr,
+	error,
+) {
+	rpcMultiaddr := fmt.Sprintf(
+		w.config.Engine.DataWorkerBaseListenMultiaddr,
+		int(w.config.Engine.DataWorkerBaseStreamPort)+int(coreId-1),
+	)
+
 	if len(w.config.Engine.DataWorkerStreamMultiaddrs) != 0 {
+		rpcMultiaddr = w.config.Engine.DataWorkerStreamMultiaddrs[coreId-1]
+	}
+
+	rpcMultiaddr = strings.Replace(rpcMultiaddr, "/0.0.0.0/", "/127.0.0.1/", 1)
+	rpcMultiaddr = strings.Replace(rpcMultiaddr, "/0:0:0:0:0:0:0:0/", "/::1/", 1)
+	rpcMultiaddr = strings.Replace(rpcMultiaddr, "/::/", "/::1/", 1)
+
+	ma, err := multiaddr.StringCast(rpcMultiaddr)
+	return ma, errors.Wrap(err, "get multiaddr of worker")
+}
+
+func (w *WorkerManager) getP2PMultiaddrOfWorker(coreId uint) (
+	multiaddr.Multiaddr,
+	error,
+) {
+	p2pMultiaddr := fmt.Sprintf(
+		w.config.Engine.DataWorkerBaseListenMultiaddr,
+		int(w.config.Engine.DataWorkerBaseP2PPort)+int(coreId-1),
+	)
+
+	if len(w.config.Engine.DataWorkerP2PMultiaddrs) != 0 {
+		p2pMultiaddr = w.config.Engine.DataWorkerP2PMultiaddrs[coreId-1]
+	}
+
+	ma, err := multiaddr.StringCast(p2pMultiaddr)
+	return ma, errors.Wrap(err, "get p2p multiaddr of worker")
+}
+
+func (w *WorkerManager) getIPCOfWorker(coreId uint) (
+	protobufs.DataIPCServiceClient,
+	error,
+) {
+	client, ok := w.serviceClients[coreId]
+	if !ok {
+		w.logger.Info("reconnecting to worker", zap.Uint("core_id", coreId))
+		addr, err := w.getMultiaddrOfWorker(coreId)
+		if err != nil {
+			return nil, errors.Wrap(err, "get ipc of worker")
+		}
+
+		mga, err := mn.ToNetAddr(addr)
+		if err != nil {
+			return nil, errors.Wrap(err, "get ipc of worker")
+		}
+
+		peerPrivKey, err := hex.DecodeString(w.config.P2P.PeerPrivKey)
+		if err != nil {
+			w.logger.Error("error unmarshaling peerkey", zap.Error(err))
+			return nil, errors.Wrap(err, "get ipc of worker")
+		}
+
+		if _, ok := w.filtersByWorker[coreId]; !ok {
+			p2pAddr, err := w.getP2PMultiaddrOfWorker(coreId)
+			if err != nil {
+				return nil, errors.Wrap(err, "get ipc of worker")
+			}
+			err = w.registerWorker(&typesStore.WorkerInfo{
+				CoreId:                coreId,
+				ListenMultiaddr:       p2pAddr.String(),
+				StreamListenMultiaddr: addr.String(),
+				Filter:                nil,
+				TotalStorage:          0,
+				Automatic:             len(w.config.Engine.DataWorkerP2PMultiaddrs) == 0,
+				Allocated:             false,
+			})
+			if err != nil {
+				return nil, errors.Wrap(err, "get ipc of worker")
+			}
+		}
+
+		privKey, err := crypto.UnmarshalEd448PrivateKey(peerPrivKey)
+		if err != nil {
+			w.logger.Error("error unmarshaling peerkey", zap.Error(err))
+			return nil, errors.Wrap(err, "get ipc of worker")
+		}
+
+		pub := privKey.GetPublic()
+		id, err := peer.IDFromPublicKey(pub)
+		if err != nil {
+			w.logger.Error("error unmarshaling peerkey", zap.Error(err))
+			return nil, errors.Wrap(err, "get ipc of worker")
+		}
+
+		creds, err := p2p.NewPeerAuthenticator(
+			w.logger,
+			w.config.P2P,
+			nil,
+			nil,
+			nil,
+			nil,
+			[][]byte{[]byte(id)},
+			map[string]channel.AllowedPeerPolicyType{
+				"quilibrium.node.node.pb.DataIPCService": channel.OnlySelfPeer,
+			},
+			map[string]channel.AllowedPeerPolicyType{},
+		).CreateClientTLSCredentials([]byte(id))
+		if err != nil {
+			return nil, errors.Wrap(err, "get ipc of worker")
+		}
+
+		client, err = grpc.NewClient(
+			mga.String(),
+			grpc.WithTransportCredentials(creds),
+		)
+		if err != nil {
+
+			return nil, errors.Wrap(err, "get ipc of worker")
+		}
+
+		w.serviceClients[coreId] = client
+	}
+
+	return protobufs.NewDataIPCServiceClient(client), nil
+}
+
+func (w *WorkerManager) spawnDataWorkers() {
+	if len(w.config.Engine.DataWorkerP2PMultiaddrs) != 0 {
 		w.logger.Warn(
 			"data workers configured by multiaddr, be sure these are running...",
 		)
@@ -478,7 +707,7 @@ func (w *WorkerManager) spawnDataWorkers() {
 	for i := 1; i <= w.config.Engine.DataWorkerCount; i++ {
 		i := i
 		go func() {
-			for {
+			for w.started {
 				args := []string{
 					fmt.Sprintf("--core=%d", i),
 					fmt.Sprintf("--parent-process=%d", os.Getpid()),
@@ -510,10 +739,10 @@ func (w *WorkerManager) spawnDataWorkers() {
 
 func (w *WorkerManager) stopDataWorkers() {
 	for i := 0; i < len(w.dataWorkers); i++ {
-		err := w.dataWorkers[i].Process.Signal(os.Kill)
+		err := w.dataWorkers[i].Process.Signal(syscall.SIGTERM)
 		if err != nil {
 			w.logger.Info(
-				"unable to kill worker",
+				"unable to stop worker",
 				zap.Int("pid", w.dataWorkers[i].Process.Pid),
 				zap.Error(err),
 			)

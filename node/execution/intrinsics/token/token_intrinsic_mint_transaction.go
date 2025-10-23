@@ -17,6 +17,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/keys"
 	"source.quilibrium.com/quilibrium/monorepo/types/schema"
+	"source.quilibrium.com/quilibrium/monorepo/types/store"
 	qcrypto "source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
 
@@ -768,7 +769,7 @@ func (i *MintTransactionInput) proveWithProofOfMeaningfulWork(
 	// signature is the delegated prover key.
 	pubKey := prover.Public().([]byte)
 	var address []byte
-	if len(i.contextData) == 32 {
+	if len(i.contextData) != 32 {
 		addressBI, err := poseidon.HashBytes(pubKey)
 		if err != nil {
 			return nil, errors.Wrap(
@@ -777,9 +778,27 @@ func (i *MintTransactionInput) proveWithProofOfMeaningfulWork(
 			)
 		}
 		address = addressBI.FillBytes(make([]byte, 32))
+	} else {
+		address = i.contextData
 	}
 
 	proverRootDomain := [32]byte(tx.Domain)
+	rewardAddress := address
+	if bytes.Equal(tx.Domain[:], QUIL_TOKEN_ADDRESS) {
+		// Special case: PoMW mints under QUIL use global records for proofs
+		proverRootDomain = intrinsics.GLOBAL_INTRINSIC_ADDRESS
+		derivedRewardAddress, err := poseidon.HashBytes(
+			slices.Concat(QUIL_TOKEN_ADDRESS[:], address),
+		)
+		if err != nil {
+			return nil, errors.Wrap(
+				err,
+				"prove with mint with proof of meaningful work",
+			)
+		}
+
+		rewardAddress = derivedRewardAddress.FillBytes(make([]byte, 32))
+	}
 
 	proof, err := tx.hypergraph.CreateTraversalProof(
 		proverRootDomain,
@@ -787,7 +806,7 @@ func (i *MintTransactionInput) proveWithProofOfMeaningfulWork(
 		hypergraph.AddsPhaseType,
 		[][]byte{slices.Concat(
 			proverRootDomain[:],
-			address,
+			rewardAddress,
 		)},
 	)
 	if err != nil {
@@ -816,7 +835,7 @@ func (i *MintTransactionInput) proveWithProofOfMeaningfulWork(
 
 	proverData, err := tx.hypergraph.GetVertexData([64]byte(slices.Concat(
 		proverRootDomain[:],
-		address,
+		rewardAddress,
 	)))
 	if err != nil {
 		return nil, errors.Wrap(
@@ -1701,13 +1720,65 @@ func (i *MintTransactionInput) verifyWithProofOfMeaningfulWork(
 		return errors.Wrap(err, "verify with mint with proof of meaningful work")
 	}
 
+	delegatedAddressBI, err := poseidon.HashBytes(i.Proofs[1][32 : 585+32])
+	if err != nil {
+		return errors.Wrap(
+			err,
+			"verify with mint with proof of meaningful work",
+		)
+	}
+
 	proverRootDomain := [32]byte(tx.Domain)
+	var rewardRoot []byte
+	if bytes.Equal(tx.Domain[:], QUIL_TOKEN_ADDRESS) {
+		// Special case: PoMW mints under QUIL use global records for proofs
+		proverRootDomain = intrinsics.GLOBAL_INTRINSIC_ADDRESS
+		delegatedAddressBI, err = poseidon.HashBytes(
+			slices.Concat(
+				QUIL_TOKEN_ADDRESS[:],
+				delegatedAddressBI.FillBytes(make([]byte, 32)),
+			),
+		)
+		if err != nil {
+			return errors.Wrap(
+				err,
+				"verify with mint with proof of meaningful work",
+			)
+		}
+
+		frame, err := tx.clockStore.GetGlobalClockFrame(
+			binary.BigEndian.Uint64(tx.Outputs[0].FrameNumber),
+		)
+		if err != nil {
+			return errors.Wrap(
+				err,
+				"verify with mint with proof of meaningful work",
+			)
+		}
+
+		rewardRoot = frame.Header.ProverTreeCommitment
+	} else {
+		// Normal case: use our own record of commitments
+		roots, err := tx.hypergraph.GetShardCommits(
+			binary.BigEndian.Uint64(tx.Outputs[0].FrameNumber),
+			tx.Domain[:],
+		)
+		if err != nil {
+			return errors.Wrap(
+				err,
+				"verify with mint with proof of meaningful work",
+			)
+		}
+
+		rewardRoot = roots[0]
+	}
 
 	// Verify the membership proof of the prover:
 	if valid, err := tx.hypergraph.VerifyTraversalProof(
 		proverRootDomain,
 		hypergraph.VertexAtomType,
 		hypergraph.AddsPhaseType,
+		rewardRoot,
 		traversalProof,
 	); err != nil || !valid {
 		return errors.Wrap(
@@ -1718,19 +1789,12 @@ func (i *MintTransactionInput) verifyWithProofOfMeaningfulWork(
 
 	pubkey := i.Proofs[1][32 : 585+32]
 	signature := i.Proofs[1][585+32:]
-	delegatedAddressBI, err := poseidon.HashBytes(i.Proofs[1][32 : 585+32])
-	if err != nil {
-		return errors.Wrap(
-			err,
-			"verify with mint with proof of meaningful work",
-		)
-	}
 
 	// Verify the state proof of the address:
 	if valid, err := i.verifyProof(
 		tx.hypergraph,
 		[][]byte{
-			delegatedAddressBI.FillBytes(make([]byte, 32)),
+			i.Proofs[1][:32],
 			i.Value.FillBytes(make([]byte, 32)),
 		},
 		i.Proofs[2],
@@ -1749,7 +1813,7 @@ func (i *MintTransactionInput) verifyWithProofOfMeaningfulWork(
 	h.Write([]byte{0})
 	h.Write(slices.Concat(
 		proverRootDomain[:],
-		i.Proofs[1][:32],
+		delegatedAddressBI.FillBytes(make([]byte, 32)),
 	))
 	h.Write(traversalProof.SubProofs[0].Ys[len(traversalProof.SubProofs[0].Ys)-1])
 
@@ -1959,10 +2023,7 @@ func (o *MintTransactionOutput) Verify(
 	index int,
 	tx *MintTransaction,
 ) (bool, error) {
-	if !bytes.Equal(
-		binary.BigEndian.AppendUint64(nil, frameNumber),
-		o.FrameNumber,
-	) {
+	if frameNumber <= binary.BigEndian.Uint64(o.FrameNumber) {
 		return false, errors.Wrap(
 			errors.New("invalid frame number"),
 			"verify output",
@@ -2026,6 +2087,7 @@ type MintTransaction struct {
 	// RDF schema support
 	rdfHypergraphSchema string
 	rdfMultiprover      *schema.RDFMultiprover
+	clockStore          store.ClockStore
 }
 
 func NewMintTransaction(
@@ -2042,6 +2104,7 @@ func NewMintTransaction(
 	keyRing keys.KeyRing,
 	rdfHypergraphSchema string,
 	rdfMultiprover *schema.RDFMultiprover,
+	clockStore store.ClockStore,
 ) *MintTransaction {
 	return &MintTransaction{
 		Domain:              domain,
@@ -2057,6 +2120,7 @@ func NewMintTransaction(
 		config:              config,
 		rdfHypergraphSchema: rdfHypergraphSchema,
 		rdfMultiprover:      rdfMultiprover,
+		clockStore:          clockStore,
 	}
 }
 
@@ -2078,8 +2142,17 @@ func (tx *MintTransaction) GetCost() (*big.Int, error) {
 	return size, nil
 }
 
+func (tx *MintTransaction) GetReadAddresses(
+	frameNumber uint64,
+) ([][]byte, error) {
+	return nil, nil
+}
+
 // GetWriteAddresses implements intrinsics.IntrinsicOperation.
-func (tx *MintTransaction) GetWriteAddresses() [][]byte {
+func (tx *MintTransaction) GetWriteAddresses(frameNumber uint64) (
+	[][]byte,
+	error,
+) {
 	addresses := [][]byte{}
 
 	// Each output creates a new coin, which is written to an address based on
@@ -2107,26 +2180,28 @@ func (tx *MintTransaction) GetWriteAddresses() [][]byte {
 
 		for i := range tx.Inputs {
 			proverRootDomain := [32]byte(tx.Domain)
-
-			proverAddress := slices.Concat(
-				proverRootDomain[:],
-				tx.Inputs[i].Proofs[1][:32],
-			)
-			// Check if not already in addresses
-			found := false
-			for _, addr := range addresses {
-				if bytes.Equal(addr, proverAddress) {
-					found = true
-					break
+			rewardAddress := []byte{}
+			if bytes.Equal(tx.Domain[:], QUIL_TOKEN_ADDRESS) {
+				// Special case: PoMW mints under QUIL use global records for proofs
+				proverRootDomain = intrinsics.GLOBAL_INTRINSIC_ADDRESS
+				rewardAddressBI, err := poseidon.HashBytes(slices.Concat(
+					QUIL_TOKEN_ADDRESS[:],
+					tx.Inputs[i].Proofs[1][:32],
+				))
+				if err != nil {
+					return nil, errors.Wrap(err, "materialize")
 				}
+				rewardAddress = rewardAddressBI.FillBytes(make([]byte, 32))
 			}
-			if !found {
-				addresses = append(addresses, proverAddress)
-			}
+
+			addresses = append(addresses, slices.Concat(
+				proverRootDomain[:],
+				rewardAddress,
+			))
 		}
 	}
 
-	return addresses
+	return addresses, nil
 }
 
 // Materialize implements intrinsics.IntrinsicOperation.
@@ -2146,11 +2221,24 @@ func (tx *MintTransaction) Materialize(
 
 		for i := 0; i < len(tx.Inputs); i++ {
 			proverRootDomain := [32]byte(tx.Domain)
+			rewardAddress := tx.Inputs[i].Proofs[1][:32]
+			if bytes.Equal(tx.Domain[:], QUIL_TOKEN_ADDRESS) {
+				// Special case: PoMW mints under QUIL use global records for proofs
+				proverRootDomain = intrinsics.GLOBAL_INTRINSIC_ADDRESS
+				rewardAddressBI, err := poseidon.HashBytes(slices.Concat(
+					QUIL_TOKEN_ADDRESS[:],
+					tx.Inputs[i].Proofs[1][:32],
+				))
+				if err != nil {
+					return nil, errors.Wrap(err, "materialize")
+				}
+				rewardAddress = rewardAddressBI.FillBytes(make([]byte, 32))
+			}
 
 			// Get current prover state
 			vertex, err := state.Get(
 				proverRootDomain[:],
-				tx.Inputs[i].Proofs[1][:32],
+				rewardAddress,
 				hgstate.VertexAddsDiscriminator,
 			)
 			if err != nil {
@@ -2182,14 +2270,15 @@ func (tx *MintTransaction) Materialize(
 				totalMinted.Add(totalMinted, input.Value)
 			}
 
-			// Subtract from prover balance
-			newBalance := new(big.Int).Sub(currentBalance, totalMinted)
-			if newBalance.Sign() < 0 {
+			if currentBalance.Cmp(totalMinted) < 0 {
 				return nil, errors.Wrap(
 					errors.New("insufficient prover balance"),
 					"materialize",
 				)
 			}
+
+			// Subtract from prover balance
+			newBalance := new(big.Int).Sub(currentBalance, totalMinted)
 
 			// Set new balance at index 1
 			newBalanceBytes := newBalance.FillBytes(make([]byte, 32))
@@ -2205,7 +2294,7 @@ func (tx *MintTransaction) Materialize(
 			// Create materialized state for prover update
 			proverUpdate := hypergraphState.NewVertexAddMaterializedState(
 				proverRootDomain,
-				[32]byte(tx.Inputs[i].Proofs[1][:32]),
+				[32]byte(rewardAddress),
 				frameNumber,
 				nil,
 				proverTree,
@@ -2214,7 +2303,7 @@ func (tx *MintTransaction) Materialize(
 			// Set the state
 			err = hypergraphState.Set(
 				proverRootDomain[:],
-				tx.Inputs[i].Proofs[1][:32],
+				rewardAddress,
 				hgstate.VertexAddsDiscriminator,
 				frameNumber,
 				proverUpdate,

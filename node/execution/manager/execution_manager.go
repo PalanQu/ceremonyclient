@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"math/big"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/compiler"
+	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/intrinsics"
@@ -44,6 +46,10 @@ type ExecutionEngineManager struct {
 	verEnc            crypto.VerifiableEncryptor
 	decafConstructor  crypto.DecafConstructor
 	compiler          compiler.CircuitCompiler
+	frameProver       crypto.FrameProver
+	rewardIssuance    consensus.RewardIssuance
+	proverRegistry    consensus.ProverRegistry
+	blsConstructor    crypto.BlsConstructor
 	includeGlobal     bool
 	quit              chan struct{}
 	wg                sync.WaitGroup
@@ -62,6 +68,10 @@ func NewExecutionEngineManager(
 	verEnc crypto.VerifiableEncryptor,
 	decafConstructor crypto.DecafConstructor,
 	compiler compiler.CircuitCompiler,
+	frameProver crypto.FrameProver,
+	rewardIssuance consensus.RewardIssuance,
+	proverRegistry consensus.ProverRegistry,
+	blsConstructor crypto.BlsConstructor,
 	includeGlobal bool,
 ) (*ExecutionEngineManager, error) {
 	return &ExecutionEngineManager{
@@ -79,6 +89,10 @@ func NewExecutionEngineManager(
 		verEnc:            verEnc,
 		decafConstructor:  decafConstructor,
 		compiler:          compiler,
+		frameProver:       frameProver,
+		rewardIssuance:    rewardIssuance,
+		proverRegistry:    proverRegistry,
+		blsConstructor:    blsConstructor,
 		includeGlobal:     includeGlobal,
 		quit:              make(chan struct{}),
 	}, nil
@@ -101,6 +115,10 @@ func (m *ExecutionEngineManager) InitializeEngines() error {
 		m.verEnc,
 		m.decafConstructor,
 		m.compiler,
+		m.frameProver,
+		m.rewardIssuance,
+		m.proverRegistry,
+		m.blsConstructor,
 		m.includeGlobal,
 	)
 	if err != nil {
@@ -615,6 +633,45 @@ func (m *ExecutionEngineManager) ProcessMessage(
 		),
 		"process message",
 	)
+}
+
+// ValidateMessage validates a message without materializing state changes
+func (m *ExecutionEngineManager) Lock(
+	frameNumber uint64,
+	address []byte,
+	message []byte,
+) ([][]byte, error) {
+	m.enginesMu.RLock()
+	defer m.enginesMu.RUnlock()
+
+	engine := m.selectEngine(address)
+	if engine == nil {
+		return nil, errors.Errorf("no execution engine found for address: %x", address)
+	}
+
+	return engine.Lock(frameNumber, address, message)
+}
+
+func (m *ExecutionEngineManager) Unlock() error {
+	m.enginesMu.RLock()
+	defer m.enginesMu.RUnlock()
+
+	errs := []string{}
+	for _, engine := range m.engines {
+		err := engine.Unlock()
+		if err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+
+	if len(errs) != 0 {
+		return errors.Wrap(
+			errors.Errorf("multiple errors: %s", strings.Join(errs, ", ")),
+			"unlock",
+		)
+	}
+
+	return nil
 }
 
 // ValidateMessage validates a message without materializing state changes

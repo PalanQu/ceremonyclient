@@ -198,9 +198,9 @@ func NewDHTNode(*zap.Logger, *config.Config, uint) (*DHTNode, error) {
 	))
 }
 
-// func NewDBConsole(*config.Config) (*DBConsole, error) {
-// 	panic(wire.Build(newDBConsole))
-// }
+func NewDBConsole(*config.Config) (*DBConsole, error) {
+	panic(wire.Build(newDBConsole))
+}
 
 func NewClockStore(
 	*zap.Logger,
@@ -289,6 +289,7 @@ func provideDataWorkerIPC(
 	proverRegistry consensus.ProverRegistry,
 	appConsensusEngineFactory *app.AppConsensusEngineFactory,
 	peerInfoManager p2p.PeerInfoManager,
+	frameProver crypto.FrameProver,
 	logger *zap.Logger,
 	coreId uint,
 	parentProcess int,
@@ -299,6 +300,7 @@ func provideDataWorkerIPC(
 		signerRegistry,
 		proverRegistry,
 		peerInfoManager,
+		frameProver,
 		appConsensusEngineFactory,
 		logger,
 		uint32(coreId),

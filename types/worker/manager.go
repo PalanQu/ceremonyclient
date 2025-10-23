@@ -14,6 +14,7 @@ type WorkerManager interface {
 	GetWorkerIdByFilter(filter []byte) (uint, error)
 	GetFilterByWorkerId(coreId uint) ([]byte, error)
 	RegisterWorker(info *store.WorkerInfo) error
-	ProposeAllocation(coreId uint, filter []byte) error
+	ProposeAllocations(coreIds []uint, filters [][]byte) error
+	DecideAllocations(reject [][]byte, confirm [][]byte) error
 	RangeWorkers() ([]*store.WorkerInfo, error)
 }

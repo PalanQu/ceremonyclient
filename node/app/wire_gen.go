@@ -55,6 +55,14 @@ func NewDHTNode(logger *zap.Logger, configConfig *config.Config, uint2 uint) (*D
 	return dhtNode, nil
 }
 
+func NewDBConsole(configConfig *config.Config) (*DBConsole, error) {
+	dbConsole, err := newDBConsole(configConfig)
+	if err != nil {
+		return nil, err
+	}
+	return dbConsole, nil
+}
+
 func NewClockStore(logger *zap.Logger, configConfig *config.Config, uint2 uint) (store.ClockStore, error) {
 	dbConfig := configConfig.DB
 	pebbleDB := store2.NewPebbleDB(logger, dbConfig, uint2)
@@ -96,6 +104,7 @@ func NewDataWorkerNodeWithProxyPubsub(logger *zap.Logger, config2 *config.Config
 		return nil, err
 	}
 	pebbleInboxStore := store2.NewPebbleInboxStore(pebbleDB, logger)
+	pebbleShardsStore := store2.NewPebbleShardsStore(pebbleDB, logger)
 	bedlamCompiler := compiler.NewBedlamCompiler()
 	inMemoryPeerInfoManager := p2p.NewInMemoryPeerInfoManager(logger)
 	dynamicFeeManager := fees.NewDynamicFeeManager(logger, kzgInclusionProver)
@@ -107,8 +116,8 @@ func NewDataWorkerNodeWithProxyPubsub(logger *zap.Logger, config2 *config.Config
 	asertDifficultyAdjuster := difficulty.NewAsertDifficultyAdjuster(uint64_2, int64_2, uint32_2)
 	optimizedProofOfMeaningfulWorkRewardIssuance := reward.NewOptRewardIssuance()
 	doubleRatchetEncryptedChannel := channel.NewDoubleRatchetEncryptedChannel()
-	appConsensusEngineFactory := app.NewAppConsensusEngineFactory(logger, config2, proxyBlossomSub, hypergraph, fileKeyManager, pebbleKeyStore, pebbleClockStore, pebbleInboxStore, pebbleHypergraphStore, frameProver, kzgInclusionProver, decaf448BulletproofProver, mpCitHVerifiableEncryptor, decaf448KeyConstructor, bedlamCompiler, cachedSignerRegistry, proverRegistry, inMemoryPeerInfoManager, dynamicFeeManager, blsAppFrameValidator, blsGlobalFrameValidator, asertDifficultyAdjuster, optimizedProofOfMeaningfulWorkRewardIssuance, bls48581KeyConstructor, doubleRatchetEncryptedChannel)
-	dataWorkerIPCServer := provideDataWorkerIPC(rpcMultiaddr, config2, cachedSignerRegistry, proverRegistry, appConsensusEngineFactory, inMemoryPeerInfoManager, logger, coreId, parentProcess)
+	appConsensusEngineFactory := app.NewAppConsensusEngineFactory(logger, config2, proxyBlossomSub, hypergraph, fileKeyManager, pebbleKeyStore, pebbleClockStore, pebbleInboxStore, pebbleShardsStore, pebbleHypergraphStore, frameProver, kzgInclusionProver, decaf448BulletproofProver, mpCitHVerifiableEncryptor, decaf448KeyConstructor, bedlamCompiler, cachedSignerRegistry, proverRegistry, inMemoryPeerInfoManager, dynamicFeeManager, blsAppFrameValidator, blsGlobalFrameValidator, asertDifficultyAdjuster, optimizedProofOfMeaningfulWorkRewardIssuance, bls48581KeyConstructor, doubleRatchetEncryptedChannel)
+	dataWorkerIPCServer := provideDataWorkerIPC(rpcMultiaddr, config2, cachedSignerRegistry, proverRegistry, appConsensusEngineFactory, inMemoryPeerInfoManager, frameProver, logger, coreId, parentProcess)
 	globalTimeReel, err := provideGlobalTimeReel(appConsensusEngineFactory)
 	if err != nil {
 		return nil, err
@@ -151,6 +160,7 @@ func NewDataWorkerNodeWithoutProxyPubsub(logger *zap.Logger, config2 *config.Con
 	engineConfig := config2.Engine
 	blossomSub := p2p.NewBlossomSub(p2PConfig, engineConfig, logger, coreId)
 	pebbleInboxStore := store2.NewPebbleInboxStore(pebbleDB, logger)
+	pebbleShardsStore := store2.NewPebbleShardsStore(pebbleDB, logger)
 	bedlamCompiler := compiler.NewBedlamCompiler()
 	inMemoryPeerInfoManager := p2p.NewInMemoryPeerInfoManager(logger)
 	dynamicFeeManager := fees.NewDynamicFeeManager(logger, kzgInclusionProver)
@@ -162,8 +172,8 @@ func NewDataWorkerNodeWithoutProxyPubsub(logger *zap.Logger, config2 *config.Con
 	asertDifficultyAdjuster := difficulty.NewAsertDifficultyAdjuster(uint64_2, int64_2, uint32_2)
 	optimizedProofOfMeaningfulWorkRewardIssuance := reward.NewOptRewardIssuance()
 	doubleRatchetEncryptedChannel := channel.NewDoubleRatchetEncryptedChannel()
-	appConsensusEngineFactory := app.NewAppConsensusEngineFactory(logger, config2, blossomSub, hypergraph, fileKeyManager, pebbleKeyStore, pebbleClockStore, pebbleInboxStore, pebbleHypergraphStore, frameProver, kzgInclusionProver, decaf448BulletproofProver, mpCitHVerifiableEncryptor, decaf448KeyConstructor, bedlamCompiler, cachedSignerRegistry, proverRegistry, inMemoryPeerInfoManager, dynamicFeeManager, blsAppFrameValidator, blsGlobalFrameValidator, asertDifficultyAdjuster, optimizedProofOfMeaningfulWorkRewardIssuance, bls48581KeyConstructor, doubleRatchetEncryptedChannel)
-	dataWorkerIPCServer := provideDataWorkerIPC(rpcMultiaddr, config2, cachedSignerRegistry, proverRegistry, appConsensusEngineFactory, inMemoryPeerInfoManager, logger, coreId, parentProcess)
+	appConsensusEngineFactory := app.NewAppConsensusEngineFactory(logger, config2, blossomSub, hypergraph, fileKeyManager, pebbleKeyStore, pebbleClockStore, pebbleInboxStore, pebbleShardsStore, pebbleHypergraphStore, frameProver, kzgInclusionProver, decaf448BulletproofProver, mpCitHVerifiableEncryptor, decaf448KeyConstructor, bedlamCompiler, cachedSignerRegistry, proverRegistry, inMemoryPeerInfoManager, dynamicFeeManager, blsAppFrameValidator, blsGlobalFrameValidator, asertDifficultyAdjuster, optimizedProofOfMeaningfulWorkRewardIssuance, bls48581KeyConstructor, doubleRatchetEncryptedChannel)
+	dataWorkerIPCServer := provideDataWorkerIPC(rpcMultiaddr, config2, cachedSignerRegistry, proverRegistry, appConsensusEngineFactory, inMemoryPeerInfoManager, frameProver, logger, coreId, parentProcess)
 	globalTimeReel, err := provideGlobalTimeReel(appConsensusEngineFactory)
 	if err != nil {
 		return nil, err
@@ -342,6 +352,7 @@ func provideDataWorkerIPC(
 	proverRegistry consensus.ProverRegistry,
 	appConsensusEngineFactory *app.AppConsensusEngineFactory,
 	peerInfoManager p2p.PeerInfoManager,
+	frameProver crypto.FrameProver,
 	logger *zap.Logger,
 	coreId uint,
 	parentProcess int,
@@ -350,6 +361,7 @@ func provideDataWorkerIPC(
 		rpcMultiaddr, config2, signerRegistry,
 		proverRegistry,
 		peerInfoManager,
+		frameProver,
 		appConsensusEngineFactory,
 		logger,
 		uint32(coreId),

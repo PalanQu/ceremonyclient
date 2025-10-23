@@ -7,6 +7,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/keys"
 	"source.quilibrium.com/quilibrium/monorepo/types/schema"
+	"source.quilibrium.com/quilibrium/monorepo/types/store"
 	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 )
 
@@ -147,6 +148,8 @@ func ProverJoinFromProtobuf(
 	signer crypto.Signer,
 	inclusionProver crypto.InclusionProver,
 	keyManager keys.KeyManager,
+	frameProver crypto.FrameProver,
+	frameStore store.ClockStore,
 ) (*ProverJoin, error) {
 	if pb == nil {
 		return nil, nil
@@ -178,10 +181,13 @@ func ProverJoinFromProtobuf(
 		FrameNumber:                pb.FrameNumber,
 		PublicKeySignatureBLS48581: *pubKeySig,
 		MergeTargets:               mergeTargets,
-		// Private fields will be set by caller
-		hypergraph:     hg,
-		keyManager:     keyManager,
-		rdfMultiprover: nil, // Will be set by caller
+		DelegateAddress:            pb.DelegateAddress,
+		Proof:                      pb.Proof,
+		hypergraph:                 hg,
+		keyManager:                 keyManager,
+		rdfMultiprover:             nil, // Will be set by caller
+		frameProver:                frameProver,
+		frameStore:                 frameStore,
 	}, nil
 }
 
@@ -201,6 +207,8 @@ func (p *ProverJoin) ToProtobuf() *protobufs.ProverJoin {
 		Filters:                    p.Filters,
 		FrameNumber:                p.FrameNumber,
 		PublicKeySignatureBls48581: p.PublicKeySignatureBLS48581.ToProtobuf(),
+		Proof:                      p.Proof,
+		DelegateAddress:            p.DelegateAddress,
 		MergeTargets:               mergeTargets,
 	}
 }
@@ -582,6 +590,8 @@ func GlobalRequestFromProtobuf(
 	signer crypto.Signer,
 	inclusionProver crypto.InclusionProver,
 	keyManager keys.KeyManager,
+	frameProver crypto.FrameProver,
+	frameStore store.ClockStore,
 ) (interface{}, error) {
 	if pb == nil {
 		return nil, nil
@@ -596,6 +606,8 @@ func GlobalRequestFromProtobuf(
 			signer,
 			inclusionProver,
 			keyManager,
+			frameProver,
+			frameStore,
 		)
 
 	case *protobufs.MessageRequest_Leave:

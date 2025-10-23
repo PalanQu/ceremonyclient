@@ -174,9 +174,22 @@ func (p *ProverConfirm) Materialize(
 			return nil, errors.Wrap(err, "materialize")
 		}
 
-		// Store join confirmation frame number
+		// Set active frame to current
 		frameNumberBytes := make([]byte, 8)
 		binary.BigEndian.PutUint64(frameNumberBytes, p.FrameNumber)
+		err = p.rdfMultiprover.Set(
+			GLOBAL_RDF_SCHEMA,
+			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
+			"allocation:ProverAllocation",
+			"LastActiveFrameNumber",
+			frameNumberBytes,
+			allocationTree,
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "materialize")
+		}
+
+		// Store join confirmation frame number
 		err = p.rdfMultiprover.Set(
 			GLOBAL_RDF_SCHEMA,
 			intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
@@ -321,6 +334,61 @@ func (p *ProverConfirm) Prove(frameNumber uint64) error {
 	return nil
 }
 
+func (p *ProverConfirm) GetReadAddresses(frameNumber uint64) ([][]byte, error) {
+	return nil, nil
+}
+
+func (p *ProverConfirm) GetWriteAddresses(frameNumber uint64) ([][]byte, error) {
+	proverAddress := p.PublicKeySignatureBLS48581.Address
+	proverFullAddress := [64]byte{}
+	copy(proverFullAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+	copy(proverFullAddress[32:], proverAddress)
+
+	// Get the existing prover vertex
+	proverTree, err := p.hypergraph.GetVertexData(proverFullAddress)
+	if err != nil || proverTree == nil {
+		return nil, errors.Wrap(
+			errors.New("prover not found"),
+			"get write addresses",
+		)
+	}
+
+	// Get prover public key for allocation lookup
+	publicKey, err := p.rdfMultiprover.Get(
+		GLOBAL_RDF_SCHEMA,
+		"prover:Prover",
+		"PublicKey",
+		proverTree,
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "get write addresses")
+	}
+
+	// Calculate allocation address:
+	allocationAddressBI, err := poseidon.HashBytes(
+		slices.Concat([]byte("PROVER_ALLOCATION"), publicKey, p.Filter),
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "get write addresses")
+	}
+
+	allocationAddress := allocationAddressBI.FillBytes(make([]byte, 32))
+	allocationFullAddress := [64]byte{}
+	copy(allocationFullAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
+	copy(allocationFullAddress[32:], allocationAddress)
+
+	addresses := map[string]struct{}{}
+	addresses[string(proverFullAddress[:])] = struct{}{}
+	addresses[string(allocationFullAddress[:])] = struct{}{}
+
+	result := [][]byte{}
+	for key := range addresses {
+		result = append(result, []byte(key))
+	}
+
+	return result, nil
+}
+
 // Verify implements intrinsics.IntrinsicOperation.
 func (p *ProverConfirm) Verify(frameNumber uint64) (bool, error) {
 	// Create confirm message contents
@@ -430,7 +498,7 @@ func (p *ProverConfirm) Verify(frameNumber uint64) (bool, error) {
 		joinFrame := binary.BigEndian.Uint64(joinFrameBytes)
 
 		// Check timing constraints
-		if joinFrame < 252840 {
+		if joinFrame < 252840 && joinFrame >= 244100 {
 			if frameNumber < 252840 {
 				// If joined before frame 252840, cannot confirm until frame 252840
 				return false, errors.Wrap(
@@ -448,8 +516,10 @@ func (p *ProverConfirm) Verify(frameNumber uint64) (bool, error) {
 		}
 
 		// For joins before 252840, once we reach frame 252840, they can confirm
-		// immediately, for joins after 252840, normal 360 frame wait applies
-		if joinFrame >= 252480 {
+		// immediately, for joins after 252840, normal 360 frame wait applies.
+		// If the join frame precedes the genesis frame (e.g. not mainnet), we
+		// ignore the topic altogether
+		if joinFrame >= 252480 || joinFrame <= 244100 {
 			framesSinceJoin := frameNumber - joinFrame
 			if framesSinceJoin < 360 {
 				return false, errors.Wrap(

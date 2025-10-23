@@ -1,16 +1,12 @@
 package global
 
 import (
-	"bytes"
 	_ "embed"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
-	"io"
 	"math/big"
-	"net/http"
 	"slices"
 	"time"
 
@@ -22,6 +18,7 @@ import (
 	hgcrdt "source.quilibrium.com/quilibrium/monorepo/hypergraph"
 	globalintrinsics "source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global/compat"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	hgstate "source.quilibrium.com/quilibrium/monorepo/node/execution/state/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/intrinsics"
@@ -44,6 +41,9 @@ type GenesisJson struct {
 	ArchivePeers       map[string]string `json:"archive_peers"`
 }
 
+//go:embed mainnet_genesis.json
+var mainnetGenesisJSON []byte
+
 // TODO[2.1.1+]: Refactor out direct hypergraph access
 func (e *GlobalConsensusEngine) initializeGenesis() *protobufs.GlobalFrame {
 	e.logger.Info("initializing genesis frame for global consensus")
@@ -52,43 +52,9 @@ func (e *GlobalConsensusEngine) initializeGenesis() *protobufs.GlobalFrame {
 
 	// If on mainnet, load from release
 	if e.config.P2P.Network == 0 {
-		var lastErr error
-		var genesisData GenesisJson = GenesisJson{}
-		for attempt := 1; attempt <= 5; attempt++ {
-			if err := func() error {
-				resp, err := http.Get("https://releases.quilibrium.com/genesis.json")
-				if err != nil {
-					return err
-				}
-				defer resp.Body.Close()
-
-				if resp.StatusCode != http.StatusOK {
-					return fmt.Errorf("http status %d", resp.StatusCode)
-				}
-
-				buf := bytes.NewBuffer(nil)
-				_, err = io.Copy(buf, resp.Body)
-				if err != nil {
-					return err
-				}
-
-				err = json.Unmarshal(buf.Bytes(), &genesisData)
-				if err != nil {
-					return err
-				}
-
-				return nil
-			}(); err != nil {
-				lastErr = err
-				// simple backoff: 200ms * attempt
-				time.Sleep(time.Duration(200*attempt) * time.Millisecond)
-				continue
-			}
-			lastErr = nil
-			break
-		}
-		if lastErr != nil {
-			e.logger.Error("failed to download genesis", zap.Error(lastErr))
+		var genesisData GenesisJson
+		if err := json.Unmarshal(mainnetGenesisJSON, &genesisData); err != nil {
+			e.logger.Error("failed to parse embedded genesis data", zap.Error(err))
 			return nil
 		}
 
@@ -128,7 +94,7 @@ func (e *GlobalConsensusEngine) initializeGenesis() *protobufs.GlobalFrame {
 			commitments[i] = &tries.VectorCommitmentTree{}
 		}
 
-		proverRoot := make([]byte, 64)
+		var proverRoot []byte
 
 		// Parse and set initial commitments from JSON
 		for hexKey, base64Value := range genesisData.InitialCommitments {
@@ -204,7 +170,12 @@ func (e *GlobalConsensusEngine) initializeGenesis() *protobufs.GlobalFrame {
 			return nil
 		}
 
-		roots := e.hypergraph.Commit()
+		roots, err := e.hypergraph.Commit(0)
+		if err != nil {
+			e.logger.Error("could not commit", zap.Error(err))
+			return nil
+		}
+
 		proverRoots := roots[tries.ShardKey{
 			L1: [3]byte{},
 			L2: intrinsics.GLOBAL_INTRINSIC_ADDRESS,
@@ -239,6 +210,38 @@ func (e *GlobalConsensusEngine) initializeGenesis() *protobufs.GlobalFrame {
 	} else {
 		// For non-mainnet, use stub genesis
 		genesisFrame = e.createStubGenesis()
+		txn, err := e.clockStore.NewTransaction(false)
+		if err != nil {
+			e.logger.Error(
+				"failed to place app shard",
+				zap.Error(err),
+			)
+			return nil
+		}
+
+		l1 := up2p.GetBloomFilterIndices(token.QUIL_TOKEN_ADDRESS, 256, 3)
+
+		err = e.shardsStore.PutAppShard(txn, store.ShardInfo{
+			L1:   l1,
+			L2:   token.QUIL_TOKEN_ADDRESS,
+			Path: []uint32{},
+		})
+		if err != nil {
+			e.logger.Error(
+				"failed to place app shard",
+				zap.Error(err),
+			)
+			txn.Abort()
+			return nil
+		}
+		if err = txn.Commit(); err != nil {
+			e.logger.Error(
+				"failed to place app shard",
+				zap.Error(err),
+			)
+			txn.Abort()
+			return nil
+		}
 	}
 
 	// Compute frame ID and store the full frame
@@ -277,17 +280,29 @@ func (e *GlobalConsensusEngine) createStubGenesis() *protobufs.GlobalFrame {
 		Output:               make([]byte, 516),
 	}
 
+	// Initialize all commitments with empty values first
 	for i := range 256 {
 		genesisHeader.GlobalCommitments[i] = make([]byte, 64)
 	}
 
-	var proverPubKey []byte
+	commitments := make([]*tries.VectorCommitmentTree, 256)
+	for i := range 256 {
+		commitments[i] = &tries.VectorCommitmentTree{}
+	}
+
+	var proverPubKeys [][]byte
 	var err error
 	if e.config.P2P.Network != 99 && e.config.Engine != nil &&
 		e.config.Engine.GenesisSeed != "" {
-		proverPubKey, err = hex.DecodeString(e.config.Engine.GenesisSeed)
+		proverPubKeyBytes, err := hex.DecodeString(e.config.Engine.GenesisSeed)
 		if err != nil {
 			panic(err)
+		}
+		if len(proverPubKeyBytes)%585 != 0 {
+			panic("invalid genesis seed for testnet seeding")
+		}
+		for i := 0; i < len(proverPubKeyBytes)/585; i++ {
+			proverPubKeys = append(proverPubKeys, proverPubKeyBytes[i*585:(i+1)*585])
 		}
 	} else {
 		proverKey, err := e.keyManager.GetSigningKey("q-prover-key")
@@ -298,271 +313,87 @@ func (e *GlobalConsensusEngine) createStubGenesis() *protobufs.GlobalFrame {
 			)
 			return nil
 		}
-		proverPubKey = proverKey.Public().([]byte)
+		proverPubKeys = [][]byte{proverKey.Public().([]byte)}
 	}
 
-	proverAddressBI, err := poseidon.HashBytes(proverPubKey)
-	if err != nil || proverAddressBI == nil {
-		e.logger.Error(
-			"failed to calculate address value",
-			zap.Error(err),
-		)
-		return nil
-	}
-	proverAddress := proverAddressBI.FillBytes(make([]byte, 32))
-
-	// Full address for the prover entry
-	proverFullAddress := [64]byte{}
-	copy(proverFullAddress[:32], intrinsics.GLOBAL_INTRINSIC_ADDRESS[:])
-	copy(proverFullAddress[32:], proverAddress)
-
-	var proverTree *tries.VectorCommitmentTree
-
-	// Create new prover entry
-	proverTree = &tries.VectorCommitmentTree{}
+	state := hgstate.NewHypergraphState(e.hypergraph)
 
 	rdfMultiprover := schema.NewRDFMultiprover(
 		&schema.TurtleRDFParser{},
 		e.inclusionProver,
 	)
-	// Store the public key
-	err = rdfMultiprover.Set(
-		globalintrinsics.GLOBAL_RDF_SCHEMA,
-		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-		"prover:Prover",
-		"PublicKey",
-		proverPubKey,
-		proverTree,
-	)
-	if err != nil {
-		e.logger.Error("failed to set rdf value", zap.Error(err))
+
+	for _, prover := range proverPubKeys {
+		addrbi, err := poseidon.HashBytes(prover)
+		if err != nil {
+			panic(err)
+		}
+
+		// Create ProverReward entry in QUIL token address with 10000 balance
+		rewardTree := &tries.VectorCommitmentTree{}
+
+		err = rdfMultiprover.Set(
+			globalintrinsics.GLOBAL_RDF_SCHEMA,
+			token.QUIL_TOKEN_ADDRESS,
+			"reward:ProverReward",
+			"DelegateAddress",
+			addrbi.FillBytes(make([]byte, 32)),
+			rewardTree,
+		)
+		if err != nil {
+			panic(err)
+		}
+
+		// Set 10000 balance
+		balance := make([]byte, 32)
+		balanceBI := big.NewInt(10000 * 8000000000)
+		balance = balanceBI.FillBytes(balance)
+		err = rdfMultiprover.Set(
+			globalintrinsics.GLOBAL_RDF_SCHEMA,
+			token.QUIL_TOKEN_ADDRESS,
+			"reward:ProverReward",
+			"Balance",
+			balance,
+			rewardTree,
+		)
+		if err != nil {
+			panic(err)
+		}
+
+		// Create reward vertex in QUIL token address
+		rewardVertex := state.NewVertexAddMaterializedState(
+			[32]byte(token.QUIL_TOKEN_ADDRESS),
+			[32]byte(addrbi.FillBytes(make([]byte, 32))),
+			0,
+			nil,
+			rewardTree,
+		)
+
+		err = state.Set(
+			token.QUIL_TOKEN_ADDRESS,
+			addrbi.FillBytes(make([]byte, 32)),
+			hgstate.VertexAddsDiscriminator,
+			0,
+			rewardVertex,
+		)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	if err := state.Commit(); err != nil {
+		e.logger.Error("failed to commit", zap.Error(err))
 		return nil
 	}
 
-	// Store status
-	err = rdfMultiprover.Set(
-		globalintrinsics.GLOBAL_RDF_SCHEMA,
-		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-		"prover:Prover",
-		"Status",
-		[]byte{1},
-		proverTree,
-	)
-	if err != nil {
-		e.logger.Error("failed to set rdf value", zap.Error(err))
-		return nil
-	}
+	state = hgstate.NewHypergraphState(e.hypergraph)
 
-	// Store available storage (initially 0)
-	availableStorageBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(availableStorageBytes, 0)
-	err = rdfMultiprover.Set(
-		globalintrinsics.GLOBAL_RDF_SCHEMA,
-		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-		"prover:Prover",
-		"AvailableStorage",
-		availableStorageBytes,
-		proverTree,
-	)
-	if err != nil {
-		e.logger.Error("failed to set rdf value", zap.Error(err))
-		return nil
-	}
-
-	// Store seniority
-	seniorityBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(seniorityBytes, 1000000000)
-	err = rdfMultiprover.Set(
-		globalintrinsics.GLOBAL_RDF_SCHEMA,
-		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-		"prover:Prover",
-		"Seniority",
-		seniorityBytes,
-		proverTree,
-	)
-	if err != nil {
-		e.logger.Error("failed to set rdf value", zap.Error(err))
-		return nil
-	}
-
-	// Create prover vertex
-	state := hgstate.NewHypergraphState(e.hypergraph)
-	proverVertex := state.NewVertexAddMaterializedState(
-		intrinsics.GLOBAL_INTRINSIC_ADDRESS,
-		[32]byte(proverAddress),
-		0,
-		nil,
-		proverTree,
-	)
-
-	err = state.Set(
-		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-		proverAddress,
-		hgstate.VertexAddsDiscriminator,
-		0,
-		proverVertex,
-	)
-	if err != nil {
-		e.logger.Error("failed to set state value", zap.Error(err))
-		return nil
-	}
-
-	// Create hyperedge for this prover
-	hyperedgeAddress := [32]byte(proverAddress)
-	hyperedge := hgcrdt.NewHyperedge(
-		intrinsics.GLOBAL_INTRINSIC_ADDRESS,
-		hyperedgeAddress,
-	)
-
-	// Create ProverAllocation entry for global
-
-	// Calculate allocation address: poseidon.Hash(publicKey || filter)
-	allocationAddressBI, err := poseidon.HashBytes(
-		slices.Concat([]byte("PROVER_ALLOCATION"), proverPubKey, nil),
-	)
-	if err != nil {
-		e.logger.Error("failed to calculate allocation address", zap.Error(err))
-		return nil
-	}
-	allocationAddress := allocationAddressBI.FillBytes(make([]byte, 32))
-
-	// Create allocation tree
-	allocationTree := &tries.VectorCommitmentTree{}
-
-	// Store prover reference (using the prover vertex)
-	err = rdfMultiprover.Set(
-		globalintrinsics.GLOBAL_RDF_SCHEMA,
-		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-		"allocation:ProverAllocation",
-		"Prover",
-		proverAddress,
-		allocationTree,
-	)
-	if err != nil {
-		e.logger.Error("failed to set state value", zap.Error(err))
-		return nil
-	}
-
-	// Store allocation status
-	err = rdfMultiprover.Set(
-		globalintrinsics.GLOBAL_RDF_SCHEMA,
-		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-		"allocation:ProverAllocation",
-		"Status",
-		[]byte{1},
-		allocationTree,
-	)
-	if err != nil {
-		e.logger.Error("failed to set state value", zap.Error(err))
-		return nil
-	}
-
-	// Store confirmation filter
-	err = rdfMultiprover.Set(
-		globalintrinsics.GLOBAL_RDF_SCHEMA,
-		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-		"allocation:ProverAllocation",
-		"ConfirmationFilter",
-		nil,
-		allocationTree,
-	)
-	if err != nil {
-		e.logger.Error("failed to set state value", zap.Error(err))
-		return nil
-	}
-
-	// Store join frame number
-	frameNumberBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(frameNumberBytes, 0)
-	err = rdfMultiprover.Set(
-		globalintrinsics.GLOBAL_RDF_SCHEMA,
-		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-		"allocation:ProverAllocation",
-		"JoinFrameNumber",
-		frameNumberBytes,
-		allocationTree,
-	)
-	if err != nil {
-		e.logger.Error("failed to set state value", zap.Error(err))
-		return nil
-	}
-
-	// Store join confirm frame number
-	err = rdfMultiprover.Set(
-		globalintrinsics.GLOBAL_RDF_SCHEMA,
-		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-		"allocation:ProverAllocation",
-		"JoinConfirmFrameNumber",
-		frameNumberBytes,
-		allocationTree,
-	)
-	if err != nil {
-		e.logger.Error("failed to set state value", zap.Error(err))
-		return nil
-	}
-
-	// Store last active frame number
-	lastActiveFrameNumberBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(lastActiveFrameNumberBytes, 244200)
-	err = rdfMultiprover.Set(
-		globalintrinsics.GLOBAL_RDF_SCHEMA,
-		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-		"allocation:ProverAllocation",
-		"LastActiveFrameNumber",
-		lastActiveFrameNumberBytes,
-		allocationTree,
-	)
-	if err != nil {
-		e.logger.Error("failed to set state value", zap.Error(err))
-		return nil
-	}
-
-	// Create allocation vertex
-	allocationVertex := state.NewVertexAddMaterializedState(
-		intrinsics.GLOBAL_INTRINSIC_ADDRESS,
-		[32]byte(allocationAddress),
-		0,
-		nil,
-		allocationTree,
-	)
-
-	err = state.Set(
-		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-		allocationAddress,
-		hgstate.VertexAddsDiscriminator,
-		0,
-		allocationVertex,
-	)
-	if err != nil {
-		e.logger.Error("failed to set state value", zap.Error(err))
-		return nil
-	}
-
-	// Add allocation vertex to hyperedge
-	allocationAtom := hgcrdt.NewVertex(
-		intrinsics.GLOBAL_INTRINSIC_ADDRESS,
-		[32]byte(allocationAddress),
-		allocationTree.Commit(e.inclusionProver, false),
-		allocationTree.GetSize(),
-	)
-	hyperedge.AddExtrinsic(allocationAtom)
-
-	// Update hyperedge
-	hyperedgeState := state.NewHyperedgeAddMaterializedState(
-		0,
-		nil,
-		hyperedge,
-	)
-	err = state.Set(
-		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
-		hyperedgeAddress[:],
-		hgstate.HyperedgeAddsDiscriminator,
-		0,
-		hyperedgeState,
-	)
-	if err != nil {
-		e.logger.Error("failed to set state value", zap.Error(err))
-		return nil
+	for _, pubkey := range proverPubKeys {
+		err = e.addGenesisProver(rdfMultiprover, state, pubkey, 0, 0)
+		if err != nil {
+			e.logger.Error("error adding prover", zap.Error(err))
+			return nil
+		}
 	}
 
 	err = state.Commit()
@@ -571,7 +402,25 @@ func (e *GlobalConsensusEngine) createStubGenesis() *protobufs.GlobalFrame {
 		return nil
 	}
 
-	roots := e.hypergraph.Commit()
+	roots, err := e.hypergraph.Commit(0)
+	if err != nil {
+		e.logger.Error("could not commit", zap.Error(err))
+		return nil
+	}
+
+	// Parse and set initial commitments from JSON
+	for shardKey, commits := range roots {
+		for i := 0; i < 3; i++ {
+			commitments[shardKey.L1[i]].Insert(
+				shardKey.L2[:],
+				commits[0],
+				nil,
+				big.NewInt(int64(len(commits[0]))),
+			)
+			commitments[shardKey.L1[i]].Commit(e.inclusionProver, false)
+		}
+	}
+
 	proverRoots := roots[tries.ShardKey{
 		L1: [3]byte{},
 		L2: intrinsics.GLOBAL_INTRINSIC_ADDRESS,
@@ -580,6 +429,13 @@ func (e *GlobalConsensusEngine) createStubGenesis() *protobufs.GlobalFrame {
 	proverRoot := proverRoots[0]
 
 	genesisHeader.ProverTreeCommitment = proverRoot
+
+	for i := 0; i < 256; i++ {
+		genesisHeader.GlobalCommitments[i] = commitments[i].Commit(
+			e.inclusionProver,
+			false,
+		)
+	}
 
 	// Establish an empty signature payload – this avoids panics on broken
 	// header readers
@@ -678,7 +534,6 @@ func (e *GlobalConsensusEngine) establishMainnetGenesisProvers(
 	if err := e.addGenesisProver(
 		rdfMultiprover,
 		state,
-		[]byte(peerId),
 		publicKey,
 		seniority.Uint64(),
 		genesisData.FrameNumber,
@@ -687,7 +542,7 @@ func (e *GlobalConsensusEngine) establishMainnetGenesisProvers(
 	}
 
 	for peerid, pubkeyhex := range genesisData.ArchivePeers {
-		id, err := base58.Decode(peerid)
+		_, err := base58.Decode(peerid)
 		if err != nil {
 			return err
 		}
@@ -700,7 +555,6 @@ func (e *GlobalConsensusEngine) establishMainnetGenesisProvers(
 		if err := e.addGenesisProver(
 			rdfMultiprover,
 			state,
-			id,
 			pubkey,
 			seniority.Uint64(),
 			genesisData.FrameNumber,
@@ -715,7 +569,6 @@ func (e *GlobalConsensusEngine) establishMainnetGenesisProvers(
 func (e *GlobalConsensusEngine) addGenesisProver(
 	rdfMultiprover *schema.RDFMultiprover,
 	state *hgstate.HypergraphState,
-	peerId []byte,
 	pubkey []byte,
 	seniority uint64,
 	frameNumber uint64,
@@ -915,7 +768,7 @@ func (e *GlobalConsensusEngine) addGenesisProver(
 
 	// Store last active frame number
 	lastActiveFrameNumberBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(lastActiveFrameNumberBytes, 244200)
+	binary.BigEndian.PutUint64(lastActiveFrameNumberBytes, frameNumber)
 	err = rdfMultiprover.Set(
 		globalintrinsics.GLOBAL_RDF_SCHEMA,
 		intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],

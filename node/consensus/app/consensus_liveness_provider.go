@@ -2,18 +2,12 @@ package app
 
 import (
 	"context"
-	"encoding/binary"
-	"math/big"
 	"slices"
 	"time"
 
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
-	"golang.org/x/crypto/sha3"
-	"source.quilibrium.com/quilibrium/monorepo/node/consensus/reward"
-	hgstate "source.quilibrium.com/quilibrium/monorepo/node/execution/state/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
-	"source.quilibrium.com/quilibrium/monorepo/types/execution/state"
 )
 
 // AppLivenessProvider implements LivenessProvider
@@ -47,9 +41,6 @@ func (p *AppLivenessProvider) Collect(
 		mixnetMessages = p.engine.mixnet.GetMessages()
 	}
 
-	var state state.State
-	state = hgstate.NewHypergraphState(p.engine.hypergraph)
-
 	finalizedMessages := []*protobufs.Message{}
 
 	// Get and clear pending messages
@@ -58,91 +49,54 @@ func (p *AppLivenessProvider) Collect(
 	p.engine.pendingMessages = []*protobufs.Message{}
 	p.engine.pendingMessagesMu.Unlock()
 
+	frameNumber := uint64(p.engine.GetFrame().Header.FrameNumber) + 1
+
+	txMap := map[string][][]byte{}
 	for i, message := range slices.Concat(mixnetMessages, pendingMessages) {
-		bundle := &protobufs.MessageBundle{}
-		if err := bundle.FromCanonicalBytes(message.Payload); err != nil {
-			p.engine.logger.Error(
-				"invalid message bytes",
-				zap.Int("message_index", i),
-				zap.Error(err),
-			)
-			continue
-		}
-
-		if err := bundle.Validate(); err != nil {
-			p.engine.logger.Error(
-				"invalid message",
-				zap.Int("message_index", i),
-				zap.Error(err),
-			)
-			continue
-		}
-
-		costBasis, err := p.engine.executionManager.GetCost(message.Payload)
+		lockedAddrs, err := p.validateAndLockMessage(frameNumber, i, message)
 		if err != nil {
-			p.engine.logger.Error(
-				"invalid message",
-				zap.Int("message_index", i),
-				zap.Error(err),
-			)
 			continue
 		}
 
-		p.engine.currentDifficultyMu.RLock()
-		difficulty := uint64(p.engine.currentDifficulty)
-		p.engine.currentDifficultyMu.RUnlock()
-		baseline := reward.GetBaselineFee(
-			difficulty,
-			p.engine.hypergraph.GetSize(nil, nil).Uint64(),
-			costBasis.Uint64(),
-			8000000000,
-		)
-		baseline.Quo(baseline, costBasis)
+		txMap[string(message.Hash)] = lockedAddrs
 
-		result, err := p.engine.executionManager.ProcessMessage(
-			uint64(p.engine.GetFrame().Header.FrameNumber),
-			new(big.Int).Mul(
-				baseline,
-				big.NewInt(int64(p.engine.GetFrame().Header.FeeMultiplierVote)),
-			),
-			message.Address,
-			message.Payload,
-			state,
-		)
-		if err != nil {
-			p.engine.logger.Error(
-				"could not validate for execution",
-				zap.Int("message_index", i),
-				zap.Error(err),
-			)
-			continue
-		}
-
-		state = result.State
 		finalizedMessages = append(finalizedMessages, message)
+	}
+
+	err := p.engine.executionManager.Unlock()
+	if err != nil {
+		p.engine.logger.Error("could not unlock", zap.Error(err))
 	}
 
 	p.engine.logger.Info(
 		"collected messages",
-		zap.Int("total_message_count", len(mixnetMessages)+len(pendingMessages)),
+		zap.Int(
+			"total_message_count",
+			len(mixnetMessages)+len(pendingMessages),
+		),
 		zap.Int("valid_message_count", len(finalizedMessages)),
 		zap.Uint64(
 			"current_frame",
 			p.engine.GetFrame().Rank(),
 		),
 	)
+	transactionsCollectedTotal.WithLabelValues(p.engine.appAddressHex).Add(
+		float64(len(finalizedMessages)),
+	)
 
 	// Calculate commitment root
-	commitment, err := p.engine.calculateRequestsRoot(finalizedMessages)
+	commitment, err := p.engine.calculateRequestsRoot(finalizedMessages, txMap)
 	if err != nil {
 		return CollectedCommitments{}, errors.Wrap(err, "collect")
 	}
 
-	commitmentHash := sha3.Sum256(commitment)
+	p.engine.collectedMessagesMu.Lock()
+	p.engine.collectedMessages[string(commitment[:32])] = finalizedMessages
+	p.engine.collectedMessagesMu.Unlock()
 
 	return CollectedCommitments{
-		frameNumber:    uint64(p.engine.GetFrame().Header.FrameNumber),
-		commitmentHash: commitmentHash[:],
+		frameNumber:    frameNumber,
+		commitmentHash: commitment,
 		prover:         p.engine.getProverAddress(),
 	}, nil
 }
@@ -163,6 +117,11 @@ func (p *AppLivenessProvider) SendLiveness(
 		frameNumber = (*prior).Header.FrameNumber + 1
 	}
 
+	lastProcessed := p.engine.GetFrame()
+	if lastProcessed != nil && lastProcessed.Header.FrameNumber > frameNumber {
+		return errors.New("out of sync, forcing resync")
+	}
+
 	// Create liveness check message
 	livenessCheck := &protobufs.ProverLivenessCheck{
 		Filter:         p.engine.appAddress,
@@ -172,28 +131,25 @@ func (p *AppLivenessProvider) SendLiveness(
 	}
 
 	// Sign the message
-	signatureData := append(
-		p.engine.appAddress,
-		binary.BigEndian.AppendUint64(nil, frameNumber)...,
-	)
-	signatureData = append(
-		signatureData,
-		binary.BigEndian.AppendUint64(nil, uint64(livenessCheck.Timestamp))...,
-	)
+	signatureData, err := livenessCheck.ConstructSignaturePayload()
+	if err != nil {
+		return errors.Wrap(err, "send liveness")
+	}
 
 	sig, err := signer.SignWithDomain(
 		signatureData,
-		slices.Concat([]byte("liveness"), p.engine.appAddress),
+		livenessCheck.GetSignatureDomain(),
 	)
 	if err != nil {
 		return errors.Wrap(err, "send liveness")
 	}
 
 	proverAddress := p.engine.getAddressFromPublicKey(publicKey)
-	livenessCheck.PublicKeySignatureBls48581 = &protobufs.BLS48581AddressedSignature{
-		Address:   proverAddress,
-		Signature: sig,
-	}
+	livenessCheck.PublicKeySignatureBls48581 =
+		&protobufs.BLS48581AddressedSignature{
+			Address:   proverAddress,
+			Signature: sig,
+		}
 
 	// Serialize using canonical bytes
 	data, err := livenessCheck.ToCanonicalBytes()
@@ -214,4 +170,51 @@ func (p *AppLivenessProvider) SendLiveness(
 	)
 
 	return nil
+}
+
+func (p *AppLivenessProvider) validateAndLockMessage(
+	frameNumber uint64,
+	i int,
+	message *protobufs.Message,
+) (lockedAddrs [][]byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			p.engine.logger.Error(
+				"panic recovered from message",
+				zap.Any("panic", r),
+				zap.Stack("stacktrace"),
+			)
+			err = errors.New("panicked processing message")
+		}
+	}()
+
+	err = p.engine.executionManager.ValidateMessage(
+		frameNumber,
+		message.Address,
+		message.Payload,
+	)
+	if err != nil {
+		p.engine.logger.Debug(
+			"invalid message",
+			zap.Int("message_index", i),
+			zap.Error(err),
+		)
+		return nil, err
+	}
+
+	lockedAddrs, err = p.engine.executionManager.Lock(
+		frameNumber,
+		message.Address,
+		message.Payload,
+	)
+	if err != nil {
+		p.engine.logger.Debug(
+			"message failed lock",
+			zap.Int("message_index", i),
+			zap.Error(err),
+		)
+		return nil, err
+	}
+
+	return lockedAddrs, nil
 }

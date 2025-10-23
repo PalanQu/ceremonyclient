@@ -1519,6 +1519,254 @@ func TestGlobalTimeReel_ComprehensiveEquivocation(t *testing.T) {
 	}
 }
 
+func TestGlobalTimeReel_NonArchive_BootstrapLoadsWindowOf360(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	s := setupTestClockStore(t)
+
+	// Persist 1000 -> 1500 (501 frames) so bootstrap has history to load.
+	buildAndPersistChain(t, s, 1000, 1500)
+
+	// Start a new reel in non-archive mode; it should bootstrap only last 360.
+	tr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, false)
+	require.NoError(t, err)
+	require.NoError(t, tr.Start())
+	defer tr.Stop()
+
+	head, err := tr.GetHead()
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1500), head.Header.FrameNumber)
+
+	info := tr.GetTreeInfo()
+	span := info["tree_span"].(uint64)
+	assert.LessOrEqual(t, span, uint64(maxGlobalTreeDepth), "tree span must be less than or equal to 360 in non-archive bootstrap")
+
+	// Old in-memory nodes before the 360-window should not be retrievable via
+	// in-memory index.
+	_, err = tr.GetFramesByNumber(1000)
+	assert.Error(t, err, "old frames should not be in memory after non-archive bootstrap")
+}
+
+func TestGlobalTimeReel_NonArchive_SnapForward_WhenGapExceeds360(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	s := setupTestClockStore(t)
+
+	// Persist a tiny tail 1000 -> 1020, so non-archive starts at 1020.
+	buildAndPersistChain(t, s, 1000, 1020)
+
+	tr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, false)
+	require.NoError(t, err)
+	require.NoError(t, tr.Start())
+	defer tr.Stop()
+
+	head, err := tr.GetHead()
+	require.NoError(t, err)
+	require.Equal(t, uint64(1020), head.Header.FrameNumber)
+
+	// Insert a future frame whose height is > head + 360 (i.e. 1381).
+	// Parent is unknown: leave ParentSelector nil/garbage, non-archive path
+	// should snap to head.
+	future := &protobufs.GlobalFrame{
+		Header: &protobufs.GlobalFrameHeader{
+			FrameNumber:    1381,
+			Timestamp:      time.Now().UnixMilli(),
+			Output:         []byte("future_1381"),
+			ParentSelector: []byte("unknown_parent"),
+		},
+	}
+	require.NoError(t, tr.Insert(context.Background(), future))
+
+	newHead, err := tr.GetHead()
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1381), newHead.Header.FrameNumber, "gap over 360 should snap head to future frame")
+}
+
+func TestGlobalTimeReel_NonArchive_PrunesStore_AsHeadAdvances(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	s := setupTestClockStore(t)
+
+	tr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, false)
+	require.NoError(t, err)
+	require.NoError(t, tr.Start())
+	defer tr.Stop()
+
+	// Insert a contiguous chain via Insert so persistCanonicalFrames runs and
+	// prunes store.
+	var prev *protobufs.GlobalFrame
+	for n := uint64(1); n <= uint64(maxGlobalTreeDepth)+25; n++ {
+		f := createGlobalFrame(n, prev, []byte(fmt.Sprintf("out%d", n)))
+		require.NoError(t, tr.Insert(context.Background(), f))
+		prev = f
+	}
+
+	head, err := tr.GetHead()
+	require.NoError(t, err)
+
+	// Oldest to keep in store should be (head - 360 + 1).
+	oldestToKeep := head.Header.FrameNumber - maxGlobalTreeDepth + 1
+
+	// Old frames should be gone from the store, head should remain.
+	_, err = s.GetGlobalClockFrame(1)
+	assert.Error(t, err, "very old frame should be pruned from store in non-archive mode")
+
+	latest, err := s.GetLatestGlobalClockFrame()
+	require.NoError(t, err)
+	assert.Equal(t, head.Header.FrameNumber, latest.Header.FrameNumber)
+
+	_, err = s.GetGlobalClockFrame(oldestToKeep)
+	assert.NoError(t, err, "boundary oldestToKeep should not be deleted")
+}
+
+func TestGlobalTimeReel_NonArchive_PendingResolves_WhenParentArrives(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	s := setupTestClockStore(t)
+
+	tr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, false)
+	require.NoError(t, err)
+	require.NoError(t, tr.Start())
+	defer tr.Stop()
+
+	ctx := context.Background()
+
+	var prev *protobufs.GlobalFrame
+	for n := uint64(90); n <= 99; n++ {
+		f := createGlobalFrame(n, prev, []byte(fmt.Sprintf("base_%d", n)))
+		require.NoError(t, tr.Insert(ctx, f))
+		prev = f
+	}
+
+	// Insert the child frame (101) first, referencing the output of the parent
+	// (100), but 100 is not in the reel yet. Set child's ParentSelector to
+	// hash(out100).
+	out100 := []byte("base_100")
+	child101 := &protobufs.GlobalFrame{
+		Header: &protobufs.GlobalFrameHeader{
+			FrameNumber:    101,
+			Timestamp:      time.Now().UnixMilli(),
+			Output:         []byte("child_101"),
+			ParentSelector: computeGlobalPoseidonHash(out100), // points to future parent 100
+		},
+	}
+	require.NoError(t, tr.Insert(ctx, child101))
+
+	// Should appear in pending (under the selector for out100).
+	pending := tr.GetPendingFrames()
+	require.NotZero(t, len(pending), "child without known parent should be pending")
+
+	// Now insert the missing parent 100 that links to 99 and has output out100.
+	parent100 := &protobufs.GlobalFrame{
+		Header: &protobufs.GlobalFrameHeader{
+			FrameNumber:    100,
+			Timestamp:      time.Now().UnixMilli(),
+			Output:         out100,
+			ParentSelector: computeGlobalPoseidonHash([]byte("base_99")),
+		},
+	}
+	require.NoError(t, tr.Insert(ctx, parent100))
+
+	// Give a beat for pending processing.
+	time.Sleep(25 * time.Millisecond)
+
+	// Pending for that selector should be cleared; head should advance to 101.
+	after := tr.GetPendingFrames()
+	for sel, list := range after {
+		assert.Failf(t, "unexpected pending remains", "selector=%x len=%d", sel, len(list))
+	}
+
+	head, err := tr.GetHead()
+	require.NoError(t, err)
+	assert.Equal(t, uint64(101), head.Header.FrameNumber)
+}
+
+func TestGlobalTimeReel_NonArchive_SnapThenAppend_NoSpuriousForks(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	s := setupTestClockStore(t)
+
+	// Seed 0 -> 200 so the store has history
+	buildAndPersistChain(t, s, 0, 200)
+
+	tr, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, false)
+	require.NoError(t, err)
+	require.NoError(t, tr.Start())
+	defer tr.Stop()
+
+	ctx := context.Background()
+	eventCh := tr.GetEventCh()
+
+	// Drain any startup/new head events.
+drain:
+	for {
+		select {
+		case <-eventCh:
+		case <-time.After(20 * time.Millisecond):
+			break drain
+		}
+	}
+
+	// Confirm bootstrapped head is 200.
+	head, err := tr.GetHead()
+	require.NoError(t, err)
+	require.Equal(t, uint64(200), head.Header.FrameNumber)
+
+	// Insert a far-ahead tip so that gap > 360 (induces snap ahead).
+	snapTip := &protobufs.GlobalFrame{
+		Header: &protobufs.GlobalFrameHeader{
+			FrameNumber:    561,
+			Timestamp:      time.Now().UnixMilli(),
+			Output:         []byte("snap_561"),
+			ParentSelector: []byte("unknown"),
+		},
+	}
+	require.NoError(t, tr.Insert(ctx, snapTip))
+
+	// We should get a fork
+	select {
+	case ev := <-eventCh:
+		require.Equal(t, TimeReelEventForkDetected, ev.Type, "snap should be a fork event")
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("timeout waiting for fork event")
+	}
+
+	// Now append a few sequential frames (562 -> 566) that chain to the snapped
+	// head.
+	var prev = snapTip
+	var forkEvents int
+	for n := uint64(562); n <= 566; n++ {
+		f := &protobufs.GlobalFrame{
+			Header: &protobufs.GlobalFrameHeader{
+				FrameNumber:    n,
+				Timestamp:      time.Now().UnixMilli(),
+				Output:         []byte(fmt.Sprintf("snap_%d", n)),
+				ParentSelector: computeGlobalPoseidonHash(prev.Header.Output),
+			},
+		}
+		require.NoError(t, tr.Insert(ctx, f))
+		prev = f
+
+		// Expect exactly one new-head event per append, and zero fork events.
+		select {
+		case ev := <-eventCh:
+			if ev.Type == TimeReelEventForkDetected {
+				forkEvents++
+			}
+			require.Equal(t, TimeReelEventNewHead, ev.Type, "sequential append should be a head advance, not a fork")
+		case <-time.After(200 * time.Millisecond):
+			t.Fatalf("timeout waiting for head advance at %d", n)
+		}
+	}
+
+	assert.Equal(t, 0, forkEvents, "no fork events should occur when linearly appending after snap")
+
+	// Head should be at 566
+	head, err = tr.GetHead()
+	require.NoError(t, err)
+	assert.Equal(t, uint64(566), head.Header.FrameNumber)
+
+	// Tree should have exactly one branch in the head's component.
+	info := tr.GetTreeInfo()
+	branchCount := info["branch_count"].(int)
+	assert.Equal(t, 1, branchCount, "should present a single branch after snap + linear append")
+}
+
 func mustLatestGlobal(t *testing.T, s *store.PebbleClockStore) *protobufs.GlobalFrame {
 	t.Helper()
 	f, err := s.GetLatestGlobalClockFrame()
@@ -1551,4 +1799,37 @@ func assertLatestNumOutput(t *testing.T, s *store.PebbleClockStore, n uint64, ou
 	f := mustLatestGlobal(t, s)
 	assert.Equal(t, n, f.Header.FrameNumber)
 	assert.Equal(t, output, f.Header.Output)
+}
+
+func createGlobalFrame(num uint64, parent *protobufs.GlobalFrame, out []byte) *protobufs.GlobalFrame {
+	var sel []byte
+	if parent != nil {
+		sel = computeGlobalPoseidonHash(parent.Header.Output)
+	}
+	return &protobufs.GlobalFrame{
+		Header: &protobufs.GlobalFrameHeader{
+			FrameNumber:    num,
+			Timestamp:      time.Now().UnixMilli(),
+			Difficulty:     0,
+			Output:         out,
+			ParentSelector: sel,
+		},
+	}
+}
+
+func buildAndPersistChain(t *testing.T, s *store.PebbleClockStore, start, end uint64) {
+	t.Helper()
+	logger, _ := zap.NewDevelopment()
+	// note: needs to be non-archive otherwise insert will only set as pending
+	reel, err := NewGlobalTimeReel(logger, createTestProverRegistry(true), s, 99, false)
+	require.NoError(t, err)
+	require.NoError(t, reel.Start())
+	defer reel.Stop()
+
+	var prev *protobufs.GlobalFrame
+	for n := start; n <= end; n++ {
+		f := createGlobalFrame(n, prev, []byte(fmt.Sprintf("out%d", n)))
+		require.NoError(t, reel.Insert(context.Background(), f))
+		prev = f
+	}
 }

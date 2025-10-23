@@ -392,45 +392,6 @@ func main(a, b int) int {
 		assert.Contains(t, err.Error(), "unknown operation type: 99")
 	})
 
-	// Test Lock/Unlock mechanism
-	t.Run("LockUnlock", func(t *testing.T) {
-		// Test addresses
-		writeAddr1 := []byte("write_address_1")
-		writeAddr2 := []byte("write_address_2")
-		readAddr1 := []byte("read_address_1")
-		readAddr2 := []byte("read_address_2")
-
-		// Lock addresses
-		err := computeIntrinsic.Lock([][]byte{writeAddr1}, [][]byte{readAddr1})
-		require.NoError(t, err)
-
-		// Try to lock same write address again - should fail
-		err = computeIntrinsic.Lock([][]byte{writeAddr1}, [][]byte{})
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "already locked for writing")
-
-		// Try to lock for reading an address that's locked for writing - should fail
-		err = computeIntrinsic.Lock([][]byte{}, [][]byte{writeAddr1})
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "already locked for writing")
-
-		// Lock additional addresses
-		err = computeIntrinsic.Lock([][]byte{writeAddr2}, [][]byte{readAddr2})
-		require.NoError(t, err)
-
-		// Unlock first set
-		err = computeIntrinsic.Unlock([][]byte{writeAddr1}, [][]byte{readAddr1})
-		require.NoError(t, err)
-
-		// Now we should be able to lock writeAddr1 again
-		err = computeIntrinsic.Lock([][]byte{writeAddr1}, [][]byte{})
-		require.NoError(t, err)
-
-		// Unlock all
-		err = computeIntrinsic.Unlock([][]byte{writeAddr1, writeAddr2}, [][]byte{readAddr2})
-		require.NoError(t, err)
-	})
-
 	// Test LoadComputeIntrinsic
 	t.Run("LoadComputeIntrinsic", func(t *testing.T) {
 		var state state.State = hgstate.NewHypergraphState(hg)
@@ -766,12 +727,12 @@ func main(a int, b int) int {
 		deployment1, err := compute.NewCodeDeployment(domain, circuit1Code, [2]string{"qcl:Int", "qcl:Int"}, inputSizes1, []string{"qcl:Int"}, compiler.NewBedlamCompiler())
 		require.NoError(t, err)
 
-		err = deployment1.Prove(token.FRAME_2_1_CUTOVER + 1)
+		err = deployment1.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 1)
 		require.NoError(t, err)
 
 		// Materialize first circuit
 		state := hgstate.NewHypergraphState(hg)
-		newst, err := deployment1.Materialize(token.FRAME_2_1_CUTOVER+1, state)
+		newst, err := deployment1.Materialize(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+1, state)
 		state = newst.(*hgstate.HypergraphState)
 		require.NoError(t, err)
 
@@ -792,11 +753,11 @@ func main(a int, b int) int {
 		deployment2, err := compute.NewCodeDeployment(domain, circuit2Code, [2]string{"qcl:Int", "qcl:Int"}, inputSizes2, []string{"qcl:Int"}, compiler.NewBedlamCompiler())
 		require.NoError(t, err)
 
-		err = deployment2.Prove(token.FRAME_2_1_CUTOVER + 2)
+		err = deployment2.Prove(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END + 2)
 		require.NoError(t, err)
 
 		// Materialize second circuit
-		newst, err = deployment2.Materialize(token.FRAME_2_1_CUTOVER+2, state)
+		newst, err = deployment2.Materialize(token.FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END+2, state)
 		require.NoError(t, err)
 		state = newst.(*hgstate.HypergraphState)
 

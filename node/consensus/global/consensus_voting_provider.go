@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"sync"
+	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/pkg/errors"
@@ -185,6 +186,7 @@ func (p *GlobalVotingProvider) DecideAndSendVote(
 		FrameNumber: chosenProposal.Header.FrameNumber,
 		Proposer:    proposerID,
 		Approve:     true,
+		Timestamp:   time.Now().UnixMilli(),
 		PublicKeySignatureBls48581: &protobufs.BLS48581AddressedSignature{
 			Address:   voterAddress,
 			Signature: sig,
@@ -359,13 +361,7 @@ func (p *GlobalVotingProvider) FinalizeVotes(
 
 	for i := 0; i < len(provers); i++ {
 		activeProver := provers[i]
-		if err != nil {
-			p.engine.logger.Error(
-				"could not get prover info",
-				zap.String("address", hex.EncodeToString(activeProver.Address)),
-			)
-			continue
-		}
+
 		// Check if this prover voted in our voterMap
 		if _, ok := voterMap[string(activeProver.Address)]; ok {
 			byteIndex := i / 8
@@ -426,6 +422,7 @@ func (p *GlobalVotingProvider) SendConfirmation(
 	confirmation := &protobufs.FrameConfirmation{
 		FrameNumber:        copiedFinalized.Header.FrameNumber,
 		Selector:           selectorBI.FillBytes(make([]byte, 32)),
+		Timestamp:          time.Now().UnixMilli(),
 		AggregateSignature: copiedFinalized.Header.PublicKeySignatureBls48581,
 	}
 

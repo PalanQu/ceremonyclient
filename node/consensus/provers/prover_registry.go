@@ -3,6 +3,7 @@ package provers
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"sync"
@@ -11,6 +12,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/exp/slices"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global"
+	hgstate "source.quilibrium.com/quilibrium/monorepo/node/execution/state/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/intrinsics"
 	"source.quilibrium.com/quilibrium/monorepo/types/execution/state"
@@ -100,7 +102,7 @@ func (r *ProverRegistry) ProcessStateTransition(
 	r.currentFrame = frameNumber
 
 	changes := state.Changeset()
-	r.logger.Debug("processing changeset", zap.Int("changeCount", len(changes)))
+	r.logger.Debug("processing changeset", zap.Int("change_count", len(changes)))
 
 	// Process each change
 	for _, change := range changes {
@@ -149,13 +151,6 @@ func (r *ProverRegistry) GetProverInfo(
 	)
 
 	if info, exists := r.proverCache[string(address)]; exists {
-		r.logger.Debug(
-			"prover info found",
-			zap.String("address", fmt.Sprintf("%x", address)),
-			zap.String("public_key", fmt.Sprintf("%x", info.PublicKey)),
-			zap.Uint8("status", uint8(info.Status)),
-			zap.Int("allocation_count", len(info.Allocations)),
-		)
 		return info, nil
 	}
 
@@ -269,11 +264,6 @@ func (r *ProverRegistry) GetActiveProvers(
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	r.logger.Debug(
-		"getting active provers",
-		zap.String("filter", fmt.Sprintf("%x", filter)),
-	)
-
 	result, err := r.getProversByStatusInternal(
 		filter,
 		consensus.ProverStatusActive,
@@ -283,7 +273,30 @@ func (r *ProverRegistry) GetActiveProvers(
 		return nil, err
 	}
 
-	r.logger.Debug("active provers retrieved", zap.Int("count", len(result)))
+	return result, nil
+}
+
+// GetProvers implements ProverRegistry
+func (r *ProverRegistry) GetProvers(filter []byte) (
+	[]*consensus.ProverInfo,
+	error,
+) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	r.logger.Debug(
+		"getting provers",
+		zap.String("filter", fmt.Sprintf("%x", filter)),
+	)
+
+	var result []*consensus.ProverInfo
+	result = append(result, r.filterCache[string(filter)]...)
+
+	sort.Slice(result, func(i, j int) bool {
+		return bytes.Compare(result[i].Address, result[j].Address) == -1
+	})
+
+	r.logger.Debug("provers retrieved", zap.Int("count", len(result)))
 	return result, nil
 }
 
@@ -402,7 +415,7 @@ func (r *ProverRegistry) getProversByStatusInternal(
 ) ([]*consensus.ProverInfo, error) {
 	var result []*consensus.ProverInfo
 
-	for _, info := range r.proverCache {
+	for _, info := range r.filterCache[string(filter)] {
 		for _, allocation := range info.Allocations {
 			if allocation.Status == status && bytes.Equal(
 				allocation.ConfirmationFilter,
@@ -761,9 +774,20 @@ func (r *ProverRegistry) extractGlobalState() error {
 						index := sort.Search(len(info), func(i int) bool {
 							return bytes.Compare(info[i].Address, proverAddress) >= 0
 						})
-						r.filterCache[string(
+						skipAdd := false
+						for _, i := range r.filterCache[string(
 							allocation.ConfirmationFilter,
-						)] = slices.Insert(info, index, proverInfo)
+						)] {
+							if bytes.Equal(i.Address, proverAddress) {
+								skipAdd = true
+								break
+							}
+						}
+						if !skipAdd {
+							r.filterCache[string(
+								allocation.ConfirmationFilter,
+							)] = slices.Insert(info, index, proverInfo)
+						}
 					}
 				}
 			}
@@ -960,9 +984,20 @@ func (r *ProverRegistry) extractGlobalState() error {
 				index := sort.Search(len(info), func(i int) bool {
 					return bytes.Compare(info[i].Address, proverRef) >= 0
 				})
-				r.filterCache[string(
+				skipAdd := false
+				for _, i := range r.filterCache[string(
 					allocationInfo.ConfirmationFilter,
-				)] = slices.Insert(info, index, proverInfo)
+				)] {
+					if bytes.Equal(i.Address, proverRef) {
+						skipAdd = true
+						break
+					}
+				}
+				if !skipAdd {
+					r.filterCache[string(
+						allocationInfo.ConfirmationFilter,
+					)] = slices.Insert(info, index, proverInfo)
+				}
 			}
 
 			r.logger.Debug(
@@ -986,9 +1021,6 @@ func (r *ProverRegistry) extractGlobalState() error {
 				}
 			}
 			allocationsFound++
-		default:
-			r.logger.Debug("unknown vertex type", zap.String("type", typeName))
-			return errors.Wrap(errors.New("invalid type"), "extract global state")
 		}
 	}
 
@@ -1076,20 +1108,38 @@ func (r *ProverRegistry) processProverChange(
 
 	switch change.StateChange {
 	case state.CreateStateChangeEvent, state.UpdateStateChangeEvent:
+		if !bytes.Equal(change.Discriminator, hgstate.VertexAddsDiscriminator) {
+			return nil
+		}
+
 		// A prover was created or updated
 		if change.Value != nil && change.Value.DataValue() != nil {
 			data := change.Value.DataValue()
 
-			// Check if this is a Prover or ProverAllocation
-			publicKey, err := r.rdfMultiprover.Get(
+			t, err := r.rdfMultiprover.GetType(
 				global.GLOBAL_RDF_SCHEMA,
-				"prover:Prover",
-				"PublicKey",
+				intrinsics.GLOBAL_INTRINSIC_ADDRESS[:],
 				data,
 			)
+			if err != nil {
+				return nil
+			}
 
-			if err == nil && len(publicKey) > 0 {
-				// This is a Prover vertex
+			// Check if this is a Prover or ProverAllocation
+			switch t {
+			case "prover:Prover":
+				r.logger.Debug("processing prover change")
+				publicKey, err := r.rdfMultiprover.Get(
+					global.GLOBAL_RDF_SCHEMA,
+					"prover:Prover",
+					"PublicKey",
+					data,
+				)
+				if err != nil {
+					r.logger.Debug("no public key")
+					return nil
+				}
+
 				statusBytes, err := r.rdfMultiprover.Get(
 					global.GLOBAL_RDF_SCHEMA,
 					"prover:Prover",
@@ -1097,9 +1147,11 @@ func (r *ProverRegistry) processProverChange(
 					data,
 				)
 				if err != nil || len(statusBytes) == 0 {
+					r.logger.Debug("no status")
 					return nil // Skip if no status
 				}
 				status := statusBytes[0]
+				r.logger.Debug("status of prover change", zap.Int("status", int(status)))
 
 				// Map internal status to our ProverStatus enum
 				var mappedStatus consensus.ProverStatus
@@ -1185,33 +1237,16 @@ func (r *ProverRegistry) processProverChange(
 					proverInfo.DelegateAddress = delegateAddress
 					proverInfo.KickFrameNumber = kickFrameNumber
 				}
-
-				// If global prover is active, add to global trie
-				if mappedStatus == consensus.ProverStatusActive {
-					if err := r.addProverToTrie(
-						proverAddress,
-						publicKey,
-						nil,
-						frameNumber,
-					); err != nil {
-						return errors.Wrap(err, "failed to add prover to global trie")
-					}
-				} else {
-					// Remove from global trie if not active
-					if err := r.removeProverFromTrie(proverAddress, nil); err != nil {
-						return errors.Wrap(err, "failed to remove prover from global trie")
-					}
-				}
-			} else {
-				// Try to read as ProverAllocation
+			case "allocation:ProverAllocation":
+				r.logger.Debug("processing prover allocation change")
 				proverRef, err := r.rdfMultiprover.Get(
 					global.GLOBAL_RDF_SCHEMA,
 					"allocation:ProverAllocation",
-					"prover:Prover",
+					"Prover",
 					data,
 				)
 				if err != nil || len(proverRef) == 0 {
-					// Neither Prover nor ProverAllocation, skip
+					r.logger.Debug("no prover")
 					return nil
 				}
 
@@ -1223,6 +1258,7 @@ func (r *ProverRegistry) processProverChange(
 					data,
 				)
 				if err != nil || len(statusBytes) == 0 {
+					r.logger.Debug("no status")
 					return nil
 				}
 				status := statusBytes[0]
@@ -1252,16 +1288,201 @@ func (r *ProverRegistry) processProverChange(
 					zap.Uint8("status", uint8(mappedStatus)),
 				)
 
-				// Extract filters
-				confirmationFilter, _ := r.rdfMultiprover.Get(
+				// Extract data
+				confirmationFilter, err := r.rdfMultiprover.Get(
 					global.GLOBAL_RDF_SCHEMA,
 					"allocation:ProverAllocation",
 					"ConfirmationFilter",
 					data,
 				)
+				if err != nil {
+					return errors.Wrap(err, "process prover change")
+				}
+
+				rejectionFilter, _ := r.rdfMultiprover.Get(
+					global.GLOBAL_RDF_SCHEMA,
+					"allocation:ProverAllocation",
+					"RejectionFilter",
+					data,
+				)
+
+				joinFrameNumberBytes, _ := r.rdfMultiprover.Get(
+					global.GLOBAL_RDF_SCHEMA,
+					"allocation:ProverAllocation",
+					"JoinFrameNumber",
+					data,
+				)
+
+				var joinFrameNumber uint64
+				if len(joinFrameNumberBytes) != 0 {
+					joinFrameNumber = binary.BigEndian.Uint64(joinFrameNumberBytes)
+				}
+
+				leaveFrameNumberBytes, _ := r.rdfMultiprover.Get(
+					global.GLOBAL_RDF_SCHEMA,
+					"allocation:ProverAllocation",
+					"LeaveFrameNumber",
+					data,
+				)
+
+				var leaveFrameNumber uint64
+				if len(leaveFrameNumberBytes) != 0 {
+					leaveFrameNumber = binary.BigEndian.Uint64(leaveFrameNumberBytes)
+				}
+
+				pauseFrameNumberBytes, _ := r.rdfMultiprover.Get(
+					global.GLOBAL_RDF_SCHEMA,
+					"allocation:ProverAllocation",
+					"PauseFrameNumber",
+					data,
+				)
+
+				var pauseFrameNumber uint64
+				if len(pauseFrameNumberBytes) != 0 {
+					pauseFrameNumber = binary.BigEndian.Uint64(pauseFrameNumberBytes)
+				}
+
+				resumeFrameNumberBytes, _ := r.rdfMultiprover.Get(
+					global.GLOBAL_RDF_SCHEMA,
+					"allocation:ProverAllocation",
+					"ResumeFrameNumber",
+					data,
+				)
+
+				var resumeFrameNumber uint64
+				if len(resumeFrameNumberBytes) != 0 {
+					resumeFrameNumber = binary.BigEndian.Uint64(resumeFrameNumberBytes)
+				}
+
+				kickFrameNumberBytes, _ := r.rdfMultiprover.Get(
+					global.GLOBAL_RDF_SCHEMA,
+					"allocation:ProverAllocation",
+					"KickFrameNumber",
+					data,
+				)
+
+				var kickFrameNumber uint64
+				if len(kickFrameNumberBytes) != 0 {
+					kickFrameNumber = binary.BigEndian.Uint64(kickFrameNumberBytes)
+				}
+
+				joinConfirmFrameNumberBytes, _ := r.rdfMultiprover.Get(
+					global.GLOBAL_RDF_SCHEMA,
+					"allocation:ProverAllocation",
+					"JoinConfirmFrameNumber",
+					data,
+				)
+
+				var joinConfirmFrameNumber uint64
+				if len(joinConfirmFrameNumberBytes) != 0 {
+					joinConfirmFrameNumber = binary.BigEndian.Uint64(
+						joinConfirmFrameNumberBytes,
+					)
+				}
+
+				joinRejectFrameNumberBytes, _ := r.rdfMultiprover.Get(
+					global.GLOBAL_RDF_SCHEMA,
+					"allocation:ProverAllocation",
+					"JoinRejectFrameNumber",
+					data,
+				)
+
+				var joinRejectFrameNumber uint64
+				if len(joinRejectFrameNumberBytes) != 0 {
+					joinRejectFrameNumber = binary.BigEndian.Uint64(
+						joinRejectFrameNumberBytes,
+					)
+				}
+
+				leaveConfirmFrameNumberBytes, _ := r.rdfMultiprover.Get(
+					global.GLOBAL_RDF_SCHEMA,
+					"allocation:ProverAllocation",
+					"LeaveConfirmFrameNumber",
+					data,
+				)
+
+				var leaveConfirmFrameNumber uint64
+				if len(leaveConfirmFrameNumberBytes) != 0 {
+					leaveConfirmFrameNumber = binary.BigEndian.Uint64(
+						leaveConfirmFrameNumberBytes,
+					)
+				}
+
+				leaveRejectFrameNumberBytes, _ := r.rdfMultiprover.Get(
+					global.GLOBAL_RDF_SCHEMA,
+					"allocation:ProverAllocation",
+					"LeaveRejectFrameNumber",
+					data,
+				)
+
+				var leaveRejectFrameNumber uint64
+				if len(leaveRejectFrameNumberBytes) != 0 {
+					leaveRejectFrameNumber = binary.BigEndian.Uint64(
+						leaveRejectFrameNumberBytes,
+					)
+				}
+
+				lastActiveFrameNumberBytes, _ := r.rdfMultiprover.Get(
+					global.GLOBAL_RDF_SCHEMA,
+					"allocation:ProverAllocation",
+					"LastActiveFrameNumber",
+					data,
+				)
+
+				var lastActiveFrameNumber uint64
+				if len(lastActiveFrameNumberBytes) != 0 {
+					lastActiveFrameNumber = binary.BigEndian.Uint64(
+						lastActiveFrameNumberBytes,
+					)
+				}
 
 				// Find the prover this allocation belongs to
 				if proverInfo, exists := r.proverCache[string(proverRef)]; exists {
+					found := false
+					for i, allocation := range proverInfo.Allocations {
+						if bytes.Equal(allocation.ConfirmationFilter, confirmationFilter) {
+							proverInfo.Allocations[i].Status = mappedStatus
+							proverInfo.Allocations[i].RejectionFilter = rejectionFilter
+							proverInfo.Allocations[i].JoinFrameNumber = joinFrameNumber
+							proverInfo.Allocations[i].LeaveFrameNumber = leaveFrameNumber
+							proverInfo.Allocations[i].PauseFrameNumber = pauseFrameNumber
+							proverInfo.Allocations[i].ResumeFrameNumber = resumeFrameNumber
+							proverInfo.Allocations[i].KickFrameNumber = kickFrameNumber
+							proverInfo.Allocations[i].JoinConfirmFrameNumber =
+								joinConfirmFrameNumber
+							proverInfo.Allocations[i].JoinRejectFrameNumber =
+								joinRejectFrameNumber
+							proverInfo.Allocations[i].LeaveConfirmFrameNumber =
+								leaveConfirmFrameNumber
+							proverInfo.Allocations[i].LeaveRejectFrameNumber =
+								leaveRejectFrameNumber
+							proverInfo.Allocations[i].LastActiveFrameNumber =
+								lastActiveFrameNumber
+							found = true
+						}
+					}
+
+					if !found {
+						proverInfo.Allocations = append(
+							proverInfo.Allocations,
+							consensus.ProverAllocationInfo{
+								Status:                  mappedStatus,
+								ConfirmationFilter:      confirmationFilter,
+								RejectionFilter:         rejectionFilter,
+								JoinFrameNumber:         joinFrameNumber,
+								LeaveFrameNumber:        leaveFrameNumber,
+								PauseFrameNumber:        pauseFrameNumber,
+								ResumeFrameNumber:       resumeFrameNumber,
+								KickFrameNumber:         kickFrameNumber,
+								JoinConfirmFrameNumber:  joinConfirmFrameNumber,
+								JoinRejectFrameNumber:   joinRejectFrameNumber,
+								LeaveConfirmFrameNumber: leaveConfirmFrameNumber,
+								LeaveRejectFrameNumber:  leaveRejectFrameNumber,
+								LastActiveFrameNumber:   lastActiveFrameNumber,
+							},
+						)
+					}
+
 					// Update tries based on allocation status
 					if mappedStatus == consensus.ProverStatusActive &&
 						len(confirmationFilter) > 0 {
@@ -1271,9 +1492,10 @@ func (r *ProverRegistry) processProverChange(
 							confirmationFilter,
 							frameNumber,
 						); err != nil {
-							return errors.Wrap(err, "failed to add prover to filter trie")
+							return errors.Wrap(err, "process prover change")
 						}
-					} else {
+					} else if mappedStatus == consensus.ProverStatusKicked ||
+						mappedStatus == consensus.ProverStatusUnknown {
 						// Remove from filter trie if not active
 						if err := r.removeProverFromTrie(
 							proverRef,
@@ -1281,7 +1503,7 @@ func (r *ProverRegistry) processProverChange(
 						); err != nil {
 							return errors.Wrap(
 								err,
-								"failed to remove prover from filter trie",
+								"process prover change",
 							)
 						}
 					}
@@ -1505,6 +1727,12 @@ func (r *ProverRegistry) GetAllActiveAppShardProvers() (
 		// Check if this prover has any active allocations (app shard provers)
 		hasActiveAllocation := false
 		for _, allocation := range proverInfo.Allocations {
+			r.logger.Debug(
+				"checking allocation status",
+				zap.String("address", hex.EncodeToString(proverInfo.Address)),
+				zap.String("filter", hex.EncodeToString(allocation.ConfirmationFilter)),
+				zap.Uint32("status", uint32(allocation.Status)),
+			)
 			if allocation.Status == consensus.ProverStatusActive &&
 				len(allocation.ConfirmationFilter) > 0 {
 				hasActiveAllocation = true
@@ -1514,6 +1742,10 @@ func (r *ProverRegistry) GetAllActiveAppShardProvers() (
 
 		// Only include provers with active allocations
 		if hasActiveAllocation {
+			r.logger.Debug(
+				"copying prover info for status",
+				zap.String("address", hex.EncodeToString(proverInfo.Address)),
+			)
 			// Make a copy to avoid external modification
 			proverCopy := &consensus.ProverInfo{
 				PublicKey:        make([]byte, len(proverInfo.PublicKey)),
@@ -1534,6 +1766,14 @@ func (r *ProverRegistry) GetAllActiveAppShardProvers() (
 
 			// Copy allocations
 			for i, allocation := range proverInfo.Allocations {
+				r.logger.Debug(
+					"copying prover allocation for status",
+					zap.String("address", hex.EncodeToString(proverInfo.Address)),
+					zap.String(
+						"filter",
+						hex.EncodeToString(allocation.ConfirmationFilter),
+					),
+				)
 				proverCopy.Allocations[i] = consensus.ProverAllocationInfo{
 					Status: allocation.Status,
 					ConfirmationFilter: make(

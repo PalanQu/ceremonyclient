@@ -28,6 +28,7 @@ message ProverJoin {
   quilibrium.node.keys.pb.BLS48581SignatureWithProofOfPossession public_key_signature_bls48581 = 3;
   bytes delegate_address = 4;
   repeated SeniorityMerge merge_targets = 5;
+  bytes proof = 6;
 }
 
 message ProverLeave {
@@ -102,6 +103,7 @@ message MessageRequest {
     quilibrium.node.compute.pb.CodeDeployment code_deploy = 22;
     quilibrium.node.compute.pb.CodeExecute code_execute = 23;
     quilibrium.node.compute.pb.CodeFinalize code_finalize = 24;
+    quilibrium.node.global.pb.FrameHeader shard = 25;
   }
   int64 timestamp = 99;
 }
@@ -204,23 +206,31 @@ message ProverLivenessCheck {
 }
 
 message FrameVote {
+  // The filter for the prover's commitment in the trie
+  bytes filter = 1;
   // The frame number being voted on
-  uint64 frame_number = 1;
+  uint64 frame_number = 2;
   // The proposer of the frame
-  bytes proposer = 2;
+  bytes proposer = 3;
   // Whether the voter approves the frame
-  bool approve = 3;
+  bool approve = 4;
+  // The timestamp when the vote was created
+  int64 timestamp = 5;
   // The BLS signature with the voter's address
-  quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 4;
+  quilibrium.node.keys.pb.BLS48581AddressedSignature public_key_signature_bls48581 = 6;
 }
 
 message FrameConfirmation {
+  // The filter for the prover's commitment in the trie
+  bytes filter = 1;
   // The frame number that was confirmed
-  uint64 frame_number = 1;
+  uint64 frame_number = 2;
   // The selector (hash) of the confirmed frame
-  bytes selector = 2;
+  bytes selector = 3;
+  // The timestamp when the vote was created
+  int64 timestamp = 4;
   // The aggregated BLS signature from all voters
-  quilibrium.node.keys.pb.BLS48581AggregateSignature aggregate_signature = 3;
+  quilibrium.node.keys.pb.BLS48581AggregateSignature aggregate_signature = 5;
 }
 
 message GlobalFrame {
@@ -267,6 +277,7 @@ message AppShardInfo {
   bytes size = 2;
   uint64 data_shards = 3;
   repeated bytes commitment = 4;
+  bytes shard_key = 5;
 }
 
 message GetAppShardsResponse {
@@ -283,10 +294,50 @@ message GetGlobalShardsResponse {
   repeated bytes commitment = 2;
 }
 
+message GetLockedAddressesRequest {
+  // The shard address identifier, in split L2||nibbles form
+  bytes shard_address = 1;
+  // The frame number of the locked address request, to disambiguate early/late
+  // requests
+  uint64 frame_number = 2;
+}
+
+message LockedTransaction {
+  // The hash of the locked transaction
+  bytes transaction_hash = 1;
+  // The shard address identifier the lock covers, in split L2||nibbles form
+  repeated bytes shard_addresses = 2;
+  // Whether all shard addresses impacted have committed to this value
+  bool committed = 3;
+  // Whether the proposed frames had a winning weight witness
+  bool filled = 4;
+}
+
+message GetLockedAddressesResponse {
+  repeated LockedTransaction transactions = 1;
+}
+
+message GlobalGetWorkerInfoRequest {}
+
+message GlobalGetWorkerInfoResponseItem {
+  uint32 core_id = 1;
+  string listen_multiaddr = 2;
+  string stream_listen_multiaddr = 3;
+  bytes filter = 4;
+  uint64 total_storage = 5;
+  bool allocated = 6;
+}
+
+message GlobalGetWorkerInfoResponse {
+  repeated GlobalGetWorkerInfoResponseItem workers = 1;
+}
+
 service GlobalService {
   rpc GetGlobalFrame (GetGlobalFrameRequest) returns (GlobalFrameResponse);
   rpc GetAppShards(GetAppShardsRequest) returns (GetAppShardsResponse);
   rpc GetGlobalShards(GetGlobalShardsRequest) returns (GetGlobalShardsResponse);
+  rpc GetLockedAddresses(GetLockedAddressesRequest) returns (GetLockedAddressesResponse);
+  rpc GetWorkerInfo(GlobalGetWorkerInfoRequest) returns (GlobalGetWorkerInfoResponse);
 }
 
 service AppShardService {

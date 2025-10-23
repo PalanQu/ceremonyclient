@@ -3,21 +3,19 @@ package app
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/sha3"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
 )
 
 func (e *AppConsensusEngine) processConsensusMessageQueue() {
-	if e.config.P2P.Network != 99 && !e.config.Engine.ArchiveMode {
-		return
-	}
-
 	defer e.wg.Done()
 
 	for {
@@ -34,10 +32,6 @@ func (e *AppConsensusEngine) processConsensusMessageQueue() {
 
 func (e *AppConsensusEngine) processProverMessageQueue() {
 	defer e.wg.Done()
-
-	if e.config.P2P.Network != 99 && !e.config.Engine.ArchiveMode {
-		return
-	}
 
 	for {
 		select {
@@ -177,7 +171,7 @@ func (e *AppConsensusEngine) handleFrameMessage(message *pb.Message) {
 	}()
 
 	// we're already getting this from consensus
-	if e.config.P2P.Network == 99 || e.config.Engine.ArchiveMode {
+	if e.IsInProverTrie(e.getProverAddress()) {
 		return
 	}
 
@@ -231,18 +225,22 @@ func (e *AppConsensusEngine) handleProverMessage(message *pb.Message) {
 
 	typePrefix := e.peekMessageType(message)
 
+	e.logger.Debug("handling prover message", zap.Uint32("type_prefix", typePrefix))
 	switch typePrefix {
 	case protobufs.MessageBundleType:
 		// MessageBundle messages need to be collected for execution
 		// Store them in pendingMessages to be processed during Collect
+		hash := sha3.Sum256(message.Data)
 		e.pendingMessagesMu.Lock()
 		e.pendingMessages = append(e.pendingMessages, &protobufs.Message{
+			Address: e.appAddress[:32],
+			Hash:    hash[:],
 			Payload: message.Data,
 		})
 		e.pendingMessagesMu.Unlock()
 
 		e.logger.Debug(
-			"collected global request for execution",
+			"collected app request for execution",
 			zap.Uint32("type", typePrefix),
 		)
 
@@ -426,14 +424,14 @@ func (e *AppConsensusEngine) handleDispatchMessage(message *pb.Message) {
 
 func (e *AppConsensusEngine) handleProposal(message *pb.Message) {
 	timer := prometheus.NewTimer(
-		frameProcessingDuration.WithLabelValues(e.appAddressHex),
+		proposalProcessingDuration.WithLabelValues(e.appAddressHex),
 	)
 	defer timer.ObserveDuration()
+
 	frame := &protobufs.AppShardFrame{}
 	if err := frame.FromCanonicalBytes(message.Data); err != nil {
 		e.logger.Debug("failed to unmarshal frame", zap.Error(err))
-		framesProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
-		timer.ObserveDuration()
+		proposalProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
 		return
 	}
 
@@ -441,11 +439,10 @@ func (e *AppConsensusEngine) handleProposal(message *pb.Message) {
 		valid, err := e.frameValidator.Validate(frame)
 		if !valid || err != nil {
 			e.logger.Error("received invalid frame", zap.Error(err))
-			framesProcessedTotal.WithLabelValues(
+			proposalProcessedTotal.WithLabelValues(
 				e.appAddressHex,
 				"invalid",
 			).Inc()
-			timer.ObserveDuration()
 			return
 		}
 
@@ -459,50 +456,163 @@ func (e *AppConsensusEngine) handleProposal(message *pb.Message) {
 			PeerID{ID: frame.Header.Prover},
 			&frame,
 		)
-		framesProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
+		proposalProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
 	}
 }
 
 func (e *AppConsensusEngine) handleLivenessCheck(message *pb.Message) {
+	timer := prometheus.NewTimer(
+		livenessCheckProcessingDuration.WithLabelValues(e.appAddressHex),
+	)
+	defer timer.ObserveDuration()
+
 	livenessCheck := &protobufs.ProverLivenessCheck{}
 	if err := livenessCheck.FromCanonicalBytes(message.Data); err != nil {
 		e.logger.Debug("failed to unmarshal liveness check", zap.Error(err))
+		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
 		return
 	}
 
-	if livenessCheck.PublicKeySignatureBls48581 != nil {
-		commitment := CollectedCommitments{
-			commitmentHash: livenessCheck.CommitmentHash,
-			frameNumber:    livenessCheck.FrameNumber,
-			prover:         livenessCheck.PublicKeySignatureBls48581.Address,
-		}
-		e.stateMachine.ReceiveLivenessCheck(
-			PeerID{ID: livenessCheck.PublicKeySignatureBls48581.Address},
-			commitment,
-		)
+	if !bytes.Equal(livenessCheck.Filter, e.appAddress) {
+		return
 	}
+
+	// Validate the liveness check structure
+	if err := livenessCheck.Validate(); err != nil {
+		e.logger.Debug("invalid liveness check", zap.Error(err))
+		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		return
+	}
+
+	proverSet, err := e.proverRegistry.GetActiveProvers(e.appAddress)
+	if err != nil {
+		e.logger.Error("could not receive liveness check", zap.Error(err))
+		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		return
+	}
+
+	lcBytes, err := livenessCheck.ConstructSignaturePayload()
+	if err != nil {
+		e.logger.Error(
+			"could not construct signature message for liveness check",
+			zap.Error(err),
+		)
+		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		return
+	}
+
+	var found []byte = nil
+	for _, prover := range proverSet {
+		if bytes.Equal(
+			prover.Address,
+			livenessCheck.PublicKeySignatureBls48581.Address,
+		) {
+			valid, err := e.keyManager.ValidateSignature(
+				crypto.KeyTypeBLS48581G1,
+				prover.PublicKey,
+				lcBytes,
+				livenessCheck.PublicKeySignatureBls48581.Signature,
+				livenessCheck.GetSignatureDomain(),
+			)
+			if err != nil || !valid {
+				e.logger.Error(
+					"could not validate signature for liveness check",
+					zap.Error(err),
+				)
+				break
+			}
+			found = prover.PublicKey
+
+			break
+		}
+	}
+
+	if found == nil {
+		e.logger.Warn(
+			"invalid liveness check",
+			zap.String(
+				"prover",
+				hex.EncodeToString(
+					livenessCheck.PublicKeySignatureBls48581.Address,
+				),
+			),
+		)
+		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		return
+	}
+
+	if livenessCheck.PublicKeySignatureBls48581 == nil {
+		e.logger.Error("no signature on liveness check")
+		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+	}
+
+	commitment := CollectedCommitments{
+		commitmentHash: livenessCheck.CommitmentHash,
+		frameNumber:    livenessCheck.FrameNumber,
+		prover:         livenessCheck.PublicKeySignatureBls48581.Address,
+	}
+	if err := e.stateMachine.ReceiveLivenessCheck(
+		PeerID{ID: livenessCheck.PublicKeySignatureBls48581.Address},
+		commitment,
+	); err != nil {
+		e.logger.Error("could not receive liveness check", zap.Error(err))
+		livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		return
+	}
+
+	livenessCheckProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
 }
 
 func (e *AppConsensusEngine) handleVote(message *pb.Message) {
+	timer := prometheus.NewTimer(
+		voteProcessingDuration.WithLabelValues(e.appAddressHex),
+	)
+	defer timer.ObserveDuration()
+
 	vote := &protobufs.FrameVote{}
 	if err := vote.FromCanonicalBytes(message.Data); err != nil {
 		e.logger.Debug("failed to unmarshal vote", zap.Error(err))
+		voteProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
 		return
 	}
 
-	if vote.PublicKeySignatureBls48581 != nil {
-		e.stateMachine.ReceiveVote(
-			PeerID{ID: vote.Proposer},
-			PeerID{ID: vote.PublicKeySignatureBls48581.Address},
-			&vote,
-		)
+	if !bytes.Equal(vote.Filter, e.appAddress) {
+		return
 	}
+
+	if vote.PublicKeySignatureBls48581 == nil {
+		e.logger.Error("vote without signature")
+		voteProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		return
+	}
+
+	if err := e.stateMachine.ReceiveVote(
+		PeerID{ID: vote.Proposer},
+		PeerID{ID: vote.PublicKeySignatureBls48581.Address},
+		&vote,
+	); err != nil {
+		e.logger.Error("could not receive vote", zap.Error(err))
+		voteProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		return
+	}
+
+	voteProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
 }
 
 func (e *AppConsensusEngine) handleConfirmation(message *pb.Message) {
+	timer := prometheus.NewTimer(
+		confirmationProcessingDuration.WithLabelValues(e.appAddressHex),
+	)
+	defer timer.ObserveDuration()
+
 	confirmation := &protobufs.FrameConfirmation{}
 	if err := confirmation.FromCanonicalBytes(message.Data); err != nil {
 		e.logger.Debug("failed to unmarshal confirmation", zap.Error(err))
+		confirmationProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		return
+	}
+
+	if !bytes.Equal(confirmation.Filter, e.appAddress) {
 		return
 	}
 
@@ -533,22 +643,35 @@ func (e *AppConsensusEngine) handleConfirmation(message *pb.Message) {
 	valid, err := e.frameValidator.Validate(matchingFrame)
 	if !valid || err != nil {
 		e.logger.Error("received invalid confirmation", zap.Error(err))
+		confirmationProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
 		return
 	}
 
-	if matchingFrame.Header.Prover != nil {
-		e.stateMachine.ReceiveConfirmation(
-			PeerID{ID: matchingFrame.Header.Prover},
-			&matchingFrame,
-		)
-		err := e.appTimeReel.Insert(e.ctx, matchingFrame)
-		if err != nil {
-			e.logger.Error(
-				"could not insert into time reel",
-				zap.Error(err),
-			)
-		}
+	if matchingFrame.Header.Prover == nil {
+		e.logger.Error("confirmation with no matched prover")
+		confirmationProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		return
 	}
+
+	if err := e.stateMachine.ReceiveConfirmation(
+		PeerID{ID: matchingFrame.Header.Prover},
+		&matchingFrame,
+	); err != nil {
+		e.logger.Error("could not receive confirmation", zap.Error(err))
+		confirmationProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		return
+	}
+
+	if err := e.appTimeReel.Insert(e.ctx, matchingFrame); err != nil {
+		e.logger.Error(
+			"could not insert into time reel",
+			zap.Error(err),
+		)
+		confirmationProcessedTotal.WithLabelValues(e.appAddressHex, "error").Inc()
+		return
+	}
+
+	confirmationProcessedTotal.WithLabelValues(e.appAddressHex, "success").Inc()
 }
 
 func (e *AppConsensusEngine) peekMessageType(message *pb.Message) uint32 {

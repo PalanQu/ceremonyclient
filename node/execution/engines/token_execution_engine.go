@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"math/big"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/pkg/errors"
@@ -22,7 +23,8 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/store"
 )
 
-// ExecutionMode defines whether the engine is running in global or application mode
+// ExecutionMode defines whether the engine is running in global or application
+// mode
 type ExecutionMode int
 
 const (
@@ -99,6 +101,7 @@ func (e *TokenExecutionEngine) Prove(
 	case *protobufs.MessageRequest_Transaction:
 		transaction, err := token.TransactionFromProtobuf(
 			req.Transaction,
+			e.inclusionProver,
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "prove")
@@ -117,6 +120,7 @@ func (e *TokenExecutionEngine) Prove(
 	case *protobufs.MessageRequest_PendingTransaction:
 		pendingTransaction, err := token.PendingTransactionFromProtobuf(
 			req.PendingTransaction,
+			e.inclusionProver,
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "prove")
@@ -189,6 +193,7 @@ func (e *TokenExecutionEngine) GetCost(message []byte) (*big.Int, error) {
 	case *protobufs.MessageRequest_Transaction:
 		transaction, err := token.TransactionFromProtobuf(
 			req.Transaction,
+			e.inclusionProver,
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "get cost")
@@ -199,6 +204,7 @@ func (e *TokenExecutionEngine) GetCost(message []byte) (*big.Int, error) {
 	case *protobufs.MessageRequest_PendingTransaction:
 		pendingTransaction, err := token.PendingTransactionFromProtobuf(
 			req.PendingTransaction,
+			e.inclusionProver,
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "get cost")
@@ -258,14 +264,8 @@ func (e *TokenExecutionEngine) Start() <-chan error {
 	go func() {
 		e.logger.Info("starting token execution engine")
 
-		// Main loop
-		for {
-			select {
-			case <-e.stopChan:
-				e.logger.Info("stopping token execution engine")
-				return
-			}
-		}
+		<-e.stopChan
+		e.logger.Info("stopping token execution engine")
 	}()
 
 	return errChan
@@ -403,7 +403,6 @@ func (e *TokenExecutionEngine) validateIndividualMessage(
 ) error {
 	isTokenOp := false
 	isUpdate := false
-	var err error
 	switch message.Request.(type) {
 	case *protobufs.MessageRequest_TokenDeploy:
 		isTokenOp = true
@@ -417,9 +416,6 @@ func (e *TokenExecutionEngine) validateIndividualMessage(
 		isTokenOp = true
 	case *protobufs.MessageRequest_Transaction:
 		isTokenOp = true
-	}
-	if err != nil {
-		return errors.Wrap(err, "validate individual message")
 	}
 
 	if !isTokenOp {
@@ -435,29 +431,9 @@ func (e *TokenExecutionEngine) validateIndividualMessage(
 	}
 
 	// For other operations, try to load the intrinsic and validate
-	addressStr := string(address)
-	e.intrinsicsMutex.RLock()
-	intrinsic, exists := e.intrinsics[addressStr]
-	e.intrinsicsMutex.RUnlock()
-
-	if !exists { // Try to load existing intrinsic
-		loaded, err := token.LoadTokenIntrinsic(
-			address,
-			e.hypergraph,
-			e.verEnc,
-			e.decafConstructor,
-			e.bulletproofProver,
-			e.inclusionProver,
-			e.keyManager,
-		)
-		if err != nil {
-			return errors.Wrap(err, "validate individual message")
-		}
-
-		e.intrinsicsMutex.Lock()
-		e.intrinsics[addressStr] = loaded
-		e.intrinsicsMutex.Unlock()
-		intrinsic = loaded
+	intrinsic, err := e.tryGetIntrinsic(address)
+	if err != nil {
+		return errors.Wrap(err, "validate individual message")
 	}
 
 	payload := []byte{}
@@ -543,6 +519,66 @@ func (e *TokenExecutionEngine) ProcessMessage(
 	}
 
 	return result, nil
+}
+
+func (e *TokenExecutionEngine) Lock(
+	frameNumber uint64,
+	address []byte,
+	message []byte,
+) ([][]byte, error) {
+	intrinsic, err := e.tryGetIntrinsic(address)
+	if err != nil {
+		// non-applicable
+		return nil, nil
+	}
+
+	if len(message) > 4 &&
+		binary.BigEndian.Uint32(message[:4]) == protobufs.MessageBundleType {
+		bundle := &protobufs.MessageBundle{}
+		err = bundle.FromCanonicalBytes(message)
+		if err != nil {
+			return nil, errors.Wrap(err, "lock")
+		}
+
+		addresses := [][]byte{}
+		for _, r := range bundle.Requests {
+			req, err := r.ToCanonicalBytes()
+			if err != nil {
+				return nil, errors.Wrap(err, "lock")
+			}
+
+			addrs, err := intrinsic.Lock(frameNumber, req[8:])
+			if err != nil {
+				return nil, err
+			}
+			addresses = append(addresses, addrs...)
+		}
+
+		return addresses, nil
+	}
+
+	return intrinsic.Lock(frameNumber, message)
+}
+
+func (e *TokenExecutionEngine) Unlock() error {
+	e.intrinsicsMutex.RLock()
+	errs := []string{}
+	for _, intrinsic := range e.intrinsics {
+		err := intrinsic.Unlock()
+		if err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+	e.intrinsicsMutex.RUnlock()
+
+	if len(errs) != 0 {
+		return errors.Wrap(
+			errors.Errorf("multiple errors: %s", strings.Join(errs, ", ")),
+			"unlock",
+		)
+	}
+
+	return nil
 }
 
 func (e *TokenExecutionEngine) handleBundle(
@@ -704,30 +740,9 @@ func (e *TokenExecutionEngine) processIndividualMessage(
 	}
 
 	// Otherwise, try to handle it as an operation on existing intrinsic
-	addressStr := string(domain)
-	e.intrinsicsMutex.RLock()
-	intrinsic, exists := e.intrinsics[addressStr]
-	e.intrinsicsMutex.RUnlock()
-
-	if !exists {
-		// Try to load existing intrinsic
-		loaded, err := token.LoadTokenIntrinsic(
-			domain,
-			e.hypergraph,
-			e.verEnc,
-			e.decafConstructor,
-			e.bulletproofProver,
-			e.inclusionProver,
-			e.keyManager,
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "process individual message")
-		}
-
-		e.intrinsicsMutex.Lock()
-		e.intrinsics[addressStr] = loaded
-		e.intrinsicsMutex.Unlock()
-		intrinsic = loaded
+	intrinsic, err := e.tryGetIntrinsic(domain)
+	if err != nil {
+		return nil, errors.Wrap(err, "process individual message")
 	}
 
 	err = e.validateIndividualMessage(frameNumber, domain, message, fromBundle)
@@ -750,7 +765,6 @@ func (e *TokenExecutionEngine) processIndividualMessage(
 	e.logger.Debug(
 		"processed individual message",
 		zap.String("address", hex.EncodeToString(address)),
-		zap.Any("state", newState),
 	)
 
 	return &execution.ProcessMessageResult{
@@ -848,6 +862,7 @@ func (e *TokenExecutionEngine) handleDeploy(
 			e.bulletproofProver,
 			e.inclusionProver,
 			e.keyManager,
+			e.clockStore,
 		)
 		if err != nil {
 			return nil, errors.Wrap(err, "handle deploy")
@@ -887,6 +902,38 @@ func (e *TokenExecutionEngine) handleDeploy(
 		Messages: []*protobufs.Message{},
 		State:    state,
 	}, nil
+}
+
+func (e *TokenExecutionEngine) tryGetIntrinsic(
+	address []byte,
+) (intrinsics.Intrinsic, error) {
+	addressStr := string(address)
+	e.intrinsicsMutex.RLock()
+	intrinsic, exists := e.intrinsics[addressStr]
+	e.intrinsicsMutex.RUnlock()
+
+	if !exists { // Try to load existing intrinsic
+		loaded, err := token.LoadTokenIntrinsic(
+			address,
+			e.hypergraph,
+			e.verEnc,
+			e.decafConstructor,
+			e.bulletproofProver,
+			e.inclusionProver,
+			e.keyManager,
+			e.clockStore,
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "try get intrinsic")
+		}
+
+		e.intrinsicsMutex.Lock()
+		e.intrinsics[addressStr] = loaded
+		e.intrinsicsMutex.Unlock()
+		intrinsic = loaded
+	}
+
+	return intrinsic, nil
 }
 
 var _ execution.ShardExecutionEngine = (*TokenExecutionEngine)(nil)

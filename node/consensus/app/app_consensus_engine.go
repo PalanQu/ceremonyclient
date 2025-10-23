@@ -3,9 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/hex"
-	"fmt"
 	"math/big"
 	"slices"
 	"strings"
@@ -14,8 +12,10 @@ import (
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/multiformats/go-multiaddr"
+	mn "github.com/multiformats/go-multiaddr/net"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/sha3"
 	"google.golang.org/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
@@ -40,7 +40,7 @@ import (
 	tkeys "source.quilibrium.com/quilibrium/monorepo/types/keys"
 	tp2p "source.quilibrium.com/quilibrium/monorepo/types/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/types/store"
-	qcrypto "source.quilibrium.com/quilibrium/monorepo/types/tries"
+	"source.quilibrium.com/quilibrium/monorepo/types/tries"
 	up2p "source.quilibrium.com/quilibrium/monorepo/utils/p2p"
 )
 
@@ -60,6 +60,7 @@ type AppConsensusEngine struct {
 	keyStore              store.KeyStore
 	clockStore            store.ClockStore
 	inboxStore            store.InboxStore
+	shardsStore           store.ShardsStore
 	hypergraphStore       store.HypergraphStore
 	frameProver           crypto.FrameProver
 	inclusionProver       crypto.InclusionProver
@@ -86,6 +87,8 @@ type AppConsensusEngine struct {
 	currentDifficultyMu   sync.RWMutex
 	pendingMessages       []*protobufs.Message
 	pendingMessagesMu     sync.RWMutex
+	collectedMessages     map[string][]*protobufs.Message
+	collectedMessagesMu   sync.RWMutex
 	lastProvenFrameTime   time.Time
 	lastProvenFrameTimeMu sync.RWMutex
 	frameStore            map[string]*protobufs.AppShardFrame
@@ -134,6 +137,9 @@ type AppConsensusEngine struct {
 	// Private routing
 	onionRouter  *onion.OnionRouter
 	onionService *onion.GRPCTransport
+
+	// Communication with master process
+	globalClient protobufs.GlobalServiceClient
 }
 
 // NewAppConsensusEngine creates a new app consensus engine using the generic
@@ -149,6 +155,7 @@ func NewAppConsensusEngine(
 	keyStore store.KeyStore,
 	clockStore store.ClockStore,
 	inboxStore store.InboxStore,
+	shardsStore store.ShardsStore,
 	hypergraphStore store.HypergraphStore,
 	frameProver crypto.FrameProver,
 	inclusionProver crypto.InclusionProver,
@@ -185,6 +192,7 @@ func NewAppConsensusEngine(
 		keyStore:                   keyStore,
 		clockStore:                 clockStore,
 		inboxStore:                 inboxStore,
+		shardsStore:                shardsStore,
 		hypergraphStore:            hypergraphStore,
 		frameProver:                frameProver,
 		inclusionProver:            inclusionProver,
@@ -204,7 +212,9 @@ func NewAppConsensusEngine(
 		peerInfoManager:            peerInfoManager,
 		executors:                  make(map[string]execution.ShardExecutionEngine),
 		frameStore:                 make(map[string]*protobufs.AppShardFrame),
+		collectedMessages:          make(map[string][]*protobufs.Message),
 		consensusMessageQueue:      make(chan *pb.Message, 1000),
+		proverMessageQueue:         make(chan *pb.Message, 1000),
 		frameMessageQueue:          make(chan *pb.Message, 100),
 		globalFrameMessageQueue:    make(chan *pb.Message, 100),
 		globalAlertMessageQueue:    make(chan *pb.Message, 100),
@@ -292,6 +302,10 @@ func NewAppConsensusEngine(
 		verEnc,
 		decafConstructor,
 		compiler,
+		frameProver,
+		nil,
+		nil,
+		nil,
 		false, // includeGlobal
 	)
 	if err != nil {
@@ -332,12 +346,25 @@ func NewAppConsensusEngine(
 	appTimeReel.SetRevertFunc(engine.revert)
 
 	// 99 (local devnet) is the special case where consensus is of one node
-	minimumProvers := func() uint64 { return 6 }
-	if config.P2P != nil && config.P2P.Network == 99 {
-		minimumProvers = func() uint64 { return 1 }
-	}
+	if config.P2P.Network == 99 {
+		logger.Debug("devnet detected, setting minimum provers to 1")
+		engine.minimumProvers = func() uint64 { return 1 }
+	} else {
+		engine.minimumProvers = func() uint64 {
+			currentSet, err := engine.proverRegistry.GetActiveProvers(
+				engine.appAddress,
+			)
+			if err != nil {
+				return 999
+			}
 
-	engine.minimumProvers = minimumProvers
+			if len(currentSet) > 6 {
+				return 6
+			}
+
+			return uint64(len(currentSet)) * 2 / 3
+		}
+	}
 
 	// Establish hypersync service
 	engine.hyperSync = hypergraph
@@ -407,6 +434,8 @@ func (e *AppConsensusEngine) Start(quit chan struct{}) <-chan error {
 			zap.Error(err),
 		)
 	}
+
+	e.ensureGlobalClient()
 
 	var initialState **protobufs.AppShardFrame = nil
 	if frame != nil {
@@ -493,6 +522,9 @@ func (e *AppConsensusEngine) Start(quit chan struct{}) <-chan error {
 	go e.processConsensusMessageQueue()
 
 	e.wg.Add(1)
+	go e.processProverMessageQueue()
+
+	e.wg.Add(1)
 	go e.processFrameMessageQueue()
 
 	e.wg.Add(1)
@@ -543,30 +575,14 @@ func (e *AppConsensusEngine) Stop(force bool) <-chan error {
 		e.cancel()
 	}
 
-	// Unsubscribe from pubsub to stop new messages from arriving
-	if e.config.P2P.Network == 99 || e.config.Engine.ArchiveMode {
-		e.pubsub.Unsubscribe(e.getConsensusMessageBitmask(), false)
-		e.pubsub.UnregisterValidator(e.getConsensusMessageBitmask())
-		e.pubsub.Unsubscribe(e.getProverMessageBitmask(), false)
-		e.pubsub.UnregisterValidator(e.getProverMessageBitmask())
-	}
-
-	e.pubsub.Unsubscribe(e.getFrameMessageBitmask(), false)
-	e.pubsub.UnregisterValidator(e.getFrameMessageBitmask())
-	e.pubsub.Unsubscribe(e.getGlobalFrameMessageBitmask(), false)
-	e.pubsub.UnregisterValidator(e.getGlobalFrameMessageBitmask())
-	e.pubsub.Unsubscribe(e.getGlobalAlertMessageBitmask(), false)
-	e.pubsub.UnregisterValidator(e.getGlobalAlertMessageBitmask())
-	e.pubsub.Unsubscribe(e.getGlobalPeerInfoMessageBitmask(), false)
-	e.pubsub.UnregisterValidator(e.getGlobalPeerInfoMessageBitmask())
-	e.pubsub.Unsubscribe(e.getDispatchMessageBitmask(), false)
-	e.pubsub.UnregisterValidator(e.getDispatchMessageBitmask())
-
 	// Stop the state machine
 	if e.stateMachine != nil {
 		if err := e.stateMachine.Stop(); err != nil && !force {
 			e.logger.Warn("error stopping state machine", zap.Error(err))
-			errChan <- errors.Wrap(err, "stop state machine")
+			select {
+			case errChan <- errors.Wrap(err, "stop state machine"):
+			default:
+			}
 		}
 	}
 
@@ -574,7 +590,10 @@ func (e *AppConsensusEngine) Stop(force bool) <-chan error {
 	if e.eventDistributor != nil {
 		if err := e.eventDistributor.Stop(); err != nil && !force {
 			e.logger.Warn("error stopping event distributor", zap.Error(err))
-			errChan <- errors.Wrap(err, "stop event distributor")
+			select {
+			case errChan <- errors.Wrap(err, "stop event distributor"):
+			default:
+			}
 		}
 	}
 
@@ -582,7 +601,10 @@ func (e *AppConsensusEngine) Stop(force bool) <-chan error {
 	if e.executionManager != nil {
 		if err := e.executionManager.StopAll(force); err != nil && !force {
 			e.logger.Warn("error stopping execution engines", zap.Error(err))
-			errChan <- errors.Wrap(err, "stop execution engines")
+			select {
+			case errChan <- errors.Wrap(err, "stop execution engines"):
+			default:
+			}
 		}
 	}
 
@@ -606,7 +628,10 @@ func (e *AppConsensusEngine) Stop(force bool) <-chan error {
 	case <-time.After(timeout):
 		if !force {
 			e.logger.Error("timeout waiting for graceful shutdown")
-			errChan <- errors.New("timeout waiting for graceful shutdown")
+			select {
+			case errChan <- errors.New("timeout waiting for graceful shutdown"):
+			default:
+			}
 		} else {
 			e.logger.Warn("forced shutdown after timeout")
 		}
@@ -616,6 +641,22 @@ func (e *AppConsensusEngine) Stop(force bool) <-chan error {
 	if e.stateMachine != nil {
 		e.stateMachine.Close()
 	}
+
+	// Unsubscribe from pubsub to stop new messages from arriving
+	e.pubsub.Unsubscribe(e.getConsensusMessageBitmask(), false)
+	e.pubsub.UnregisterValidator(e.getConsensusMessageBitmask())
+	e.pubsub.Unsubscribe(e.getProverMessageBitmask(), false)
+	e.pubsub.UnregisterValidator(e.getProverMessageBitmask())
+	e.pubsub.Unsubscribe(e.getFrameMessageBitmask(), false)
+	e.pubsub.UnregisterValidator(e.getFrameMessageBitmask())
+	e.pubsub.Unsubscribe(e.getGlobalFrameMessageBitmask(), false)
+	e.pubsub.UnregisterValidator(e.getGlobalFrameMessageBitmask())
+	e.pubsub.Unsubscribe(e.getGlobalAlertMessageBitmask(), false)
+	e.pubsub.UnregisterValidator(e.getGlobalAlertMessageBitmask())
+	e.pubsub.Unsubscribe(e.getGlobalPeerInfoMessageBitmask(), false)
+	e.pubsub.UnregisterValidator(e.getGlobalPeerInfoMessageBitmask())
+	e.pubsub.Unsubscribe(e.getDispatchMessageBitmask(), false)
+	e.pubsub.UnregisterValidator(e.getDispatchMessageBitmask())
 
 	close(errChan)
 	return errChan
@@ -688,7 +729,9 @@ func (e *AppConsensusEngine) RegisterExecutor(
 
 	// Update metrics
 	executorRegistrationTotal.WithLabelValues(e.appAddressHex, "register").Inc()
-	executorsRegistered.WithLabelValues(e.appAddressHex).Set(float64(len(e.executors)))
+	executorsRegistered.WithLabelValues(
+		e.appAddressHex,
+	).Set(float64(len(e.executors)))
 
 	close(errChan)
 	return errChan
@@ -733,7 +776,9 @@ func (e *AppConsensusEngine) UnregisterExecutor(
 
 	// Update metrics
 	executorRegistrationTotal.WithLabelValues(e.appAddressHex, "unregister").Inc()
-	executorsRegistered.WithLabelValues(e.appAddressHex).Set(float64(len(e.executors)))
+	executorsRegistered.WithLabelValues(
+		e.appAddressHex,
+	).Set(float64(len(e.executors)))
 
 	close(errChan)
 	return errChan
@@ -819,7 +864,7 @@ func (e *AppConsensusEngine) revert(
 	l2 := make([]byte, 32)
 	copy(l2, e.appAddress[:min(len(e.appAddress), 32)])
 
-	shardKey := qcrypto.ShardKey{
+	shardKey := tries.ShardKey{
 		L1: [3]byte(bits),
 		L2: [32]byte(l2),
 	}
@@ -841,9 +886,12 @@ func (e *AppConsensusEngine) materialize(
 	var state state.State
 	state = hgstate.NewHypergraphState(e.hypergraph)
 
-	acceptedMessages := []*protobufs.MessageBundle{}
-
 	for i, request := range frame.Requests {
+		e.logger.Debug(
+			"processing request",
+			zap.Int("message_index", i),
+		)
+
 		requestBytes, err := request.ToCanonicalBytes()
 
 		if err != nil {
@@ -870,19 +918,24 @@ func (e *AppConsensusEngine) materialize(
 				zap.Int("message_index", i),
 				zap.Error(err),
 			)
-			continue
+			return errors.Wrap(err, "materialize")
 		}
 
 		e.currentDifficultyMu.RLock()
 		difficulty := uint64(e.currentDifficulty)
 		e.currentDifficultyMu.RUnlock()
-		baseline := reward.GetBaselineFee(
-			difficulty,
-			e.hypergraph.GetSize(nil, nil).Uint64(),
-			costBasis.Uint64(),
-			8000000000,
-		)
-		baseline.Quo(baseline, costBasis)
+		var baseline *big.Int
+		if costBasis.Cmp(big.NewInt(0)) == 0 {
+			baseline = big.NewInt(0)
+		} else {
+			baseline = reward.GetBaselineFee(
+				difficulty,
+				e.hypergraph.GetSize(nil, nil).Uint64(),
+				costBasis.Uint64(),
+				8000000000,
+			)
+			baseline.Quo(baseline, costBasis)
+		}
 
 		result, err := e.executionManager.ProcessMessage(
 			frame.Header.FrameNumber,
@@ -890,7 +943,7 @@ func (e *AppConsensusEngine) materialize(
 				baseline,
 				big.NewInt(int64(frame.Header.FeeMultiplierVote)),
 			),
-			e.appAddress,
+			e.appAddress[:32],
 			requestBytes,
 			state,
 		)
@@ -904,13 +957,12 @@ func (e *AppConsensusEngine) materialize(
 		}
 
 		state = result.State
-		acceptedMessages = append(acceptedMessages, request)
 	}
 
-	err := e.proverRegistry.ProcessStateTransition(state, frame.Header.FrameNumber)
-	if err != nil {
-		return errors.Wrap(err, "materialize")
-	}
+	e.logger.Debug(
+		"processed transactions",
+		zap.Any("current_changeset_count", len(state.Changeset())),
+	)
 
 	if err := state.Commit(); err != nil {
 		return errors.Wrap(err, "materialize")
@@ -954,24 +1006,32 @@ func (e *AppConsensusEngine) calculateFrameSelector(
 
 func (e *AppConsensusEngine) calculateRequestsRoot(
 	messages []*protobufs.Message,
+	txMap map[string][][]byte,
 ) ([]byte, error) {
 	if len(messages) == 0 {
 		return make([]byte, 64), nil
 	}
 
-	tree := &qcrypto.VectorCommitmentTree{}
+	tree := &tries.VectorCommitmentTree{}
 
-	for i, msg := range messages {
-		if msg.Hash != nil {
-			err := tree.Insert(
-				binary.BigEndian.AppendUint64(nil, uint64(i)),
-				msg.Hash,
-				nil,
-				big.NewInt(0),
+	for _, msg := range messages {
+		hash := sha3.Sum256(msg.Payload)
+
+		if msg.Hash == nil || !bytes.Equal(msg.Hash, hash[:]) {
+			return nil, errors.Wrap(
+				errors.New("invalid hash"),
+				"calculate requests root",
 			)
-			if err != nil {
-				return nil, errors.Wrap(err, "calculate requests root")
-			}
+		}
+
+		err := tree.Insert(
+			msg.Hash,
+			slices.Concat(txMap[string(msg.Hash)]...),
+			nil,
+			big.NewInt(0),
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "calculate requests root")
 		}
 	}
 
@@ -981,7 +1041,14 @@ func (e *AppConsensusEngine) calculateRequestsRoot(
 		return nil, errors.Errorf("invalid commitment length %d", len(commitment))
 	}
 
-	return commitment, nil
+	commitHash := sha3.Sum256(commitment)
+
+	set, err := tries.SerializeNonLazyTree(tree)
+	if err != nil {
+		return nil, errors.Wrap(err, "calculate requests root")
+	}
+
+	return slices.Concat(commitHash[:], set), nil
 }
 
 func (e *AppConsensusEngine) getConsensusMessageBitmask() []byte {
@@ -1292,17 +1359,13 @@ func (e *AppConsensusEngine) internalProveFrame(
 		return nil, errors.New("no proving key available")
 	}
 
-	bits := up2p.GetBloomFilterIndices(e.appAddress, 256, 3)
-	l2 := make([]byte, 32)
-	copy(l2, e.appAddress[:min(len(e.appAddress), 32)])
-
-	shardKey := qcrypto.ShardKey{
-		L1: [3]byte(bits),
-		L2: [32]byte(l2),
+	stateRoots, err := e.hypergraph.CommitShard(
+		previousFrame.Header.FrameNumber+1,
+		e.appAddress,
+	)
+	if err != nil {
+		return nil, err
 	}
-
-	root := e.hypergraph.Commit()
-	stateRoots := root[shardKey]
 
 	if len(stateRoots) == 0 {
 		stateRoots = make([][]byte, 4)
@@ -1312,14 +1375,49 @@ func (e *AppConsensusEngine) internalProveFrame(
 		stateRoots[3] = make([]byte, 64)
 	}
 
-	requestsRoot, err := e.calculateRequestsRoot(messages)
+	txMap := map[string][][]byte{}
+	for i, message := range messages {
+		e.logger.Debug(
+			"locking addresses for message",
+			zap.Int("index", i),
+			zap.String("tx_hash", hex.EncodeToString(message.Hash)),
+		)
+		lockedAddrs, err := e.executionManager.Lock(
+			previousFrame.Header.FrameNumber+1,
+			message.Address,
+			message.Payload,
+		)
+		if err != nil {
+			e.logger.Debug(
+				"message failed lock",
+				zap.Int("message_index", i),
+				zap.Error(err),
+			)
+
+			err := e.executionManager.Unlock()
+			if err != nil {
+				e.logger.Error("could not unlock", zap.Error(err))
+				return nil, err
+			}
+		}
+
+		txMap[string(message.Hash)] = lockedAddrs
+	}
+
+	err = e.executionManager.Unlock()
+	if err != nil {
+		e.logger.Error("could not unlock", zap.Error(err))
+		return nil, err
+	}
+
+	requestsRoot, err := e.calculateRequestsRoot(messages, txMap)
 	if err != nil {
 		return nil, err
 	}
 
 	timestamp := time.Now().UnixMilli()
 	difficulty := e.difficultyAdjuster.GetNextDifficulty(
-		previousFrame.Rank(),
+		previousFrame.Rank()+1,
 		timestamp,
 	)
 
@@ -1356,10 +1454,19 @@ func (e *AppConsensusEngine) internalProveFrame(
 		}
 	}
 
+	rootCommit := make([]byte, 64)
+	if len(requestsRoot[32:]) > 0 {
+		tree, err := tries.DeserializeNonLazyTree(requestsRoot[32:])
+		if err != nil {
+			return nil, err
+		}
+		rootCommit = tree.Commit(e.inclusionProver, false)
+	}
+
 	newHeader, err := e.frameProver.ProveFrameHeader(
 		previousFrame.Header,
 		e.appAddress,
-		requestsRoot,
+		rootCommit,
 		stateRoots,
 		e.getProverAddress(),
 		signer,
@@ -1394,202 +1501,53 @@ func (e *AppConsensusEngine) messagesToRequests(
 	return requests
 }
 
-// getWorkerIndexFromFilter determines the worker index based on the filter
-func (e *AppConsensusEngine) getWorkerIndexFromFilter() int {
-	// If no app address, assume worker 0
-	if len(e.appAddress) == 0 {
-		return 0
-	}
-
-	// Check configured worker filters
-	for i, filter := range e.config.Engine.DataWorkerFilters {
-		if filter == hex.EncodeToString(e.appAddress) {
-			return i
-		}
-	}
-
-	// Default to worker 0 if filter not found
-	return 0
+// SetGlobalClient sets the global client manually, used for tests
+func (e *AppConsensusEngine) SetGlobalClient(
+	client protobufs.GlobalServiceClient,
+) {
+	e.globalClient = client
 }
 
-// getWorkerPubsubAddrs returns pubsub addresses for a specific worker
-func (e *AppConsensusEngine) getWorkerPubsubAddrs(
-	ownAddrs []multiaddr.Multiaddr,
-	workerIndex int,
-) []string {
-	addrs := make([]string, 0)
-
-	// Check specific worker multiaddrs first
-	if workerIndex < len(e.config.Engine.DataWorkerP2PMultiaddrs) &&
-		e.config.Engine.DataWorkerP2PMultiaddrs[workerIndex] != "" {
-		// Use specific configured address
-		specificAddr := e.config.Engine.DataWorkerP2PMultiaddrs[workerIndex]
-
-		// Try to match against discovered addresses
-		for _, addr := range ownAddrs {
-			if e.matchesPattern(addr.String(), specificAddr) {
-				addrs = append(addrs, addr.String())
-			}
-		}
-
-		// If no match found, use the configured address as is
-		if len(addrs) == 0 {
-			addrs = append(addrs, specificAddr)
-		}
-	} else {
-		// Build from base pattern
-		port := e.config.Engine.DataWorkerBaseP2PPort + uint16(workerIndex)
-		pattern := fmt.Sprintf(e.config.Engine.DataWorkerBaseListenMultiaddr, port)
-
-		// Find matching discovered addresses
-		for _, addr := range ownAddrs {
-			if e.matchesPattern(addr.String(), pattern) {
-				addrs = append(addrs, addr.String())
-			}
-		}
-
-		// If no match found, construct from pattern
-		if len(addrs) == 0 && pattern != "" {
-			addrs = append(addrs, pattern)
-		}
+func (e *AppConsensusEngine) ensureGlobalClient() error {
+	if e.globalClient != nil {
+		return nil
 	}
 
-	return addrs
-}
-
-// getWorkerStreamAddrs returns stream addresses for a specific worker
-func (e *AppConsensusEngine) getWorkerStreamAddrs(
-	ownAddrs []multiaddr.Multiaddr,
-	workerIndex int,
-) []string {
-	addrs := make([]string, 0)
-
-	// Check specific worker multiaddrs first
-	if workerIndex < len(e.config.Engine.DataWorkerStreamMultiaddrs) &&
-		e.config.Engine.DataWorkerStreamMultiaddrs[workerIndex] != "" {
-		// Use specific configured address
-		specificAddr := e.config.Engine.DataWorkerStreamMultiaddrs[workerIndex]
-
-		// Try to match against discovered addresses
-		for _, addr := range ownAddrs {
-			if e.matchesPattern(addr.String(), specificAddr) {
-				addrs = append(addrs, addr.String())
-			}
-		}
-
-		// If no match found, use the configured address as-is
-		if len(addrs) == 0 {
-			addrs = append(addrs, specificAddr)
-		}
-	} else {
-		// Build from base pattern
-		port := e.config.Engine.DataWorkerBaseStreamPort + uint16(workerIndex)
-		pattern := fmt.Sprintf(e.config.Engine.DataWorkerBaseListenMultiaddr, port)
-
-		// Find matching discovered addresses
-		for _, addr := range ownAddrs {
-			if e.matchesPattern(addr.String(), pattern) {
-				addrs = append(addrs, addr.String())
-			}
-		}
-
-		// If no match found, construct from pattern
-		if len(addrs) == 0 && pattern != "" {
-			addrs = append(addrs, pattern)
-		}
+	addr, err := multiaddr.StringCast(e.config.P2P.StreamListenMultiaddr)
+	if err != nil {
+		return errors.Wrap(err, "ensure global client")
 	}
 
-	return addrs
-}
-
-// matchesProtocol checks if an address matches a configured protocol pattern
-func (e *AppConsensusEngine) matchesProtocol(addr, pattern string) bool {
-	// Extract protocol components and match
-	// e.g., /ip4/1.2.3.4/tcp/8336/quic-v1 matches /ip4/0.0.0.0/tcp/8336/quic-v1
-	patternParts := strings.Split(pattern, "/")
-	addrParts := strings.Split(addr, "/")
-
-	if len(patternParts) != len(addrParts) {
-		return false
+	mga, err := mn.ToNetAddr(addr)
+	if err != nil {
+		return errors.Wrap(err, "ensure global client")
 	}
 
-	for i, part := range patternParts {
-		// Skip IP comparison for wildcard/localhost in pattern
-		if i > 0 && patternParts[i-1] == "ip4" &&
-			(part == "0.0.0.0" || part == "127.0.0.1") {
-			continue
-		}
-		if i > 0 && patternParts[i-1] == "ip6" &&
-			(part == "::" || part == "::1") {
-			continue
-		}
-
-		if part != addrParts[i] {
-			return false
-		}
+	creds, err := p2p.NewPeerAuthenticator(
+		e.logger,
+		e.config.P2P,
+		nil,
+		nil,
+		nil,
+		nil,
+		[][]byte{[]byte(e.pubsub.GetPeerID())},
+		map[string]channel.AllowedPeerPolicyType{
+			"quilibrium.node.global.pb.GlobalService": channel.OnlySelfPeer,
+		},
+		map[string]channel.AllowedPeerPolicyType{},
+	).CreateClientTLSCredentials([]byte(e.pubsub.GetPeerID()))
+	if err != nil {
+		return errors.Wrap(err, "ensure global client")
 	}
 
-	return true
-}
-
-// matchesPattern is more flexible than matchesProtocol, allowing partial
-// matches
-func (e *AppConsensusEngine) matchesPattern(addr, pattern string) bool {
-	// First try exact protocol match
-	if e.matchesProtocol(addr, pattern) {
-		return true
+	client, err := grpc.NewClient(
+		mga.String(),
+		grpc.WithTransportCredentials(creds),
+	)
+	if err != nil {
+		return errors.Wrap(err, "ensure global client")
 	}
 
-	// Try matching with port substitution (for %d patterns)
-	if strings.Contains(pattern, "%d") {
-		// Extract the port from the address
-		addrParts := strings.Split(addr, "/")
-		patternParts := strings.Split(pattern, "/")
-
-		if len(addrParts) == len(patternParts) {
-			allMatch := true
-			for i, part := range patternParts {
-				if part == "%d" {
-					// Skip port comparison
-					continue
-				}
-				// Skip IP comparison for wildcard/localhost in pattern
-				if i > 0 && patternParts[i-1] == "ip4" &&
-					(part == "0.0.0.0" || part == "127.0.0.1") {
-					continue
-				}
-				if i > 0 && patternParts[i-1] == "ip6" &&
-					(part == "::" || part == "::1") {
-					continue
-				}
-
-				if part != addrParts[i] {
-					allMatch = false
-					break
-				}
-			}
-			return allMatch
-		}
-	}
-
-	return false
-}
-
-// signPeerInfo signs the peer info message
-func (e *AppConsensusEngine) signPeerInfo(
-	info *protobufs.PeerInfo,
-) ([]byte, error) {
-	msg := append([]byte("peerinfo"), info.PeerId...)
-	msg = binary.BigEndian.AppendUint64(msg, uint64(info.Timestamp))
-	// for _, addr := range info.PubsubMultiaddrs {
-	// 	msg = append(msg, addr...)
-	// }
-	// for _, addr := range info.StreamMultiaddrs {
-	// 	msg = append(msg, addr...)
-	// }
-	// if info.Filter != nil {
-	// 	msg = append(msg, hex.EncodeToString(info.Filter)...)
-	// }
-
-	return e.pubsub.SignMessage(msg)
+	e.globalClient = protobufs.NewGlobalServiceClient(client)
+	return nil
 }

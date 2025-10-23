@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"math/big"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -19,10 +22,13 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/sha3"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/config"
 	"source.quilibrium.com/quilibrium/monorepo/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/go-libp2p-blossomsub/pb"
+	qhypergraph "source.quilibrium.com/quilibrium/monorepo/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/provers"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/reward"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
@@ -31,6 +37,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/global/compat"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/manager"
 	hgstate "source.quilibrium.com/quilibrium/monorepo/node/execution/state/hypergraph"
+	qgrpc "source.quilibrium.com/quilibrium/monorepo/node/internal/grpc"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p/onion"
@@ -61,10 +68,18 @@ var GLOBAL_PEER_INFO_BITMASK = []byte{0x00, 0x00, 0x00, 0x00}
 
 var GLOBAL_ALERT_BITMASK = bytes.Repeat([]byte{0x00}, 16)
 
-// timestampedPeerInfo stores peer info with a timestamp for expiry management
-type timestampedPeerInfo struct {
-	peerInfo  *protobufs.PeerInfo
-	timestamp time.Time
+type coverageStreak struct {
+	StartFrame uint64
+	LastFrame  uint64
+	Count      uint64
+}
+
+type LockedTransaction struct {
+	TransactionHash []byte
+	ShardAddresses  [][]byte
+	Prover          []byte
+	Committed       bool
+	Filled          bool
 }
 
 // GlobalConsensusEngine  uses the generic state machine for consensus
@@ -109,6 +124,7 @@ type GlobalConsensusEngine struct {
 	globalPeerInfoMessageQueue  chan *pb.Message
 	globalAlertMessageQueue     chan *pb.Message
 	appFramesMessageQueue       chan *pb.Message
+	shardConsensusMessageQueue  chan *pb.Message
 
 	// Emergency halt
 	haltCtx context.Context
@@ -129,8 +145,14 @@ type GlobalConsensusEngine struct {
 	lastProvenFrameTime   time.Time
 	lastProvenFrameTimeMu sync.RWMutex
 	frameStore            map[string]*protobufs.GlobalFrame
-	appFrameStore         map[string]*protobufs.AppShardFrame
 	frameStoreMu          sync.RWMutex
+	appFrameStore         map[string]*protobufs.AppShardFrame
+	appFrameStoreMu       sync.RWMutex
+	lowCoverageStreak     map[string]*coverageStreak
+
+	// Transaction cross-shard lock tracking
+	txLockMap map[uint64]map[string]map[string]*LockedTransaction
+	txLockMu  sync.RWMutex
 
 	// Generic state machine
 	stateMachine *consensus.StateMachine[
@@ -229,14 +251,16 @@ func NewGlobalConsensusEngine(
 		globalConsensusMessageQueue: make(chan *pb.Message, 1000),
 		globalFrameMessageQueue:     make(chan *pb.Message, 100),
 		globalProverMessageQueue:    make(chan *pb.Message, 1000),
-		appFramesMessageQueue:       make(chan *pb.Message, 1000000),
+		appFramesMessageQueue:       make(chan *pb.Message, 10000),
 		globalPeerInfoMessageQueue:  make(chan *pb.Message, 1000),
 		globalAlertMessageQueue:     make(chan *pb.Message, 100),
+		shardConsensusMessageQueue:  make(chan *pb.Message, 10000),
 		currentDifficulty:           config.Engine.Difficulty,
 		lastProvenFrameTime:         time.Now(),
 		blacklistMap:                make(map[string]bool),
 		pendingMessages:             [][]byte{},
 		alertPublicKey:              []byte{},
+		txLockMap:                   make(map[uint64]map[string]map[string]*LockedTransaction),
 	}
 
 	if config.Engine.AlertKey != "" {
@@ -274,7 +298,7 @@ func NewGlobalConsensusEngine(
 				return 6
 			}
 
-			return uint64(len(currentSet))
+			return uint64(len(currentSet)) * 2 / 3
 		}
 	}
 
@@ -284,6 +308,7 @@ func NewGlobalConsensusEngine(
 		logger,
 		config,
 		engine.ProposeWorkerJoin,
+		engine.DecideWorkerJoins,
 	)
 	if !config.Engine.ArchiveMode {
 		strategy := provers.RewardGreedy
@@ -366,6 +391,10 @@ func NewGlobalConsensusEngine(
 		verEnc,
 		decafConstructor,
 		compiler,
+		frameProver,
+		rewardIssuance,
+		proverRegistry,
+		blsConstructor,
 		true, // includeGlobal
 	)
 	if err != nil {
@@ -428,16 +457,25 @@ func (e *GlobalConsensusEngine) Start(quit chan struct{}) <-chan error {
 	e.quit = quit
 	e.ctx, e.cancel = context.WithCancel(context.Background())
 
+	// Start worker manager background process (if applicable)
+	if !e.config.Engine.ArchiveMode {
+		if err := e.workerManager.Start(e.ctx); err != nil {
+			errChan <- errors.Wrap(err, "start")
+			close(errChan)
+			return errChan
+		}
+	}
+
 	// Start execution engines
 	if err := e.executionManager.StartAll(e.quit); err != nil {
-		errChan <- errors.Wrap(err, "start execution engines")
+		errChan <- errors.Wrap(err, "start")
 		close(errChan)
 		return errChan
 	}
 
 	// Start the event distributor
 	if err := e.eventDistributor.Start(e.ctx); err != nil {
-		errChan <- errors.Wrap(err, "start event distributor")
+		errChan <- errors.Wrap(err, "start")
 		close(errChan)
 		return errChan
 	}
@@ -459,7 +497,42 @@ func (e *GlobalConsensusEngine) Start(quit chan struct{}) <-chan error {
 
 	var initialState **protobufs.GlobalFrame = nil
 	if frame != nil {
-		initialState = &frame
+		if frame.Header.FrameNumber == 244200 && e.config.P2P.Network == 0 {
+			e.logger.Warn("purging previous genesis to start new")
+			err = e.clockStore.DeleteGlobalClockFrameRange(0, 244201)
+			if err != nil {
+				panic(err)
+			}
+			set := e.hypergraph.(*qhypergraph.HypergraphCRDT).GetVertexAddsSet(
+				tries.ShardKey{
+					L1: [3]byte{},
+					L2: [32]byte(bytes.Repeat([]byte{0xff}, 32)),
+				},
+			)
+			leaves := tries.GetAllLeaves(
+				set.GetTree().SetType,
+				set.GetTree().PhaseType,
+				set.GetTree().ShardKey,
+				set.GetTree().Root,
+			)
+			txn, err := e.hypergraph.NewTransaction(false)
+			if err != nil {
+				panic(err)
+			}
+			for _, l := range leaves {
+				err = set.GetTree().Delete(txn, l.Key)
+				if err != nil {
+					txn.Abort()
+					panic(err)
+				}
+			}
+			if err = txn.Commit(); err != nil {
+				panic(err)
+			}
+			frame = nil
+		} else {
+			initialState = &frame
+		}
 	}
 
 	if e.config.P2P.Network == 99 || e.config.Engine.ArchiveMode {
@@ -502,6 +575,14 @@ func (e *GlobalConsensusEngine) Start(quit chan struct{}) <-chan error {
 		return errChan
 	}
 
+	// Subscribe to shard consensus messages to broker lock agreement
+	err = e.subscribeToShardConsensusMessages()
+	if err != nil {
+		errChan <- errors.Wrap(err, "start")
+		close(errChan)
+		return errChan
+	}
+
 	// Subscribe to frames
 	err = e.subscribeToFrameMessages()
 	if err != nil {
@@ -538,6 +619,10 @@ func (e *GlobalConsensusEngine) Start(quit chan struct{}) <-chan error {
 	e.wg.Add(1)
 	go e.processGlobalConsensusMessageQueue()
 
+	// Start shard consensus message queue processor
+	e.wg.Add(1)
+	go e.processShardConsensusMessageQueue()
+
 	// Start frame message queue processor
 	e.wg.Add(1)
 	go e.processFrameMessageQueue()
@@ -565,6 +650,10 @@ func (e *GlobalConsensusEngine) Start(quit chan struct{}) <-chan error {
 	// Start periodic metrics update
 	e.wg.Add(1)
 	go e.updateMetrics()
+
+	// Start periodic tx lock pruning
+	e.wg.Add(1)
+	go e.pruneTxLocksPeriodically()
 
 	if e.config.P2P.Network == 99 || e.config.Engine.ArchiveMode {
 		// Start the state machine
@@ -645,6 +734,9 @@ func (e *GlobalConsensusEngine) setupGRPCServer() error {
 			"quilibrium.node.global.pb.KeyRegistryService":               channel.OnlySelfPeer,
 		},
 		map[string]channel.AllowedPeerPolicyType{
+			// Alternative nodes may not need to make this only self peer, but this
+			// prevents a repeated lock DoS
+			"/quilibrium.node.global.pb.GlobalService/GetLockedAddresses": channel.OnlySelfPeer,
 			"/quilibrium.node.global.pb.MixnetService/GetTag":             channel.AnyPeer,
 			"/quilibrium.node.global.pb.MixnetService/PutTag":             channel.AnyPeer,
 			"/quilibrium.node.global.pb.MixnetService/PutMessage":         channel.AnyPeer,
@@ -663,8 +755,10 @@ func (e *GlobalConsensusEngine) setupGRPCServer() error {
 	}
 
 	// Create gRPC server with TLS
-	e.grpcServer = grpc.NewServer(
+	e.grpcServer = qgrpc.NewServer(
 		grpc.Creds(tlsCreds),
+		grpc.ChainUnaryInterceptor(e.authProvider.UnaryInterceptor),
+		grpc.ChainStreamInterceptor(e.authProvider.StreamInterceptor),
 		grpc.MaxRecvMsgSize(10*1024*1024),
 		grpc.MaxSendMsgSize(10*1024*1024),
 	)
@@ -691,6 +785,15 @@ func (e *GlobalConsensusEngine) getAddressFromPublicKey(
 func (e *GlobalConsensusEngine) Stop(force bool) <-chan error {
 	errChan := make(chan error, 1)
 
+	// Stop worker manager background process (if applicable)
+	if !e.config.Engine.ArchiveMode {
+		if err := e.workerManager.Stop(); err != nil {
+			errChan <- errors.Wrap(err, "stop")
+			close(errChan)
+			return errChan
+		}
+	}
+
 	if e.grpcServer != nil {
 		e.logger.Info("stopping gRPC server")
 		e.grpcServer.GracefulStop()
@@ -702,14 +805,14 @@ func (e *GlobalConsensusEngine) Stop(force bool) <-chan error {
 	if e.config.P2P.Network == 99 || e.config.Engine.ArchiveMode {
 		// Stop the state machine
 		if err := e.stateMachine.Stop(); err != nil && !force {
-			errChan <- errors.Wrap(err, "stop state machine")
+			errChan <- errors.Wrap(err, "stop")
 		}
 	}
 
 	// Stop execution engines
 	if e.executionManager != nil {
 		if err := e.executionManager.StopAll(force); err != nil && !force {
-			errChan <- errors.Wrap(err, "stop execution engines")
+			errChan <- errors.Wrap(err, "stop")
 		}
 	}
 
@@ -720,15 +823,25 @@ func (e *GlobalConsensusEngine) Stop(force bool) <-chan error {
 
 	// Stop event distributor
 	if err := e.eventDistributor.Stop(); err != nil && !force {
-		errChan <- errors.Wrap(err, "stop event distributor")
+		errChan <- errors.Wrap(err, "stop")
 	}
 
 	// Unsubscribe from pubsub
 	if e.config.Engine.ArchiveMode || e.config.P2P.Network == 99 {
 		e.pubsub.Unsubscribe(GLOBAL_CONSENSUS_BITMASK, false)
 		e.pubsub.UnregisterValidator(GLOBAL_CONSENSUS_BITMASK)
+		e.pubsub.Unsubscribe(bytes.Repeat([]byte{0xff}, 32), false)
+		e.pubsub.UnregisterValidator(bytes.Repeat([]byte{0xff}, 32))
 	}
 
+	e.pubsub.Unsubscribe(slices.Concat(
+		[]byte{0},
+		bytes.Repeat([]byte{0xff}, 32),
+	), false)
+	e.pubsub.UnregisterValidator(slices.Concat(
+		[]byte{0},
+		bytes.Repeat([]byte{0xff}, 32),
+	))
 	e.pubsub.Unsubscribe(GLOBAL_FRAME_BITMASK, false)
 	e.pubsub.UnregisterValidator(GLOBAL_FRAME_BITMASK)
 	e.pubsub.Unsubscribe(GLOBAL_PROVER_BITMASK, false)
@@ -1139,8 +1252,10 @@ func (e *GlobalConsensusEngine) materialize(
 	var state state.State
 	state = hgstate.NewHypergraphState(e.hypergraph)
 
-	acceptedMessages := []*protobufs.MessageBundle{}
-
+	e.logger.Debug(
+		"materializing messages",
+		zap.Int("message_count", len(requests)),
+	)
 	for i, request := range requests {
 		requestBytes, err := request.ToCanonicalBytes()
 
@@ -1174,13 +1289,18 @@ func (e *GlobalConsensusEngine) materialize(
 		e.currentDifficultyMu.RLock()
 		difficulty := uint64(e.currentDifficulty)
 		e.currentDifficultyMu.RUnlock()
-		baseline := reward.GetBaselineFee(
-			difficulty,
-			e.hypergraph.GetSize(nil, nil).Uint64(),
-			costBasis.Uint64(),
-			8000000000,
-		)
-		baseline.Quo(baseline, costBasis)
+		var baseline *big.Int
+		if costBasis.Cmp(big.NewInt(0)) == 0 {
+			baseline = big.NewInt(0)
+		} else {
+			baseline = reward.GetBaselineFee(
+				difficulty,
+				e.hypergraph.GetSize(nil, nil).Uint64(),
+				costBasis.Uint64(),
+				8000000000,
+			)
+			baseline.Quo(baseline, costBasis)
+		}
 
 		result, err := e.executionManager.ProcessMessage(
 			frameNumber,
@@ -1199,15 +1319,14 @@ func (e *GlobalConsensusEngine) materialize(
 		}
 
 		state = result.State
-		acceptedMessages = append(acceptedMessages, request)
+	}
+
+	if err := state.Commit(); err != nil {
+		return errors.Wrap(err, "materialize")
 	}
 
 	err := e.proverRegistry.ProcessStateTransition(state, frameNumber)
 	if err != nil {
-		return errors.Wrap(err, "materialize")
-	}
-
-	if err := state.Commit(); err != nil {
 		return errors.Wrap(err, "materialize")
 	}
 
@@ -1380,16 +1499,16 @@ func (e *GlobalConsensusEngine) cleanupFrameStore() {
 				zap.Uint64("max_frame", cutoffFrameNumber-1),
 			)
 		}
-	}
 
-	e.logger.Debug(
-		"cleaned up frame store",
-		zap.Int("deleted_frames", deletedCount),
-		zap.Int("remaining_frames", len(e.frameStore)),
-		zap.Uint64("max_frame_number", maxFrameNumber),
-		zap.Uint64("cutoff_frame_number", cutoffFrameNumber),
-		zap.Bool("archive_mode", e.config.Engine.ArchiveMode),
-	)
+		e.logger.Debug(
+			"cleaned up frame store",
+			zap.Int("deleted_frames", deletedCount),
+			zap.Int("remaining_frames", len(e.frameStore)),
+			zap.Uint64("max_frame_number", maxFrameNumber),
+			zap.Uint64("cutoff_frame_number", cutoffFrameNumber),
+			zap.Bool("archive_mode", e.config.Engine.ArchiveMode),
+		)
+	}
 }
 
 // isAddressBlacklisted checks if a given address (full or partial) is in the
@@ -1814,6 +1933,74 @@ func (e *GlobalConsensusEngine) reportPeerInfoPeriodically() {
 	}
 }
 
+func (e *GlobalConsensusEngine) pruneTxLocksPeriodically() {
+	defer e.wg.Done()
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	e.pruneTxLocks()
+
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case <-ticker.C:
+			e.pruneTxLocks()
+		}
+	}
+}
+
+func (e *GlobalConsensusEngine) pruneTxLocks() {
+	e.txLockMu.RLock()
+	if len(e.txLockMap) == 0 {
+		e.txLockMu.RUnlock()
+		return
+	}
+	e.txLockMu.RUnlock()
+
+	frame, err := e.clockStore.GetLatestGlobalClockFrame()
+	if err != nil {
+		if !errors.Is(err, store.ErrNotFound) {
+			e.logger.Debug(
+				"failed to load latest global frame for tx lock pruning",
+				zap.Error(err),
+			)
+		}
+		return
+	}
+
+	if frame == nil || frame.Header == nil {
+		return
+	}
+
+	head := frame.Header.FrameNumber
+	if head < 2 {
+		return
+	}
+
+	cutoff := head - 2
+
+	e.txLockMu.Lock()
+	removed := 0
+	for frameNumber := range e.txLockMap {
+		if frameNumber < cutoff {
+			delete(e.txLockMap, frameNumber)
+			removed++
+		}
+	}
+	e.txLockMu.Unlock()
+
+	if removed > 0 {
+		e.logger.Debug(
+			"pruned stale tx locks",
+			zap.Uint64("head_frame", head),
+			zap.Uint64("cutoff_frame", cutoff),
+			zap.Int("frames_removed", removed),
+		)
+	}
+}
+
 // validatePeerInfoSignature validates the signature of a peer info message
 func (e *GlobalConsensusEngine) validatePeerInfoSignature(
 	peerInfo *protobufs.PeerInfo,
@@ -1947,16 +2134,19 @@ func reservedPrefixes(proto int) []netip.Prefix {
 
 // TODO(2.1.1+): This could use refactoring
 func (e *GlobalConsensusEngine) ProposeWorkerJoin(
-	coreId uint,
-	filter []byte,
+	coreIds []uint,
+	filters [][]byte,
+	serviceClients map[uint]*grpc.ClientConn,
 ) error {
 	frame := e.GetFrame()
 	if frame == nil {
+		e.logger.Debug("cannot propose, no frame")
 		return errors.New("not ready")
 	}
 
 	_, err := e.keyManager.GetSigningKey("q-prover-key")
 	if err != nil {
+		e.logger.Debug("cannot propose, no signer key")
 		return errors.Wrap(err, "propose worker join")
 	}
 
@@ -1968,12 +2158,14 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 
 	helpers := []*global.SeniorityMerge{}
 	if !skipMerge {
+		e.logger.Debug("attempting merge")
 		peerIds := []string{}
 		oldProver, err := keys.Ed448KeyFromBytes(
 			[]byte(e.config.P2P.PeerPrivKey),
 			e.pubsub.GetPublicKey(),
 		)
 		if err != nil {
+			e.logger.Debug("cannot get peer key", zap.Error(err))
 			return errors.Wrap(err, "propose worker join")
 		}
 		helpers = append(helpers, global.NewSeniorityMerge(
@@ -1982,6 +2174,7 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 		))
 		peerIds = append(peerIds, peer.ID(e.pubsub.GetPeerID()).String())
 		if len(e.config.Engine.MultisigProverEnrollmentPaths) != 0 {
+			e.logger.Debug("loading old configs")
 			for _, conf := range e.config.Engine.MultisigProverEnrollmentPaths {
 				extraConf, err := config.LoadConfig(conf, "", false)
 				if err != nil {
@@ -2049,18 +2242,91 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 		}
 	}
 
+	challenge := sha3.Sum256(frame.Header.Output)
+
+	joins := min(len(serviceClients), len(filters))
+	results := make([][516]byte, joins)
+	idx := uint32(0)
+	ids := [][]byte{}
+	e.logger.Debug("preparing join commitment")
+	for range joins {
+		ids = append(
+			ids,
+			slices.Concat(
+				e.getProverAddress(),
+				filters[idx],
+				binary.BigEndian.AppendUint32(nil, idx),
+			),
+		)
+		idx++
+	}
+
+	idx = 0
+
+	wg := errgroup.Group{}
+	wg.SetLimit(joins)
+
+	e.logger.Debug(
+		"attempting join proof",
+		zap.String("challenge", hex.EncodeToString(challenge[:])),
+		zap.Uint64("difficulty", uint64(frame.Header.Difficulty)),
+		zap.Int("ids_count", len(ids)),
+	)
+
+	for _, core := range coreIds {
+		svc := serviceClients[core]
+		i := idx
+
+		// limit to available joins
+		if i == uint32(joins) {
+			break
+		}
+		wg.Go(func() error {
+			client := protobufs.NewDataIPCServiceClient(svc)
+			resp, err := client.CreateJoinProof(
+				e.ctx,
+				&protobufs.CreateJoinProofRequest{
+					Challenge:   challenge[:],
+					Difficulty:  frame.Header.Difficulty,
+					Ids:         ids,
+					ProverIndex: i,
+				},
+			)
+			if err != nil {
+				return err
+			}
+
+			results[i] = [516]byte(resp.Response)
+			return nil
+		})
+		idx++
+	}
+	e.logger.Debug("waiting for join proof to complete")
+
+	err = wg.Wait()
+	if err != nil {
+		e.logger.Debug("failed join proof", zap.Error(err))
+		return errors.Wrap(err, "propose worker join")
+	}
+
 	join, err := global.NewProverJoin(
-		[][]byte{filter},
+		filters,
 		frame.Header.FrameNumber,
 		helpers,
 		delegate,
 		e.keyManager,
 		e.hypergraph,
 		schema.NewRDFMultiprover(&schema.TurtleRDFParser{}, e.inclusionProver),
+		e.frameProver,
+		e.clockStore,
 	)
 	if err != nil {
 		e.logger.Error("could not construct join", zap.Error(err))
 		return errors.Wrap(err, "propose worker join")
+	}
+
+	for _, res := range results {
+		join.Proof = append(join.Proof, res[:]...)
 	}
 
 	err = join.Prove(frame.Header.FrameNumber)
@@ -2077,6 +2343,7 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 				},
 			},
 		},
+		Timestamp: time.Now().UnixMilli(),
 	}
 
 	msg, err := bundle.ToCanonicalBytes()
@@ -2093,6 +2360,106 @@ func (e *GlobalConsensusEngine) ProposeWorkerJoin(
 		e.logger.Error("could not construct join", zap.Error(err))
 		return errors.Wrap(err, "propose worker join")
 	}
+
+	e.logger.Debug("submitted join request")
+
+	return nil
+}
+
+func (e *GlobalConsensusEngine) DecideWorkerJoins(
+	reject [][]byte,
+	confirm [][]byte,
+) error {
+	frame := e.GetFrame()
+	if frame == nil {
+		e.logger.Debug("cannot decide, no frame")
+		return errors.New("not ready")
+	}
+
+	_, err := e.keyManager.GetSigningKey("q-prover-key")
+	if err != nil {
+		e.logger.Debug("cannot decide, no signer key")
+		return errors.Wrap(err, "decide worker joins")
+	}
+
+	bundle := &protobufs.MessageBundle{
+		Requests: []*protobufs.MessageRequest{},
+	}
+
+	if len(reject) != 0 {
+		for _, r := range reject {
+			rejectMessage, err := global.NewProverReject(
+				r,
+				frame.Header.FrameNumber,
+				e.keyManager,
+				e.hypergraph,
+				schema.NewRDFMultiprover(&schema.TurtleRDFParser{}, e.inclusionProver),
+			)
+			if err != nil {
+				e.logger.Error("could not construct reject", zap.Error(err))
+				return errors.Wrap(err, "decide worker joins")
+			}
+
+			err = rejectMessage.Prove(frame.Header.FrameNumber)
+			if err != nil {
+				e.logger.Error("could not construct reject", zap.Error(err))
+				return errors.Wrap(err, "decide worker joins")
+			}
+
+			bundle.Requests = append(bundle.Requests, &protobufs.MessageRequest{
+				Request: &protobufs.MessageRequest_Reject{
+					Reject: rejectMessage.ToProtobuf(),
+				},
+			})
+		}
+	}
+
+	if len(confirm) != 0 {
+		for _, r := range confirm {
+			confirmMessage, err := global.NewProverConfirm(
+				r,
+				frame.Header.FrameNumber,
+				e.keyManager,
+				e.hypergraph,
+				schema.NewRDFMultiprover(&schema.TurtleRDFParser{}, e.inclusionProver),
+			)
+			if err != nil {
+				e.logger.Error("could not construct confirm", zap.Error(err))
+				return errors.Wrap(err, "decide worker joins")
+			}
+
+			err = confirmMessage.Prove(frame.Header.FrameNumber)
+			if err != nil {
+				e.logger.Error("could not construct confirm", zap.Error(err))
+				return errors.Wrap(err, "decide worker joins")
+			}
+
+			bundle.Requests = append(bundle.Requests, &protobufs.MessageRequest{
+				Request: &protobufs.MessageRequest_Confirm{
+					Confirm: confirmMessage.ToProtobuf(),
+				},
+			})
+		}
+	}
+
+	bundle.Timestamp = time.Now().UnixMilli()
+
+	msg, err := bundle.ToCanonicalBytes()
+	if err != nil {
+		e.logger.Error("could not construct decision", zap.Error(err))
+		return errors.Wrap(err, "decide worker joins")
+	}
+
+	err = e.pubsub.PublishToBitmask(
+		GLOBAL_PROVER_BITMASK,
+		msg,
+	)
+	if err != nil {
+		e.logger.Error("could not construct join", zap.Error(err))
+		return errors.Wrap(err, "decide worker joins")
+	}
+
+	e.logger.Debug("submitted join decisions")
 
 	return nil
 }

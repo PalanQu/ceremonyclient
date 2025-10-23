@@ -18,25 +18,32 @@ type peerMonitor struct {
 	attempts int
 }
 
-func (pm *peerMonitor) pingOnce(ctx context.Context, logger *zap.Logger, peer peer.ID) bool {
+func (pm *peerMonitor) pingOnce(
+	ctx context.Context,
+	logger *zap.Logger,
+	peer peer.ID,
+) bool {
 	pingCtx, cancel := context.WithTimeout(ctx, pm.timeout)
 	defer cancel()
 	select {
 	case <-ctx.Done():
 	case <-pingCtx.Done():
-		logger.Debug("ping timeout")
 		return false
 	case res := <-pm.ps.Ping(pingCtx, peer):
 		if res.Error != nil {
 			logger.Debug("ping error", zap.Error(res.Error))
 			return false
 		}
-		logger.Debug("ping success", zap.Duration("rtt", res.RTT))
 	}
 	return true
 }
 
-func (pm *peerMonitor) ping(ctx context.Context, logger *zap.Logger, wg *sync.WaitGroup, peer peer.ID) {
+func (pm *peerMonitor) ping(
+	ctx context.Context,
+	logger *zap.Logger,
+	wg *sync.WaitGroup,
+	peer peer.ID,
+) {
 	defer wg.Done()
 	for i := 0; i < pm.attempts; i++ {
 		pm.pingOnce(ctx, logger, peer)
@@ -50,7 +57,6 @@ func (pm *peerMonitor) run(ctx context.Context, logger *zap.Logger) {
 			return
 		case <-time.After(pm.period):
 			peers := pm.ps.Host.Network().Peers()
-			logger.Debug("pinging connected peers", zap.Int("peer_count", len(peers)))
 			wg := &sync.WaitGroup{}
 			for _, id := range peers {
 				slogger := logger.With(zap.String("peer_id", id.String()))
@@ -58,16 +64,19 @@ func (pm *peerMonitor) run(ctx context.Context, logger *zap.Logger) {
 				go pm.ping(ctx, slogger, wg, id)
 			}
 			wg.Wait()
-			logger.Debug("pinged connected peers")
 		}
 	}
 }
 
-// MonitorPeers periodically looks up the peers connected to the host and pings them
-// repeatedly to ensure they are still reachable. If the peer is not reachable after
-// the attempts, the connections to the peer are closed.
+// MonitorPeers periodically looks up the peers connected to the host and pings
+// them repeatedly to ensure they are still reachable. If the peer is not
+// reachable after the attempts, the connections to the peer are closed.
 func MonitorPeers(
-	ctx context.Context, logger *zap.Logger, h host.Host, timeout, period time.Duration, attempts int,
+	ctx context.Context,
+	logger *zap.Logger,
+	h host.Host,
+	timeout, period time.Duration,
+	attempts int,
 ) {
 	ps := ping.NewPingService(h)
 	pm := &peerMonitor{

@@ -25,6 +25,12 @@ type Extrinsic struct {
 
 type Location [64]byte // 32 bytes for AppAddress + 32 bytes for DataAddress
 
+type ShardMetadata struct {
+	Commitment []byte
+	LeafCount  uint64
+	Size       uint64
+}
+
 var ErrInvalidAtomType = errors.New("invalid atom type for set")
 var ErrInvalidLocation = errors.New("invalid location")
 var ErrRemoved = errors.New("removed")
@@ -46,13 +52,31 @@ type Hypergraph interface {
 	GetSize(shardKey *tries.ShardKey, path []int) *big.Int
 
 	// Commit calculates the hierarchical vector commitments for each shard's
-	// add/remove sets and returns the roots.
-	Commit() map[tries.ShardKey][][]byte
+	// add/remove sets and returns the roots. Utilizes the frameNumber for
+	// historical caching.
+	Commit(frameNumber uint64) (map[tries.ShardKey][][]byte, error)
+
+	// CommitShard calculates the hierarchical vector commitments for each shard
+	// address' add/remove sets and returns the commitments at the tree level of
+	// the address. Utilizes the frameNumber for historical caching.
+	CommitShard(frameNumber uint64, shardAddress []byte) ([][]byte, error)
+
+	// GetShardCommits returns the hierarchical vector commitments for the
+	// specific shard address at the given frameNumber. If this is not already
+	// stored, returns an error.
+	GetShardCommits(frameNumber uint64, shardAddress []byte) ([][]byte, error)
 
 	// SetCoveredPrefix sets a prefix where inserted values are retained. Values
 	// outside of this will be rejected – synchronization will only set neighbor
 	// and ascendant branches.
 	SetCoveredPrefix(prefix []int) error
+
+	// GetCoveredPrefix retrieves the covered prefix value.
+	GetCoveredPrefix() ([]int, error)
+
+	// GetMetadataAtKey is a fast path to retrieve metadata information used for
+	// consensus, avoiding unnecessary recomputation for lookups.
+	GetMetadataAtKey(pathKey []byte) ([]ShardMetadata, error)
 
 	// Vertex operations
 
@@ -195,6 +219,7 @@ type Hypergraph interface {
 		domain [32]byte,
 		atomType AtomType,
 		phaseType PhaseType,
+		root []byte,
 		traversalProof *tries.TraversalProof,
 	) (bool, error)
 

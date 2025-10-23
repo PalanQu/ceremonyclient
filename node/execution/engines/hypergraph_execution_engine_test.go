@@ -5,12 +5,12 @@ import (
 	"math/big"
 	"testing"
 
-	"github.com/iden3/go-iden3-crypto/poseidon"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+	"golang.org/x/crypto/sha3"
 	hgcrdt "source.quilibrium.com/quilibrium/monorepo/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/engines"
 	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/hypergraph"
@@ -26,6 +26,7 @@ import (
 func TestHypergraphExecutionEngine_Start(t *testing.T) {
 	logger := zap.NewNop()
 	mockHG := new(mocks.MockHypergraph)
+	mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
 	mockClockStore := new(mocks.MockClockStore)
 	mockKeyManager := new(mocks.MockKeyManager)
 	mockInclusionProver := new(mocks.MockInclusionProver)
@@ -63,6 +64,7 @@ func TestHypergraphExecutionEngine_Start(t *testing.T) {
 
 func TestHypergraphExecutionEngine_ProcessMessage_Deploy(t *testing.T) {
 	mockhg := tests.CreateHypergraphWithInclusionProver(&mocks.MockInclusionProver{})
+	mockhg.On("GetCoveredPrefix").Return([]int{}, nil)
 	hypergraphDeployReq := createHypergraphDeployPayload(t, mockhg)
 	vertexAdd := createVertexAddPayload(t, mockhg)
 	tests := []struct {
@@ -163,6 +165,7 @@ func TestHypergraphExecutionEngine_ProcessMessage_Deploy(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			logger := zap.NewNop()
 			mockHG := new(mocks.MockHypergraph)
+			mockHG.On("GetCoveredPrefix").Return([]int{}, nil).Maybe()
 			mockClockStore := new(mocks.MockClockStore)
 			mockKeyManager := new(mocks.MockKeyManager)
 			mockInclusionProver := new(mocks.MockInclusionProver)
@@ -213,6 +216,7 @@ func TestHypergraphExecutionEngine_ProcessMessage_Deploy(t *testing.T) {
 func TestHypergraphExecutionEngine_BundledMessages(t *testing.T) {
 	logger := zap.NewNop()
 	mockHG := new(mocks.MockHypergraph)
+	mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
 	mockClockStore := new(mocks.MockClockStore)
 	mockKeyManager := new(mocks.MockKeyManager)
 	mockInclusionProver := new(mocks.MockInclusionProver)
@@ -293,9 +297,8 @@ func TestHypergraphExecutionEngine_BundledMessages(t *testing.T) {
 	}
 
 	// Set hash
-	hashBI, err := poseidon.HashBytes(bundleMsg.Payload)
-	require.NoError(t, err)
-	bundleMsg.Hash = hashBI.FillBytes(make([]byte, 32))
+	hash := sha3.Sum256(bundleMsg.Payload)
+	bundleMsg.Hash = hash[:]
 
 	// Process bundle
 	state := hgstate.NewHypergraphState(mockHG)
@@ -364,6 +367,7 @@ func TestHypergraphExecutionEngine_AllOperationTypes(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			logger := zap.NewNop()
 			mockHG := new(mocks.MockHypergraph)
+			mockHG.On("GetCoveredPrefix").Return([]int{}, nil)
 			mockClockStore := new(mocks.MockClockStore)
 			mockKeyManager := new(mocks.MockKeyManager)
 			mockInclusionProver := new(mocks.MockInclusionProver)

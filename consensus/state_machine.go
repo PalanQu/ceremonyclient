@@ -425,6 +425,8 @@ func (sm *StateMachine[
 							fmt.Sprintf("error encountered in %s", sm.machineState),
 							err,
 						)
+						time.Sleep(10 * time.Second)
+						sm.SendEvent(EventSyncTimeout)
 						return
 					}
 					found := false
@@ -535,6 +537,7 @@ func (sm *StateMachine[
 						fmt.Sprintf("error encountered in %s", sm.machineState),
 						err,
 					)
+					sm.SendEvent(EventInduceSync)
 					return
 				}
 				sm.mu.Lock()
@@ -567,16 +570,21 @@ func (sm *StateMachine[
 				),
 			)
 
-			err := sm.livenessProvider.SendLiveness(data, collected, ctx)
-			if err != nil {
-				sm.traceLogger.Error(
-					fmt.Sprintf("error encountered in %s", sm.machineState),
-					err,
-				)
-				return
+			select {
+			case <-time.After(1 * time.Second):
+				err := sm.livenessProvider.SendLiveness(data, collected, ctx)
+				if err != nil {
+					sm.traceLogger.Error(
+						fmt.Sprintf("error encountered in %s", sm.machineState),
+						err,
+					)
+					sm.SendEvent(EventInduceSync)
+					return
+				}
+			case <-ctx.Done():
 			}
 		},
-		Timeout:   1 * time.Second,
+		Timeout:   2 * time.Second,
 		OnTimeout: EventLivenessTimeout,
 	}
 
@@ -587,9 +595,11 @@ func (sm *StateMachine[
 			defer sm.traceLogger.Trace("exit Proving behavior")
 			sm.mu.Lock()
 			collected := sm.collected
+			sm.collected = nil
 			sm.mu.Unlock()
 
 			if collected == nil {
+				sm.SendEvent(EventInduceSync)
 				return
 			}
 
@@ -604,6 +614,7 @@ func (sm *StateMachine[
 					err,
 				)
 
+				sm.SendEvent(EventInduceSync)
 				return
 			}
 
@@ -642,9 +653,12 @@ func (sm *StateMachine[
 						fmt.Sprintf("error encountered in %s", sm.machineState),
 						err,
 					)
+					sm.SendEvent(EventInduceSync)
 					return
 				}
 				sm.SendEvent(EventPublishComplete)
+			} else {
+				sm.mu.Unlock()
 			}
 		},
 		Timeout:   1 * time.Second,
@@ -672,7 +686,13 @@ func (sm *StateMachine[
 				}
 
 				if len(sm.proposals[(*sm.activeState).Rank()+1]) < int(sm.minimumProvers()) {
-					sm.traceLogger.Trace("insufficient proposal count")
+					sm.traceLogger.Trace(
+						fmt.Sprintf(
+							"insufficient proposal count: %d, need %d",
+							len(sm.proposals[(*sm.activeState).Rank()+1]),
+							int(sm.minimumProvers()),
+						),
+					)
 					sm.mu.Unlock()
 					return
 				}
@@ -706,6 +726,7 @@ func (sm *StateMachine[
 							fmt.Sprintf("error encountered in %s", sm.machineState),
 							err,
 						)
+						sm.SendEvent(EventInduceSync)
 						break
 					}
 					sm.mu.Lock()
@@ -738,6 +759,7 @@ func (sm *StateMachine[
 						fmt.Sprintf("error encountered in %s", sm.machineState),
 						err,
 					)
+					sm.SendEvent(EventInduceSync)
 					return
 				}
 
@@ -784,6 +806,7 @@ func (sm *StateMachine[
 					fmt.Sprintf("error encountered in %s", sm.machineState),
 					err,
 				)
+				sm.SendEvent(EventInduceSync)
 				return
 			}
 			next := (*finalized).Clone().(StateT)
@@ -812,6 +835,8 @@ func (sm *StateMachine[
 						fmt.Sprintf("error encountered in %s", sm.machineState),
 						err,
 					)
+					sm.SendEvent(EventInduceSync)
+					return
 				}
 				sm.mu.Lock()
 			}
@@ -901,13 +926,13 @@ func (sm *StateMachine[
 		StateLivenessCheck,
 		nil,
 	)
-	// Loop until we get enough of these
-	addTransition(
-		StateLivenessCheck,
-		EventLivenessCheckReceived,
-		StateLivenessCheck,
-		nil,
-	)
+	// // Loop until we get enough of these
+	// addTransition(
+	// 	StateLivenessCheck,
+	// 	EventLivenessCheckReceived,
+	// 	StateLivenessCheck,
+	// 	nil,
+	// )
 
 	// Prover flow
 	addTransition(StateProving, EventProofComplete, StatePublishing, nil)
@@ -917,7 +942,7 @@ func (sm *StateMachine[
 
 	// Common voting flow
 	addTransition(StateVoting, EventProposalReceived, StateVoting, nil)
-	addTransition(StateVoting, EventVoteReceived, StateVoting, nil)
+	// addTransition(StateVoting, EventVoteReceived, StateVoting, nil)
 	addTransition(StateVoting, EventQuorumReached, StateFinalizing, nil)
 	addTransition(StateVoting, EventVotingTimeout, StateVoting, nil)
 	addTransition(StateFinalizing, EventAggregationDone, StateVerifying, nil)
@@ -966,6 +991,14 @@ func (sm *StateMachine[
 ]) Stop() error {
 	sm.traceLogger.Trace("enter stop")
 	defer sm.traceLogger.Trace("exit stop")
+drain:
+	for {
+		select {
+		case <-sm.eventChan:
+		default:
+			break drain
+		}
+	}
 	sm.SendEvent(EventStop)
 	return nil
 }

@@ -26,6 +26,9 @@ const FRAME_2_1_CUTOVER = 244200
 const FRAME_2_1_EXTENDED_ENROLL_END = 252840
 const FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END = FRAME_2_1_EXTENDED_ENROLL_END + 360
 
+// used to skip frame-based checks, for tests
+var BEHAVIOR_PASS = false
+
 // using ed448 derivation process of seed = [57]byte{0x00..}
 var publicReadKey, _ = hex.DecodeString("2cf07ca8d9ab1a4bb0902e25a9b90759dd54d881f54d52a76a17e79bf0361c325650f12746e4337ffb5940e7665ad7bf83f44af98d964bbe")
 
@@ -87,7 +90,7 @@ func (i *TransactionInput) Prove(tx *Transaction, index int) ([]byte, error) {
 	var blind []byte
 
 	if bytes.Equal(i.address[:32], QUIL_TOKEN_ADDRESS) &&
-		frameNumber <= FRAME_2_1_CUTOVER {
+		frameNumber <= FRAME_2_1_EXTENDED_ENROLL_CONFIRM_END && !BEHAVIOR_PASS {
 		return nil, errors.Wrap(errors.New("invalid action"), "prove input")
 	}
 
@@ -133,7 +136,13 @@ func (i *TransactionInput) Prove(tx *Transaction, index int) ([]byte, error) {
 	if tx.config.Behavior&Acceptable != 0 {
 		if !bytes.Equal(pendingTypeBytes, checkType) {
 			return nil, errors.Wrap(
-				errors.New("invalid type for address"),
+				errors.New(
+					fmt.Sprintf(
+						"invalid type for address: %x, expected %x",
+						checkType,
+						pendingTypeBytes,
+					),
+				),
 				"prove input",
 			)
 		}
@@ -884,10 +893,7 @@ func (o *TransactionOutput) Verify(
 	frameNumber uint64,
 	config *TokenIntrinsicConfiguration,
 ) (bool, error) {
-	if !bytes.Equal(
-		binary.BigEndian.AppendUint64(nil, frameNumber),
-		o.FrameNumber,
-	) {
+	if frameNumber <= binary.BigEndian.Uint64(o.FrameNumber) {
 		return false, errors.Wrap(
 			errors.New("invalid frame number"),
 			"verify output",
@@ -1235,7 +1241,8 @@ func (tx *Transaction) Prove(frameNumber uint64) error {
 		return err
 	}
 
-	if len(res.Commitment) != len(tx.Outputs)*56 {
+	if len(res.Commitment) != len(tx.Outputs)*56 ||
+		len(res.Blinding) != len(tx.Outputs)*56 {
 		return errors.Wrap(errors.New("invalid range proof"), "prove")
 	}
 
@@ -1269,6 +1276,171 @@ func (tx *Transaction) Prove(frameNumber uint64) error {
 	}
 
 	return nil
+}
+
+func (tx *Transaction) GetReadAddresses(
+	frameNumber uint64,
+) ([][]byte, error) {
+	return nil, nil
+}
+
+func (tx *Transaction) GetWriteAddresses(
+	frameNumber uint64,
+) ([][]byte, error) {
+	// Create the coin type hash
+	coinTypeBI, err := poseidon.HashBytes(
+		slices.Concat(tx.Domain[:], []byte("coin:Coin")),
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "get write addresses")
+	}
+	coinTypeBytes := coinTypeBI.FillBytes(make([]byte, 32))
+
+	addresses := [][]byte{}
+
+	// For each output, create a coin
+	for _, output := range tx.Outputs {
+		// Create coin tree
+		coinTree := &qcrypto.VectorCommitmentTree{}
+
+		// Index 0: FrameNumber
+		if err := coinTree.Insert(
+			[]byte{0},
+			output.FrameNumber,
+			nil,
+			big.NewInt(8),
+		); err != nil {
+			return nil, errors.Wrap(err, "get write addresses")
+		}
+
+		// Index 1: Commitment
+		if err := coinTree.Insert(
+			[]byte{1 << 2},
+			output.Commitment,
+			nil,
+			big.NewInt(56),
+		); err != nil {
+			return nil, errors.Wrap(err, "get write addresses")
+		}
+
+		// Index 2: OneTimeKey
+		if err := coinTree.Insert(
+			[]byte{2 << 2},
+			output.RecipientOutput.OneTimeKey,
+			nil,
+			big.NewInt(56),
+		); err != nil {
+			return nil, errors.Wrap(err, "get write addresses")
+		}
+
+		// Index 3: VerificationKey
+		if err := coinTree.Insert(
+			[]byte{3 << 2},
+			output.RecipientOutput.VerificationKey,
+			nil,
+			big.NewInt(56),
+		); err != nil {
+			return nil, errors.Wrap(err, "get write addresses")
+		}
+
+		// Index 4: CoinBalance (encrypted)
+		if err := coinTree.Insert(
+			[]byte{4 << 2},
+			output.RecipientOutput.CoinBalance,
+			nil,
+			big.NewInt(56),
+		); err != nil {
+			return nil, errors.Wrap(err, "get write addresses")
+		}
+
+		// Index 5: Mask (encrypted)
+		if err := coinTree.Insert(
+			[]byte{5 << 2},
+			output.RecipientOutput.Mask,
+			nil,
+			big.NewInt(56),
+		); err != nil {
+			return nil, errors.Wrap(err, "get write addresses")
+		}
+
+		// Index 6 & 7: Additional references (for non-divisible tokens)
+		if len(output.RecipientOutput.AdditionalReference) == 64 &&
+			len(output.RecipientOutput.AdditionalReferenceKey) == 56 {
+			if err := coinTree.Insert(
+				[]byte{6 << 2},
+				output.RecipientOutput.AdditionalReference,
+				nil,
+				big.NewInt(56),
+			); err != nil {
+				return nil, errors.Wrap(err, "get write addresses")
+			}
+
+			if err := coinTree.Insert(
+				[]byte{7 << 2},
+				output.RecipientOutput.AdditionalReferenceKey,
+				nil,
+				big.NewInt(56),
+			); err != nil {
+				return nil, errors.Wrap(err, "get write addresses")
+			}
+		}
+
+		// Type marker at max index
+		if err := coinTree.Insert(
+			bytes.Repeat([]byte{0xff}, 32),
+			coinTypeBytes,
+			nil,
+			big.NewInt(32),
+		); err != nil {
+			return nil, errors.Wrap(err, "get write addresses")
+		}
+
+		// Compute address and add to state
+		commit := coinTree.Commit(tx.inclusionProver, false)
+		outAddrBI, err := poseidon.HashBytes(commit)
+		if err != nil {
+			return nil, errors.Wrap(err, "get write addresses")
+		}
+
+		coinAddress := outAddrBI.FillBytes(make([]byte, 32))
+
+		addresses = append(addresses, slices.Concat(
+			tx.Domain[:],
+			coinAddress,
+		))
+	}
+
+	// Mark inputs as spent
+	for _, input := range tx.Inputs {
+		if len(input.Signature) == 336 {
+			// Standard format
+			verificationKey := input.Signature[56*4 : 56*5]
+			spendCheckBI, err := poseidon.HashBytes(verificationKey)
+			if err != nil {
+				return nil, errors.Wrap(err, "get write addresses")
+			}
+
+			// Create spent marker
+			spentTree := &qcrypto.VectorCommitmentTree{}
+			if err := spentTree.Insert(
+				[]byte{0},
+				[]byte{0x01},
+				nil,
+				big.NewInt(0),
+			); err != nil {
+				return nil, errors.Wrap(err, "get write addresses")
+			}
+
+			spentAddress := spendCheckBI.FillBytes(make([]byte, 32))
+
+			addresses = append(addresses, slices.Concat(
+				tx.Domain[:],
+				spentAddress,
+			))
+		}
+	}
+
+	return addresses, nil
 }
 
 func (tx *Transaction) GetChallenge() ([]byte, error) {
@@ -1388,10 +1560,19 @@ func (tx *Transaction) Verify(frameNumber uint64) (bool, error) {
 		commitments = append(commitments, tx.Outputs[i].Commitment)
 	}
 
+	roots, err := tx.hypergraph.GetShardCommits(
+		binary.BigEndian.Uint64(tx.Outputs[0].FrameNumber),
+		tx.Domain[:],
+	)
+	if err != nil {
+		return false, errors.Wrap(err, "verify")
+	}
+
 	valid, err := tx.hypergraph.VerifyTraversalProof(
 		tx.Domain,
 		hypergraph.VertexAtomType,
 		hypergraph.AddsPhaseType,
+		roots[0],
 		tx.TraversalProof,
 	)
 	if err != nil || !valid {

@@ -15,11 +15,12 @@ import (
 	"time"
 
 	"github.com/iden3/go-iden3-crypto/poseidon"
+	"github.com/libp2p/go-libp2p"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-	"google.golang.org/protobuf/proto"
+	"golang.org/x/crypto/sha3"
 	"source.quilibrium.com/quilibrium/monorepo/bls48581"
 	"source.quilibrium.com/quilibrium/monorepo/bulletproofs"
 	"source.quilibrium.com/quilibrium/monorepo/channel"
@@ -34,6 +35,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/reward"
 	consensustime "source.quilibrium.com/quilibrium/monorepo/node/consensus/time"
 	"source.quilibrium.com/quilibrium/monorepo/node/consensus/validator"
+	"source.quilibrium.com/quilibrium/monorepo/node/execution/intrinsics/token"
 	"source.quilibrium.com/quilibrium/monorepo/node/keys"
 	"source.quilibrium.com/quilibrium/monorepo/node/p2p"
 	"source.quilibrium.com/quilibrium/monorepo/node/store"
@@ -41,6 +43,7 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/protobufs"
 	tconsensus "source.quilibrium.com/quilibrium/monorepo/types/consensus"
 	"source.quilibrium.com/quilibrium/monorepo/types/crypto"
+	thypergraph "source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	tkeys "source.quilibrium.com/quilibrium/monorepo/types/keys"
 	"source.quilibrium.com/quilibrium/monorepo/vdf"
 	"source.quilibrium.com/quilibrium/monorepo/verenc"
@@ -109,7 +112,6 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 		ScenarioNetworkPartition
 		ScenarioEquivocation
 		ScenarioGlobalEvents
-		ScenarioExecutorChurn
 		ScenarioStateRewind
 	)
 
@@ -120,11 +122,10 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 		ScenarioNetworkPartition: "Network Partition",
 		ScenarioEquivocation:     "Equivocation Attempt",
 		ScenarioGlobalEvents:     "Global Events",
-		ScenarioExecutorChurn:    "Executor Churn",
 		ScenarioStateRewind:      "State Rewind",
 	}
 
-	appAddress := []byte{0xCC, 0x01, 0x02, 0x03}
+	appAddress := token.QUIL_TOKEN_ADDRESS
 
 	// Create nodes
 	type chaosNode struct {
@@ -135,6 +136,7 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 		frameHistory   []*protobufs.AppShardFrame
 		quit           chan struct{}
 		mu             sync.RWMutex
+		gsc            *mockGlobalClientLocks
 	}
 
 	nodes := make([]*chaosNode, numNodes)
@@ -183,6 +185,21 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 
 	t.Log("Step 2: Creating chaos test nodes with engine using factory")
 
+	_, m, cleanup := tests.GenerateSimnetHosts(t, numNodes, []libp2p.Option{})
+	defer cleanup()
+
+	p2pcfg := config.P2PConfig{}.WithDefaults()
+	p2pcfg.Network = 1
+	p2pcfg.StreamListenMultiaddr = "/ip4/0.0.0.0/tcp/0"
+	p2pcfg.MinBootstrapPeers = numNodes - 1
+	p2pcfg.DiscoveryPeerLookupLimit = numNodes - 1
+	c := &config.Config{
+		Engine: &config.EngineConfig{
+			Difficulty:   80000,
+			ProvingKeyId: "q-prover-key",
+		},
+		P2P: &p2pcfg,
+	}
 	// Helper to create node using factory
 	createAppNodeWithFactory := func(nodeIdx int, appAddress []byte, proverRegistry tconsensus.ProverRegistry, proverKey []byte, keyManager tkeys.KeyManager) (*AppConsensusEngine, *mockAppIntegrationPubSub, *consensustime.GlobalTimeReel, func()) {
 		cfg := zap.NewDevelopmentConfig()
@@ -201,10 +218,11 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 		nodeKeyStore := store.NewPebbleKeyStore(nodeDB, logger)
 		nodeClockStore := store.NewPebbleClockStore(nodeDB, logger)
 		nodeInboxStore := store.NewPebbleInboxStore(nodeDB, logger)
+		nodeShardsStore := store.NewPebbleShardsStore(nodeDB, logger)
 		nodeHg := hypergraph.NewHypergraph(logger, nodeHypergraphStore, nodeInclusionProver, []int{}, &tests.Nopthenticator{})
 
 		// Create mock pubsub for network simulation
-		pubsub := newMockAppIntegrationPubSub([]byte(fmt.Sprintf("node-%d", nodeIdx)))
+		pubsub := newMockAppIntegrationPubSub(c, logger, []byte(m.Nodes[nodeIdx].ID()), m.Nodes[nodeIdx], m.Keys[nodeIdx], m.Nodes)
 
 		// Aside from pubsub, the rest should be concrete instances
 		conf := &config.Config{
@@ -213,7 +231,7 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 				ProvingKeyId: "q-prover-key",
 			},
 			P2P: &config.P2PConfig{
-				Network:               99,
+				Network:               1,
 				StreamListenMultiaddr: "/ip4/0.0.0.0/tcp/0",
 			},
 		}
@@ -241,6 +259,7 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 			nodeKeyStore,
 			nodeClockStore,
 			nodeInboxStore,
+			nodeShardsStore,
 			nodeHypergraphStore,
 			frameProver,
 			nodeInclusionProver,
@@ -280,6 +299,8 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 		cleanup := func() {
 			nodeDB.Close()
 		}
+		mockGSC := &mockGlobalClientLocks{}
+		engine.SetGlobalClient(mockGSC)
 
 		return engine, pubsub, globalTimeReel, cleanup
 	}
@@ -298,7 +319,11 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 			executors:      make(map[string]*mockIntegrationExecutor),
 			frameHistory:   make([]*protobufs.AppShardFrame, 0),
 			quit:           make(chan struct{}),
+			gsc:            &mockGlobalClientLocks{},
 		}
+
+		// ensure unique global service client per node
+		node.engine.SetGlobalClient(node.gsc)
 
 		// Subscribe to frames
 		pubsub.Subscribe(engine.getConsensusMessageBitmask(), func(message *pb.Message) error {
@@ -325,17 +350,8 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 
 	// Start all nodes
 	t.Log("Step 4: Starting all nodes")
-	for i, node := range nodes {
+	for _, node := range nodes {
 		node.engine.Start(node.quit)
-
-		// Add initial executors
-		for j := 0; j < 2; j++ {
-			execName := fmt.Sprintf("node-%d-exec-%d", i, j)
-			executor := newMockIntegrationExecutor(execName)
-			node.executors[execName] = executor
-			node.engine.RegisterExecutor(executor, uint64(j))
-		}
-		t.Logf("  - Started node %d with 2 executors", i)
 	}
 
 	// Wait for genesis
@@ -345,6 +361,52 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 	// Increase peer count
 	for _, node := range nodes {
 		node.pubsub.peerCount = numNodes - 1
+	}
+
+	// Pre-generate valid payloads and stash for broadcast; commit initial world state for verification
+	// Create per-node hypergraphs slice to feed payload creation
+	hgs := make([]thypergraph.Hypergraph, 0, numNodes)
+	for _, node := range nodes {
+		hgs = append(hgs, node.engine.hypergraph)
+	}
+
+	t.Logf("Step 5.a: Generating 6,000 pending transactions")
+	pending := make([]*token.PendingTransaction, 0, 6)
+	for i := 0; i < 6; i++ {
+		for j := 0; j < 1000; j++ {
+			tx := createValidPendingTxPayload(t, hgs, keys.NewInMemoryKeyManager(bc, dc), byte(i))
+			pending = append(pending, tx)
+		}
+	}
+
+	t.Logf("Step 5.b: Sealing world state at genesis")
+	// Seal initial world state for reference in verification
+	for _, hg := range hgs {
+		hg.Commit(0)
+	}
+
+	// Encode payloads as MessageBundle and stash
+	stashedPayloads := make([][]byte, 0, len(pending))
+	for _, tx := range pending {
+		require.NoError(t, tx.Prove(0))
+		req := &protobufs.MessageBundle{
+			Requests: []*protobufs.MessageRequest{
+				{Request: &protobufs.MessageRequest_PendingTransaction{PendingTransaction: tx.ToProtobuf()}},
+			},
+			Timestamp: time.Now().UnixMilli(),
+		}
+		out, err := req.ToCanonicalBytes()
+		require.NoError(t, err)
+		stashedPayloads = append(stashedPayloads, out)
+	}
+
+	// Record hashes into each node's global service client for lock checks
+	for _, node := range nodes {
+		for _, payload := range stashedPayloads {
+			h := sha3.Sum256(payload)
+			node.gsc.hashes = append(node.gsc.hashes, h[:])
+			node.gsc.committed = true
+		}
 	}
 
 	// Chaos test state
@@ -475,26 +537,20 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 		messageBitmask[0] = 0x01
 		copy(messageBitmask[1:], appAddress)
 
-		// Send batch of messages
-		msgCount := random.Intn(20) + 10
-		for i := 0; i < msgCount; i++ {
-			msg := &protobufs.Message{
-				Hash:    []byte(fmt.Sprintf("chaos-msg-%d-%d", time.Now().Unix(), i)),
-				Payload: []byte(fmt.Sprintf("chaos payload %d", i)),
-			}
-
-			if msgData, err := proto.Marshal(msg); err == nil {
-				// Pick random non-partitioned node to send from
-				for j, node := range nodes {
-					if !state.partitionedNodes[j] {
-						node.pubsub.PublishToBitmask(node.engine.getConsensusMessageBitmask(), msgData)
-						break
-					}
+		// Broadcast pre-generated valid payloads to ensure end-to-end processing
+		sent := 0
+		for _, payload := range stashedPayloads {
+			// Pick random non-partitioned node to send from
+			for j, node := range nodes {
+				if !state.partitionedNodes[j] {
+					node.pubsub.PublishToBitmask(node.engine.getProverMessageBitmask(), payload)
+					sent++
+					break
 				}
 			}
 		}
 
-		t.Logf("    - Sent %d messages", msgCount)
+		t.Logf("    - Sent %d stashed valid payloads", sent)
 		time.Sleep(3 * time.Second)
 	}
 
@@ -661,42 +717,6 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 		t.Log("    - Simulated global event impact")
 	}
 
-	runExecutorChurn := func() {
-		t.Log("  [Scenario] Executor Churn")
-
-		// Pick random node
-		nodeIdx := random.Intn(numNodes)
-		node := nodes[nodeIdx]
-
-		// Remove an executor
-		node.mu.Lock()
-		var removedExec string
-		for name := range node.executors {
-			removedExec = name
-			delete(node.executors, name)
-			break
-		}
-		node.mu.Unlock()
-
-		if removedExec != "" {
-			node.engine.UnregisterExecutor(removedExec, 0, false)
-			t.Logf("    - Removed executor %s from node %d", removedExec, nodeIdx)
-		}
-
-		// Add new executor
-		newExecName := fmt.Sprintf("node-%d-exec-new-%d", nodeIdx, time.Now().Unix())
-		newExecutor := newMockIntegrationExecutor(newExecName)
-
-		node.mu.Lock()
-		node.executors[newExecName] = newExecutor
-		node.mu.Unlock()
-
-		node.engine.RegisterExecutor(newExecutor, uint64(len(node.executors)))
-		t.Logf("    - Added executor %s to node %d", newExecName, nodeIdx)
-
-		time.Sleep(2 * time.Second)
-	}
-
 	runStateRewind := func() {
 		frames := random.Intn(maxFramesPerScenario) + 1
 		t.Logf("  [Scenario] State Rewind Simulation for %d frames", frames)
@@ -840,9 +860,6 @@ func TestAppConsensusEngine_Integration_ChaosScenario(t *testing.T) {
 
 		case ScenarioGlobalEvents:
 			runGlobalEvents()
-
-		case ScenarioExecutorChurn:
-			runExecutorChurn()
 
 		case ScenarioStateRewind:
 			runStateRewind()

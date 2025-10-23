@@ -3,6 +3,7 @@ package protobufs
 import (
 	"bytes"
 	"encoding/binary"
+	"slices"
 	"time"
 
 	"github.com/multiformats/go-multiaddr"
@@ -318,6 +319,18 @@ func (p *ProverJoin) ToCanonicalBytes() ([]byte, error) {
 		}
 	}
 
+	// Write proof
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(p.Proof)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if _, err := buf.Write(p.Proof); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
 	return buf.Bytes(), nil
 }
 
@@ -409,6 +422,16 @@ func (p *ProverJoin) FromCanonicalBytes(data []byte) error {
 		); err != nil {
 			return errors.Wrap(err, "from canonical bytes")
 		}
+	}
+
+	// Read proof
+	var proofLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &proofLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	p.Proof = make([]byte, proofLen)
+	if _, err := buf.Read(p.Proof); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
 	}
 
 	return nil
@@ -1087,6 +1110,8 @@ func (m *MessageRequest) ToCanonicalBytes() ([]byte, error) {
 		innerBytes, err = request.CodeExecute.ToCanonicalBytes()
 	case *MessageRequest_CodeFinalize:
 		innerBytes, err = request.CodeFinalize.ToCanonicalBytes()
+	case *MessageRequest_Shard:
+		innerBytes, err = request.Shard.ToCanonicalBytes()
 	default:
 		return nil, errors.New("unknown request type")
 	}
@@ -1335,6 +1360,13 @@ func (m *MessageRequest) FromCanonicalBytes(data []byte) error {
 			return errors.Wrap(err, "from canonical bytes")
 		}
 		m.Request = &MessageRequest_CodeFinalize{CodeFinalize: codeFinalize}
+
+	case FrameHeaderType:
+		frameHeader := &FrameHeader{}
+		if err := frameHeader.FromCanonicalBytes(dataBytes); err != nil {
+			return errors.Wrap(err, "from canonical bytes")
+		}
+		m.Request = &MessageRequest_Shard{Shard: frameHeader}
 
 	default:
 		return errors.Errorf("unknown message type: 0x%08X", innerType)
@@ -2067,6 +2099,18 @@ func (f *FrameVote) ToCanonicalBytes() ([]byte, error) {
 		return nil, errors.Wrap(err, "to canonical bytes")
 	}
 
+	// Write filter
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(f.Filter)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if _, err := buf.Write(f.Filter); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
 	// Write frame_number
 	if err := binary.Write(buf, binary.BigEndian, f.FrameNumber); err != nil {
 		return nil, errors.Wrap(err, "to canonical bytes")
@@ -2090,6 +2134,10 @@ func (f *FrameVote) ToCanonicalBytes() ([]byte, error) {
 		approve = 1
 	}
 	if err := binary.Write(buf, binary.BigEndian, approve); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	if err := binary.Write(buf, binary.BigEndian, f.Timestamp); err != nil {
 		return nil, errors.Wrap(err, "to canonical bytes")
 	}
 
@@ -2133,6 +2181,16 @@ func (f *FrameVote) FromCanonicalBytes(data []byte) error {
 		)
 	}
 
+	// Read filter
+	var filterLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &filterLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	f.Filter = make([]byte, filterLen)
+	if _, err := buf.Read(f.Filter); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
 	// Read frame_number
 	if err := binary.Read(buf, binary.BigEndian, &f.FrameNumber); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -2154,6 +2212,11 @@ func (f *FrameVote) FromCanonicalBytes(data []byte) error {
 		return errors.Wrap(err, "from canonical bytes")
 	}
 	f.Approve = approve != 0
+
+	// Read timestamp
+	if err := binary.Read(buf, binary.BigEndian, &f.Timestamp); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
 
 	// Read public_key_signature_bls48581
 	var sigLen uint32
@@ -2188,6 +2251,18 @@ func (f *FrameConfirmation) ToCanonicalBytes() ([]byte, error) {
 		return nil, errors.Wrap(err, "to canonical bytes")
 	}
 
+	// Write filter
+	if err := binary.Write(
+		buf,
+		binary.BigEndian,
+		uint32(len(f.Filter)),
+	); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+	if _, err := buf.Write(f.Filter); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
 	// Write frame_number
 	if err := binary.Write(buf, binary.BigEndian, f.FrameNumber); err != nil {
 		return nil, errors.Wrap(err, "to canonical bytes")
@@ -2202,6 +2277,10 @@ func (f *FrameConfirmation) ToCanonicalBytes() ([]byte, error) {
 		return nil, errors.Wrap(err, "to canonical bytes")
 	}
 	if _, err := buf.Write(f.Selector); err != nil {
+		return nil, errors.Wrap(err, "to canonical bytes")
+	}
+
+	if err := binary.Write(buf, binary.BigEndian, f.Timestamp); err != nil {
 		return nil, errors.Wrap(err, "to canonical bytes")
 	}
 
@@ -2245,6 +2324,16 @@ func (f *FrameConfirmation) FromCanonicalBytes(data []byte) error {
 		)
 	}
 
+	// Read filter
+	var filterLen uint32
+	if err := binary.Read(buf, binary.BigEndian, &filterLen); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+	f.Filter = make([]byte, filterLen)
+	if _, err := buf.Read(f.Filter); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
 	// Read frame_number
 	if err := binary.Read(buf, binary.BigEndian, &f.FrameNumber); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
@@ -2257,6 +2346,11 @@ func (f *FrameConfirmation) FromCanonicalBytes(data []byte) error {
 	}
 	f.Selector = make([]byte, selectorLen)
 	if _, err := buf.Read(f.Selector); err != nil {
+		return errors.Wrap(err, "from canonical bytes")
+	}
+
+	// Read timestamp
+	if err := binary.Read(buf, binary.BigEndian, &f.Timestamp); err != nil {
 		return errors.Wrap(err, "from canonical bytes")
 	}
 
@@ -3248,6 +3342,9 @@ func (m *MessageRequest) Validate() error {
 		return m.GetCodeExecute().Validate()
 	case m.GetCodeFinalize() != nil:
 		return m.GetCodeFinalize().Validate()
+	case m.GetShard() != nil:
+		return m.GetShard().Validate()
+
 	default:
 		return nil
 	}
@@ -3754,8 +3851,9 @@ func (p *ProverLivenessCheck) Validate() error {
 		return errors.Wrap(errors.New("invalid filter length"), "validate")
 	}
 
-	// Commitment hash should be 32 bytes
-	if len(p.CommitmentHash) != 32 {
+	// Commitment hash should be 32 bytes if global, at least 32 if not
+	if (len(p.Filter) == 0 && len(p.CommitmentHash) != 32) ||
+		(len(p.Filter) != 0 && len(p.CommitmentHash) < 32) {
 		return errors.Wrap(errors.New("invalid commitment hash length"), "validate")
 	}
 
@@ -3764,12 +3862,23 @@ func (p *ProverLivenessCheck) Validate() error {
 		return errors.Wrap(errors.New("missing signature"), "validate")
 	}
 
-	// Validate the signature
+	// Validate the signature payload (not the signature itself)
 	if err := p.PublicKeySignatureBls48581.Validate(); err != nil {
 		return errors.Wrap(err, "validate")
 	}
 
 	return nil
+}
+
+func (p *ProverLivenessCheck) ConstructSignaturePayload() ([]byte, error) {
+	clone := proto.Clone(p).(*ProverLivenessCheck)
+	clone.PublicKeySignatureBls48581 = nil
+	cloneBytes, err := clone.ToCanonicalBytes()
+	return cloneBytes, errors.Wrap(err, "construct signature payload")
+}
+
+func (p *ProverLivenessCheck) GetSignatureDomain() []byte {
+	return slices.Concat([]byte("PROVER_LIVENESS"), p.Filter)
 }
 
 var _ ValidatableMessage = (*FrameVote)(nil)

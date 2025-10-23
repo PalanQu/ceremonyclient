@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"math/big"
 	"slices"
+	"strings"
 	"sync"
 
 	"github.com/pkg/errors"
@@ -22,6 +23,8 @@ import (
 	"source.quilibrium.com/quilibrium/monorepo/types/hypergraph"
 	"source.quilibrium.com/quilibrium/monorepo/types/keys"
 )
+
+var ErrUnsupportedMessageType = errors.New("unsupported message type")
 
 type ComputeExecutionEngine struct {
 	logger            *zap.Logger
@@ -143,13 +146,8 @@ func (e *ComputeExecutionEngine) Start() <-chan error {
 	go func() {
 		e.logger.Info("starting compute execution engine")
 
-		for {
-			select {
-			case <-e.stopChan:
-				e.logger.Info("stopping compute execution engine")
-				return
-			}
-		}
+		<-e.stopChan
+		e.logger.Info("stopping compute execution engine")
 	}()
 
 	return errChan
@@ -187,31 +185,9 @@ func (e *ComputeExecutionEngine) Prove(
 	*protobufs.MessageRequest,
 	error,
 ) {
-	addressStr := string(domain)
-	e.intrinsicsMutex.RLock()
-	intrinsic, exists := e.intrinsics[addressStr]
-	e.intrinsicsMutex.RUnlock()
-	if !exists {
-		// Try to load existing intrinsic
-		loaded, err := compute.LoadComputeIntrinsic(
-			domain,
-			e.hypergraph,
-			hgstate.NewHypergraphState(e.hypergraph),
-			e.inclusionProver,
-			e.bulletproofProver,
-			e.verEnc,
-			e.decafConstructor,
-			e.keyManager,
-			e.compiler,
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "prove")
-		}
-
-		e.intrinsicsMutex.Lock()
-		e.intrinsics[addressStr] = loaded
-		e.intrinsicsMutex.Unlock()
-		intrinsic = loaded
+	intrinsic, err := e.tryGetIntrinsic(domain)
+	if err != nil {
+		return nil, errors.Wrap(err, "prove")
 	}
 
 	if len(message) < 4 {
@@ -219,7 +195,7 @@ func (e *ComputeExecutionEngine) Prove(
 	}
 
 	request := &protobufs.MessageRequest{}
-	err := request.FromCanonicalBytes(message)
+	err = request.FromCanonicalBytes(message)
 	if err != nil {
 		return nil, errors.Wrap(err, "prove")
 	}
@@ -292,6 +268,67 @@ func (e *ComputeExecutionEngine) Prove(
 	}
 
 	return nil, errors.Wrap(errors.New("unsupported type"), "prove")
+}
+
+func (e *ComputeExecutionEngine) Lock(
+	frameNumber uint64,
+	address []byte,
+	message []byte,
+) ([][]byte, error) {
+	intrinsic, err := e.tryGetIntrinsic(address)
+	if err != nil {
+		// non-applicable
+		return nil, nil
+	}
+
+	if len(message) > 4 &&
+		binary.BigEndian.Uint32(message[:4]) == protobufs.MessageBundleType {
+		bundle := &protobufs.MessageBundle{}
+		err = bundle.FromCanonicalBytes(message)
+		if err != nil {
+			return nil, errors.Wrap(err, "lock")
+		}
+
+		addresses := [][]byte{}
+		for _, r := range bundle.Requests {
+			req, err := r.ToCanonicalBytes()
+			if err != nil {
+				return nil, errors.Wrap(err, "lock")
+			}
+
+			addrs, err := intrinsic.Lock(frameNumber, req[8:])
+			if err != nil {
+				return nil, err
+			}
+			addresses = append(addresses, addrs...)
+		}
+
+		return addresses, nil
+	}
+
+	addresses, err := intrinsic.Lock(frameNumber, message)
+	return addresses, errors.Wrap(err, "lock")
+}
+
+func (e *ComputeExecutionEngine) Unlock() error {
+	e.intrinsicsMutex.RLock()
+	errs := []string{}
+	for _, intrinsic := range e.intrinsics {
+		err := intrinsic.Unlock()
+		if err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+	e.intrinsicsMutex.RUnlock()
+
+	if len(errs) != 0 {
+		return errors.Wrap(
+			errors.Errorf("multiple errors: %s", strings.Join(errs, ", ")),
+			"unlock",
+		)
+	}
+
+	return nil
 }
 
 func (e *ComputeExecutionEngine) GetCost(message []byte) (*big.Int, error) {
@@ -485,83 +522,38 @@ func (e *ComputeExecutionEngine) validateIndividualMessage(
 	message *protobufs.MessageRequest,
 	fromBundle bool,
 ) error {
-	isComputeOp := false
-	isUpdate := false
-	var err error
-	switch message.Request.(type) {
-	case *protobufs.MessageRequest_ComputeDeploy:
-		isComputeOp = true
-		isUpdate = true
-	case *protobufs.MessageRequest_ComputeUpdate:
-		isComputeOp = true
-		isUpdate = true
-	case *protobufs.MessageRequest_CodeDeploy:
-		isComputeOp = true
-	case *protobufs.MessageRequest_CodeExecute:
-		isComputeOp = true
-	case *protobufs.MessageRequest_CodeFinalize:
-		isComputeOp = true
-	}
+	payload, err := e.tryExtractMessageForIntrinsic(message)
 	if err != nil {
+		if errors.Is(err, ErrUnsupportedMessageType) {
+			// Not a compute operation, this validation doesn't apply
+			return nil
+		}
 		return errors.Wrap(err, "validate individual message")
 	}
 
-	if !isComputeOp {
-		// Not a compute operation, this validation doesn't apply
-		return nil
-	}
-
 	// For compute deploy operations, just validate the structure
-	if isUpdate && fromBundle {
+	if (message.GetComputeDeploy() != nil || message.GetComputeUpdate() != nil) &&
+		fromBundle {
 		return errors.Wrap(message.Validate(), "validate individual message")
 	}
 
 	// For other operations, try to load the intrinsic and validate
-	addressStr := string(address)
-	e.intrinsicsMutex.RLock()
-	intrinsic, exists := e.intrinsics[addressStr]
-	e.intrinsicsMutex.RUnlock()
-
-	if !exists {
-		// Try to load existing intrinsic
-		loaded, err := compute.LoadComputeIntrinsic(
-			address,
-			e.hypergraph,
-			hgstate.NewHypergraphState(e.hypergraph),
-			e.inclusionProver,
-			e.bulletproofProver,
-			e.verEnc,
-			e.decafConstructor,
-			e.keyManager,
-			e.compiler,
-		)
-		if err != nil {
-			return errors.Wrap(err, "validate individual message")
-		}
-
-		e.intrinsicsMutex.Lock()
-		e.intrinsics[addressStr] = loaded
-		e.intrinsicsMutex.Unlock()
-		intrinsic = loaded
-	}
-
-	payload := []byte{}
-	switch message.Request.(type) {
-	case *protobufs.MessageRequest_ComputeDeploy:
-		err = errors.New("deployments must be bundled")
-	case *protobufs.MessageRequest_ComputeUpdate:
-		err = errors.New("updates must be bundled")
-	case *protobufs.MessageRequest_CodeDeploy:
-		payload, err = message.GetCodeDeploy().ToCanonicalBytes()
-	case *protobufs.MessageRequest_CodeExecute:
-		payload, err = message.GetCodeExecute().ToCanonicalBytes()
-	case *protobufs.MessageRequest_CodeFinalize:
-		payload, err = message.GetCodeFinalize().ToCanonicalBytes()
-	default:
-		err = errors.New("unsupported message type")
-	}
+	intrinsic, err := e.tryGetIntrinsic(address)
 	if err != nil {
 		return errors.Wrap(err, "validate individual message")
+	}
+
+	switch message.Request.(type) {
+	case *protobufs.MessageRequest_ComputeDeploy:
+		return errors.Wrap(
+			errors.New("deployments must be bundled"),
+			"validate individual message",
+		)
+	case *protobufs.MessageRequest_ComputeUpdate:
+		return errors.Wrap(
+			errors.New("updates must be bundled"),
+			"validate individual message",
+		)
 	}
 
 	// Validate the operation
@@ -861,22 +853,7 @@ func (e *ComputeExecutionEngine) processIndividualMessage(
 	fromBundle bool,
 	state state.State,
 ) (*execution.ProcessMessageResult, error) {
-	payload := []byte{}
-	var err error
-	switch message.Request.(type) {
-	case *protobufs.MessageRequest_ComputeDeploy:
-		payload, err = message.GetComputeDeploy().ToCanonicalBytes()
-	case *protobufs.MessageRequest_ComputeUpdate:
-		payload, err = message.GetComputeUpdate().ToCanonicalBytes()
-	case *protobufs.MessageRequest_CodeDeploy:
-		payload, err = message.GetCodeDeploy().ToCanonicalBytes()
-	case *protobufs.MessageRequest_CodeExecute:
-		payload, err = message.GetCodeExecute().ToCanonicalBytes()
-	case *protobufs.MessageRequest_CodeFinalize:
-		payload, err = message.GetCodeFinalize().ToCanonicalBytes()
-	default:
-		err = errors.New("unsupported message type")
-	}
+	payload, err := e.tryExtractMessageForIntrinsic(message)
 	if err != nil {
 		return nil, errors.Wrap(err, "process individual message")
 	}
@@ -912,32 +889,9 @@ func (e *ComputeExecutionEngine) processIndividualMessage(
 	}
 
 	// Otherwise, try to handle it as an operation on existing intrinsic
-	addressStr := string(address)
-	e.intrinsicsMutex.RLock()
-	intrinsic, exists := e.intrinsics[addressStr]
-	e.intrinsicsMutex.RUnlock()
-
-	if !exists {
-		// Try to load existing intrinsic
-		loaded, err := compute.LoadComputeIntrinsic(
-			address,
-			e.hypergraph,
-			state,
-			e.inclusionProver,
-			e.bulletproofProver,
-			e.verEnc,
-			e.decafConstructor,
-			e.keyManager,
-			e.compiler,
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "process individual message")
-		}
-
-		e.intrinsicsMutex.Lock()
-		e.intrinsics[addressStr] = loaded
-		e.intrinsicsMutex.Unlock()
-		intrinsic = loaded
+	intrinsic, err := e.tryGetIntrinsic(address)
+	if err != nil {
+		return nil, errors.Wrap(err, "process individual message")
 	}
 
 	err = e.validateIndividualMessage(frameNumber, address, message, fromBundle)
@@ -961,13 +915,68 @@ func (e *ComputeExecutionEngine) processIndividualMessage(
 	e.logger.Debug(
 		"processed individual message",
 		zap.String("address", hex.EncodeToString(address)),
-		zap.Any("state", state),
 	)
 
 	return &execution.ProcessMessageResult{
 		Messages: []*protobufs.Message{},
 		State:    state,
 	}, nil
+}
+
+func (e *ComputeExecutionEngine) tryGetIntrinsic(
+	address []byte,
+) (intrinsics.Intrinsic, error) {
+	addressStr := string(address)
+	e.intrinsicsMutex.RLock()
+	intrinsic, exists := e.intrinsics[addressStr]
+	e.intrinsicsMutex.RUnlock()
+
+	if !exists {
+		// Try to load existing intrinsic
+		loaded, err := compute.LoadComputeIntrinsic(
+			address,
+			e.hypergraph,
+			hgstate.NewHypergraphState(e.hypergraph),
+			e.inclusionProver,
+			e.bulletproofProver,
+			e.verEnc,
+			e.decafConstructor,
+			e.keyManager,
+			e.compiler,
+		)
+		if err != nil {
+			return nil, errors.Wrap(err, "try get intrinsic")
+		}
+
+		e.intrinsicsMutex.Lock()
+		e.intrinsics[addressStr] = loaded
+		e.intrinsicsMutex.Unlock()
+		intrinsic = loaded
+	}
+
+	return intrinsic, nil
+}
+
+func (e *ComputeExecutionEngine) tryExtractMessageForIntrinsic(
+	message *protobufs.MessageRequest,
+) ([]byte, error) {
+	payload := []byte{}
+	var err error
+	switch message.Request.(type) {
+	case *protobufs.MessageRequest_ComputeDeploy:
+		payload, err = message.GetComputeDeploy().ToCanonicalBytes()
+	case *protobufs.MessageRequest_ComputeUpdate:
+		payload, err = message.GetComputeUpdate().ToCanonicalBytes()
+	case *protobufs.MessageRequest_CodeDeploy:
+		payload, err = message.GetCodeDeploy().ToCanonicalBytes()
+	case *protobufs.MessageRequest_CodeExecute:
+		payload, err = message.GetCodeExecute().ToCanonicalBytes()
+	case *protobufs.MessageRequest_CodeFinalize:
+		payload, err = message.GetCodeFinalize().ToCanonicalBytes()
+	default:
+		err = ErrUnsupportedMessageType
+	}
+	return payload, err
 }
 
 var _ execution.ShardExecutionEngine = (*ComputeExecutionEngine)(nil)

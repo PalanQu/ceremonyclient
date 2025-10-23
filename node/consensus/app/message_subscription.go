@@ -9,16 +9,12 @@ import (
 )
 
 func (e *AppConsensusEngine) subscribeToConsensusMessages() error {
-	if e.config.P2P.Network != 99 && !e.config.Engine.ArchiveMode {
-		return nil
-	}
-
 	proverKey, _, _, _ := e.GetProvingKey(e.config.Engine)
 	e.mixnet = rpm.NewRPMMixnet(
 		e.logger,
 		proverKey,
 		e.proverRegistry,
-		e.appFilter,
+		e.appAddress,
 	)
 
 	if err := e.pubsub.Subscribe(
@@ -53,10 +49,6 @@ func (e *AppConsensusEngine) subscribeToConsensusMessages() error {
 }
 
 func (e *AppConsensusEngine) subscribeToGlobalProverMessages() error {
-	if e.config.P2P.Network != 99 && !e.config.Engine.ArchiveMode {
-		return nil
-	}
-
 	if err := e.pubsub.Subscribe(
 		e.getGlobalProverMessageBitmask(),
 		func(message *pb.Message) error {
@@ -84,14 +76,11 @@ func (e *AppConsensusEngine) subscribeToProverMessages() error {
 	if err := e.pubsub.Subscribe(
 		e.getProverMessageBitmask(),
 		func(message *pb.Message) error {
-			if e.config.P2P.Network != 99 && !e.config.Engine.ArchiveMode {
-				return nil
-			}
-
 			select {
 			case <-e.haltCtx.Done():
 				return nil
 			case e.proverMessageQueue <- message:
+				e.logger.Debug("got prover message")
 				return nil
 			case <-e.ctx.Done():
 				return errors.New("context cancelled")
