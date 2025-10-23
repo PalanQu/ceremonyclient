@@ -354,7 +354,7 @@ func provideDifficultyAnchorFrameNumber(config *config.Config) uint64 {
 }
 
 func provideDifficultyAnchorParentTime() int64 {
-	return 1759226400000
+	return 1761217200000
 }
 
 func provideDifficultyAnchorDifficulty() uint32 {
