@@ -7,6 +7,8 @@ import (
 
 	"github.com/cloudflare/circl/sign/ed448"
 	"github.com/iden3/go-iden3-crypto/poseidon"
+	pcrypto "github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/pkg/errors"
 )
 
@@ -84,8 +86,8 @@ func (s *SignedX448Key) Validate() error {
 		)
 	}
 
-	// Parent key address should be 32 bytes
-	if len(s.ParentKeyAddress) != 32 {
+	// Parent key address should be non-zero bytes
+	if len(s.ParentKeyAddress) == 0 {
 		return errors.Wrap(
 			errors.New("invalid parent key address length"),
 			"validate",
@@ -184,8 +186,13 @@ func (s *SignedDecaf448Key) Validate() error {
 		)
 	}
 
+<<<<<<< HEAD
 	// Parent key address should be 32 bytes
 	if len(s.ParentKeyAddress) != 32 {
+=======
+	// Parent key address should be non-zero bytes
+	if len(s.ParentKeyAddress) == 0 {
+>>>>>>> 2fec50e (amend: missing keys.go change)
 		return errors.Wrap(
 			errors.New("invalid parent key address length"),
 			"validate",
@@ -430,13 +437,21 @@ func (s *SignedX448Key) Verify(
 			return errors.Wrap(err, "verify signature")
 		}
 
-		// Check that parent key address matches the public key
-		addrBI, err := poseidon.HashBytes(sig.Ed448Signature.PublicKey.KeyValue)
+		pubKey, err := pcrypto.UnmarshalEd448PublicKey(
+			s.Key.KeyValue,
+		)
 		if err != nil {
-			return errors.Wrap(err, "compute address from public key")
+			return errors.Wrap(err, "verify signature")
 		}
-		addressToCheck := addrBI.FillBytes(make([]byte, 32))
-		if !bytes.Equal(addressToCheck, s.ParentKeyAddress) {
+		peerID, err := peer.IDFromPublicKey(pubKey)
+		if err != nil {
+			return errors.Wrap(err, "verify signature")
+		}
+
+		// Check that parent key address matches the public key
+		identityPeerID := []byte(peerID.String())
+
+		if !bytes.Equal(identityPeerID, s.ParentKeyAddress) {
 			return errors.Wrap(
 				errors.New("parent key address does not match public key"),
 				"verify",
@@ -548,6 +563,7 @@ func (s *SignedDecaf448Key) Verify(
 			return errors.Wrap(err, "verify signature")
 		}
 
+<<<<<<< HEAD
 		// Check that parent key address matches the public key
 		addrBI, err := poseidon.HashBytes(sig.Ed448Signature.PublicKey.KeyValue)
 		if err != nil {
@@ -555,6 +571,22 @@ func (s *SignedDecaf448Key) Verify(
 		}
 		addressToCheck := addrBI.FillBytes(make([]byte, 32))
 		if !bytes.Equal(addressToCheck, s.ParentKeyAddress) {
+=======
+		pubKey, err := pcrypto.UnmarshalEd448PublicKey(
+			s.Key.KeyValue,
+		)
+		if err != nil {
+			return errors.Wrap(err, "verify signature")
+		}
+		peerID, err := peer.IDFromPublicKey(pubKey)
+		if err != nil {
+			return errors.Wrap(err, "verify signature")
+		}
+
+		// Check that parent key address matches the public key
+		identityPeerID := []byte(peerID.String())
+		if !bytes.Equal(identityPeerID, s.ParentKeyAddress) {
+>>>>>>> 2fec50e (amend: missing keys.go change)
 			return errors.Wrap(
 				errors.New("parent key address does not match public key"),
 				"verify",
