@@ -186,13 +186,8 @@ func (s *SignedDecaf448Key) Validate() error {
 		)
 	}
 
-<<<<<<< HEAD
-	// Parent key address should be 32 bytes
-	if len(s.ParentKeyAddress) != 32 {
-=======
 	// Parent key address should be non-zero bytes
 	if len(s.ParentKeyAddress) == 0 {
->>>>>>> 2fec50e (amend: missing keys.go change)
 		return errors.Wrap(
 			errors.New("invalid parent key address length"),
 			"validate",
@@ -563,15 +558,6 @@ func (s *SignedDecaf448Key) Verify(
 			return errors.Wrap(err, "verify signature")
 		}
 
-<<<<<<< HEAD
-		// Check that parent key address matches the public key
-		addrBI, err := poseidon.HashBytes(sig.Ed448Signature.PublicKey.KeyValue)
-		if err != nil {
-			return errors.Wrap(err, "compute address from public key")
-		}
-		addressToCheck := addrBI.FillBytes(make([]byte, 32))
-		if !bytes.Equal(addressToCheck, s.ParentKeyAddress) {
-=======
 		pubKey, err := pcrypto.UnmarshalEd448PublicKey(
 			s.Key.KeyValue,
 		)
@@ -586,7 +572,6 @@ func (s *SignedDecaf448Key) Verify(
 		// Check that parent key address matches the public key
 		identityPeerID := []byte(peerID.String())
 		if !bytes.Equal(identityPeerID, s.ParentKeyAddress) {
->>>>>>> 2fec50e (amend: missing keys.go change)
 			return errors.Wrap(
 				errors.New("parent key address does not match public key"),
 				"verify",
