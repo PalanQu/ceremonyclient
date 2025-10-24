@@ -44,6 +44,15 @@ type GenesisJson struct {
 //go:embed mainnet_genesis.json
 var mainnetGenesisJSON []byte
 
+func (e *GlobalConsensusEngine) getMainnetGenesisJSON() *GenesisJson {
+	genesisData := &GenesisJson{}
+	if err := json.Unmarshal(mainnetGenesisJSON, genesisData); err != nil {
+		e.logger.Error("failed to parse embedded genesis data", zap.Error(err))
+		return nil
+	}
+	return genesisData
+}
+
 // TODO[2.1.1+]: Refactor out direct hypergraph access
 func (e *GlobalConsensusEngine) initializeGenesis() *protobufs.GlobalFrame {
 	e.logger.Info("initializing genesis frame for global consensus")
@@ -52,9 +61,8 @@ func (e *GlobalConsensusEngine) initializeGenesis() *protobufs.GlobalFrame {
 
 	// If on mainnet, load from release
 	if e.config.P2P.Network == 0 {
-		var genesisData GenesisJson
-		if err := json.Unmarshal(mainnetGenesisJSON, &genesisData); err != nil {
-			e.logger.Error("failed to parse embedded genesis data", zap.Error(err))
+		genesisData := e.getMainnetGenesisJSON()
+		if genesisData == nil {
 			return nil
 		}
 
@@ -473,7 +481,7 @@ func (e *GlobalConsensusEngine) createStubGenesis() *protobufs.GlobalFrame {
 
 func (e *GlobalConsensusEngine) establishMainnetGenesisProvers(
 	state *hgstate.HypergraphState,
-	genesisData GenesisJson,
+	genesisData *GenesisJson,
 ) error {
 	rdfMultiprover := schema.NewRDFMultiprover(
 		&schema.TurtleRDFParser{},
