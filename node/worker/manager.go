@@ -636,6 +636,7 @@ func (w *WorkerManager) getIPCOfWorker(coreId uint) (
 				StreamListenMultiaddr: addr.String(),
 				Filter:                nil,
 				TotalStorage:          0,
+				AvailableStorage:      0,
 				Automatic:             len(w.config.Engine.DataWorkerP2PMultiaddrs) == 0,
 				Allocated:             false,
 			})
